@@ -171,7 +171,6 @@ async def fetch_guild_config(conn: aiosqlite.Connection, guild_id: int) -> Guild
     return GuildConfig(
         guild_id=row["guild_id"],
         free_agent_role_id=row["free_agent_role_id"],
-        reserve_role_id=row["reserve_role_id"],
         fa_channel_id=row["fa_channel_id"],
         fa_message_id=row["fa_message_id"],
     )
@@ -186,18 +185,6 @@ async def upsert_guild_config(
         ON CONFLICT(guild_id) DO UPDATE SET free_agent_role_id = excluded.free_agent_role_id
         """,
         (guild_id, free_agent_role_id),
-    )
-
-
-async def upsert_reserve_role(
-    conn: aiosqlite.Connection, guild_id: int, reserve_role_id: int
-) -> None:
-    await conn.execute(
-        """
-        INSERT INTO guild_config (guild_id, reserve_role_id) VALUES (?, ?)
-        ON CONFLICT(guild_id) DO UPDATE SET reserve_role_id = excluded.reserve_role_id
-        """,
-        (guild_id, reserve_role_id),
     )
 
 

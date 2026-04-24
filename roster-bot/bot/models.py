@@ -20,7 +20,6 @@ class TeamSlot:
 class GuildConfig:
     guild_id: int
     free_agent_role_id: int | None = None
-    reserve_role_id: int | None = None
     fa_channel_id: int | None = None
     fa_message_id: int | None = None
 
