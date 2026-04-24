@@ -255,15 +255,14 @@ class _Step3View(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
-        sel = discord.ui.RoleSelect(
+        self._sel = discord.ui.RoleSelect(
             placeholder="Select principal role (optional)…", min_values=1, max_values=1
         )
-        sel.callback = self._on_select
-        self.add_item(sel)
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
-        self._state.principal_role_id = sel.values[0].id
+        self._state.principal_role_id = self._sel.values[0].id
         self.stop()
         await _show_builder(interaction, self._state, slot_type="staff", step_num=4)
 
