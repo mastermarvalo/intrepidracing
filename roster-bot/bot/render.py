@@ -83,6 +83,7 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     return embed
 
 
+
 def _tier_sort_key(role: discord.Role) -> int:
     parts = role.name.strip().split()
     return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 999
@@ -101,6 +102,7 @@ def build_fa_embed(guild: discord.Guild, fa_role_id: int) -> discord.Embed:
     tier_roles = {
         r for r in guild.roles
         if r.name.strip().lower().startswith("tier ")
+        and "reserve" not in r.name.strip().lower()
     }
 
     by_tier: dict[discord.Role, list[discord.Member]] = {}
@@ -114,7 +116,7 @@ def build_fa_embed(guild: discord.Guild, fa_role_id: int) -> discord.Embed:
     embed = discord.Embed(title="Free Agents", color=discord.Color.green())
 
     if not by_tier:
-        embed.description = "No free agents with tier roles found."
+        embed.description = "No free agents found."
         return embed
 
     for role in sorted(by_tier, key=_tier_sort_key):
