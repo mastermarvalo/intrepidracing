@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 
@@ -28,5 +28,5 @@ class Team:
     tagline: str | None = None
     logo_url: str | None = None
     message_id: int | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     slots: list[TeamSlot] = field(default_factory=list)
