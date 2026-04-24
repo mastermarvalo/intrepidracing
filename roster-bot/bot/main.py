@@ -30,7 +30,6 @@ class RosterBot(commands.Bot):
         await db.init()
         await self.load_extension("bot.cogs.roster")
         await self.load_extension("bot.events")
-        await self.load_extension("bot.poll")
         # Global sync — commands appear in all servers but propagation takes up to 1h.
         # For faster dev iteration, call tree.sync(guild=discord.Object(id=YOUR_GUILD_ID)).
         await self.tree.sync()

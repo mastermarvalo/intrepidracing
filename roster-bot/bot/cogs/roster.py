@@ -79,12 +79,12 @@ class RosterCog(commands.Cog):
     @roster.command(name="create", description="Create a new team roster")
     @app_commands.describe(name="Team identifier (e.g. redbull)")
     async def roster_create(self, interaction: discord.Interaction, name: str) -> None:
-        await flow.start_create(interaction, team_key=name.lower(), bot=self.bot)
+        await flow.start_create(interaction, team_key=name.lower())
 
     @roster.command(name="edit", description="Edit an existing team roster")
     @app_commands.describe(name="Team identifier (e.g. redbull)")
     async def roster_edit(self, interaction: discord.Interaction, name: str) -> None:
-        await flow.start_edit(interaction, team_key=name.lower(), bot=self.bot)
+        await flow.start_edit(interaction, team_key=name.lower())
 
 
 class _ConfirmRemoveView(discord.ui.View):
