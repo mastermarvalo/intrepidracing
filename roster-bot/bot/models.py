@@ -2,7 +2,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
-
 SlotType = Literal["staff", "driver"]
 
 
