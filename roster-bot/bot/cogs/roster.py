@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import db, queries
+from bot import db, flow, queries
 
 log = logging.getLogger(__name__)
 
@@ -79,12 +79,12 @@ class RosterCog(commands.Cog):
     @roster.command(name="create", description="Create a new team roster")
     @app_commands.describe(name="Team identifier (e.g. redbull)")
     async def roster_create(self, interaction: discord.Interaction, name: str) -> None:
-        await interaction.response.send_message("(stub — coming in step 5)", ephemeral=True)
+        await flow.start_create(interaction, team_key=name.lower(), bot=self.bot)
 
     @roster.command(name="edit", description="Edit an existing team roster")
     @app_commands.describe(name="Team identifier (e.g. redbull)")
     async def roster_edit(self, interaction: discord.Interaction, name: str) -> None:
-        await interaction.response.send_message("(stub — coming in step 6)", ephemeral=True)
+        await flow.start_edit(interaction, team_key=name.lower(), bot=self.bot)
 
 
 class _ConfirmRemoveView(discord.ui.View):
