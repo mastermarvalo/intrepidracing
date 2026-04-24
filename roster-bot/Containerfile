@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install uv for fast dependency resolution
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy project files
+COPY pyproject.toml ./
+COPY bot/ ./bot/
+COPY migrations/ ./migrations/
+
+# Install production deps only (no dev extras)
+RUN uv pip install --system --no-cache .
+
+# DB file lives in a mounted volume; default path matches .env.example
+VOLUME ["/data"]
+ENV DB_PATH=/data/roster.db
+
+CMD ["python", "-m", "bot"]
