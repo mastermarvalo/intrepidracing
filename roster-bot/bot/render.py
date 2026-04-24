@@ -15,17 +15,16 @@ class MemberLike(Protocol):
     def roles(self) -> list[discord.Role]: ...
 
 
-def _slot_value(pool: list[MemberLike], slot: TeamSlot) -> str:
+def _slot_block(pool: list[MemberLike], slot: TeamSlot) -> str:
     """
-    Build the field value for one slot.
+    Build the text block for one slot: bold label followed by member mentions.
 
-    Members at indices < quantity get plain mentions. Members beyond quantity
-    get an *(overflow)* tag — they're on the team role but exceed the seat count.
-    Empty seats below quantity are padded with *Spot Open*.
+    Members within the seat count get plain mentions. Extras get *(overflow)*.
+    Empty seats are padded with *Spot Open*.
     """
     assigned = [m for m in pool if any(r.id == slot.slot_role_id for r in m.roles)]
 
-    lines: list[str] = []
+    lines = [f"**{slot.label}**"]
     for i, member in enumerate(assigned):
         if i < slot.quantity:
             lines.append(f"<@{member.id}>")
@@ -35,20 +34,20 @@ def _slot_value(pool: list[MemberLike], slot: TeamSlot) -> str:
     open_spots = max(0, slot.quantity - len(assigned))
     lines.extend(["*Spot Open*"] * open_spots)
 
-    return "\n".join(lines) if lines else "*Spot Open*"
+    return "\n".join(lines)
 
 
-def _section_fields(
+def _section_text(
     pool: list[MemberLike],
     slots: list[TeamSlot],
     slot_type: SlotType,
-) -> list[tuple[str, str]]:
-    """Return (label, value) pairs for all slots of the given type, in sort_order."""
+) -> str:
+    """Combine all slots of one type into a single text block, in sort_order."""
     typed = sorted(
         (s for s in slots if s.slot_type == slot_type),
         key=lambda s: s.sort_order,
     )
-    return [(slot.label, _slot_value(pool, slot)) for slot in typed]
+    return "\n".join(_slot_block(pool, slot) for slot in typed)
 
 
 def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
@@ -68,20 +67,16 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     if team.logo_url:
         embed.set_thumbnail(url=team.logo_url)
 
-    staff_fields = _section_fields(pool, team.slots, "staff")
-    driver_fields = _section_fields(pool, team.slots, "driver")
+    staff_text = _section_text(pool, team.slots, "staff")
+    driver_text = _section_text(pool, team.slots, "driver")
 
-    # Discord field names are bold by default; no extra markdown needed.
-    # ​ (zero-width space) satisfies Discord's "value must be non-empty" rule
-    # while keeping the header visually clean.
-    if staff_fields:
-        embed.add_field(name="Staff", value="​", inline=False)
-        for name, value in staff_fields:
-            embed.add_field(name=name, value=value, inline=False)
+    # Each section is a single field: underlined bold header as the name,
+    # all slots concatenated as the value. This avoids the blank-line gap
+    # that a separate header field (with a zero-width-space value) creates.
+    if staff_text:
+        embed.add_field(name="__**Staff**__", value=staff_text, inline=False)
 
-    if driver_fields:
-        embed.add_field(name="Drivers", value="​", inline=False)
-        for name, value in driver_fields:
-            embed.add_field(name=name, value=value, inline=False)
+    if driver_text:
+        embed.add_field(name="__**Drivers**__", value=driver_text, inline=False)
 
     return embed

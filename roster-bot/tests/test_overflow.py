@@ -12,8 +12,11 @@ def member(id: int, *role_ids: int) -> FakeMember:
     return FakeMember(id=id, roles=[FakeRole(r) for r in role_ids])
 
 
+def driver_value(embed) -> str:
+    return next(f for f in embed.fields if "Driver" in f.name).value
+
+
 def test_overflow_members_all_visible():
-    """All members should appear in the field even when count exceeds quantity."""
     slot = make_slot(slot_role_id=DRIVER_ROLE, quantity=2)
     team = make_team(slots=[slot])
     members = [
@@ -21,59 +24,46 @@ def test_overflow_members_all_visible():
         member(11, TEAM_ROLE, DRIVER_ROLE),
         member(12, TEAM_ROLE, DRIVER_ROLE),  # overflow
     ]
-    embed = build_embed(team, members)
-    field = next(f for f in embed.fields if f.name == slot.label)
-    assert "<@10>" in field.value
-    assert "<@11>" in field.value
-    assert "<@12>" in field.value
+    value = driver_value(build_embed(team, members))
+    assert "<@10>" in value
+    assert "<@11>" in value
+    assert "<@12>" in value
 
 
 def test_overflow_members_flagged():
-    """Members beyond quantity should have the overflow marker."""
     slot = make_slot(slot_role_id=DRIVER_ROLE, quantity=1)
     team = make_team(slots=[slot])
     members = [
         member(10, TEAM_ROLE, DRIVER_ROLE),
         member(11, TEAM_ROLE, DRIVER_ROLE),  # overflow
     ]
-    embed = build_embed(team, members)
-    field = next(f for f in embed.fields if f.name == slot.label)
-    # member 10 is within quota — no overflow tag
-    lines = field.value.splitlines()
-    assert lines[0] == "<@10>"
-    assert "overflow" in lines[1]
-    assert "<@11>" in lines[1]
+    value = driver_value(build_embed(team, members))
+    # First line after the label is member 10 (within quota)
+    lines = value.splitlines()
+    label_idx = next(i for i, l in enumerate(lines) if "Slot" in l)
+    assert lines[label_idx + 1] == "<@10>"
+    assert "overflow" in lines[label_idx + 2]
+    assert "<@11>" in lines[label_idx + 2]
 
 
 def test_no_open_spots_when_overflowing():
-    """Overflow implies all seats are taken — no *Spot Open* padding."""
     slot = make_slot(slot_role_id=DRIVER_ROLE, quantity=1)
     team = make_team(slots=[slot])
-    members = [
-        member(10, TEAM_ROLE, DRIVER_ROLE),
-        member(11, TEAM_ROLE, DRIVER_ROLE),
-    ]
-    embed = build_embed(team, members)
-    field = next(f for f in embed.fields if f.name == slot.label)
-    assert "Spot Open" not in field.value
+    members = [member(10, TEAM_ROLE, DRIVER_ROLE), member(11, TEAM_ROLE, DRIVER_ROLE)]
+    value = driver_value(build_embed(team, members))
+    assert "Spot Open" not in value
 
 
 def test_overflow_exact_capacity_no_flag():
-    """Filling exactly to capacity should not trigger overflow."""
     slot = make_slot(slot_role_id=DRIVER_ROLE, quantity=2)
     team = make_team(slots=[slot])
-    members = [
-        member(10, TEAM_ROLE, DRIVER_ROLE),
-        member(11, TEAM_ROLE, DRIVER_ROLE),
-    ]
-    embed = build_embed(team, members)
-    field = next(f for f in embed.fields if f.name == slot.label)
-    assert "overflow" not in field.value
-    assert "Spot Open" not in field.value
+    members = [member(10, TEAM_ROLE, DRIVER_ROLE), member(11, TEAM_ROLE, DRIVER_ROLE)]
+    value = driver_value(build_embed(team, members))
+    assert "overflow" not in value
+    assert "Spot Open" not in value
 
 
 def test_single_overflow():
-    """One member over capacity: the third member gets flagged."""
     slot = make_slot(slot_role_id=DRIVER_ROLE, quantity=2)
     team = make_team(slots=[slot])
     members = [
@@ -81,9 +71,9 @@ def test_single_overflow():
         member(11, TEAM_ROLE, DRIVER_ROLE),
         member(12, TEAM_ROLE, DRIVER_ROLE),
     ]
-    embed = build_embed(team, members)
-    field = next(f for f in embed.fields if f.name == slot.label)
-    lines = field.value.splitlines()
-    assert lines[0] == "<@10>"
-    assert lines[1] == "<@11>"
-    assert "overflow" in lines[2]
+    value = driver_value(build_embed(team, members))
+    lines = value.splitlines()
+    label_idx = next(i for i, l in enumerate(lines) if "Slot" in l)
+    assert lines[label_idx + 1] == "<@10>"
+    assert lines[label_idx + 2] == "<@11>"
+    assert "overflow" in lines[label_idx + 3]
