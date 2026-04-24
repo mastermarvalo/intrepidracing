@@ -17,6 +17,12 @@ class TeamSlot:
 
 
 @dataclass
+class GuildConfig:
+    guild_id: int
+    free_agent_role_id: int | None = None
+
+
+@dataclass
 class Team:
     id: int
     guild_id: int

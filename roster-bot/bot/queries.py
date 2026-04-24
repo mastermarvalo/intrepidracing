@@ -9,7 +9,7 @@ from typing import Sequence
 
 import aiosqlite
 
-from bot.models import Team, TeamSlot
+from bot.models import GuildConfig, Team, TeamSlot
 
 
 def _row_to_slot(row: aiosqlite.Row) -> TeamSlot:
@@ -151,3 +151,28 @@ async def replace_slots(
 
 async def delete_team(conn: aiosqlite.Connection, team_id: int) -> None:
     await conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+
+
+# ── guild config ──────────────────────────────────────────────────────────────
+
+
+async def fetch_guild_config(conn: aiosqlite.Connection, guild_id: int) -> GuildConfig:
+    async with conn.execute(
+        "SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return GuildConfig(guild_id=guild_id)
+    return GuildConfig(guild_id=row["guild_id"], free_agent_role_id=row["free_agent_role_id"])
+
+
+async def upsert_guild_config(
+    conn: aiosqlite.Connection, guild_id: int, free_agent_role_id: int
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO guild_config (guild_id, free_agent_role_id) VALUES (?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET free_agent_role_id = excluded.free_agent_role_id
+        """,
+        (guild_id, free_agent_role_id),
+    )
