@@ -1,0 +1,21 @@
+services:
+  roster-bot:
+    build:
+      context: .
+      dockerfile: Containerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/roster.db
+    volumes:
+      - roster-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import sqlite3, os; sqlite3.connect(os.environ['DB_PATH']).execute('SELECT 1')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  roster-data:

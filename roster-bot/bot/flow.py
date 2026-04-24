@@ -1,13 +1,14 @@
 """
 Guided create/edit flow for /roster create and /roster edit.
 
-The flow is six steps:
+The flow is seven steps:
   1. Modal  — team name, tagline, logo URL
   2. View   — pick the "team role" (who counts as on this team)
-  3. View   — build staff slots (Add/Done loop)
-  4. View   — build driver slots (same loop)
-  5. View   — pick the channel to post in
-  6. View   — preview and confirm
+  3. View   — pick the "principal role" that can sign/drop players (optional)
+  4. View   — build staff slots (Add/Done loop)
+  5. View   — build driver slots (same loop)
+  6. View   — pick the channel to post in
+  7. View   — preview and confirm
 
 State is collected in a FlowState object and stored in `_sessions` while the
 admin works through the steps.  It's discarded when the flow finishes or times out.
@@ -57,7 +58,7 @@ class SlotDraft:
 
 @dataclass
 class FlowState:
-    """All data collected across the six steps for a single create/edit session."""
+    """All data collected across the seven steps for a single create/edit session."""
 
     guild_id: int
     user_id: int
@@ -74,11 +75,14 @@ class FlowState:
     # Step 2
     team_role_id: int = 0
 
-    # Steps 3 & 4 — filled incrementally via the slot-builder loop
+    # Step 3 — role allowed to sign/drop players for this team (optional)
+    principal_role_id: Optional[int] = None
+
+    # Steps 4 & 5 — filled incrementally via the slot-builder loop
     staff_slots: list[SlotDraft] = field(default_factory=list)
     driver_slots: list[SlotDraft] = field(default_factory=list)
 
-    # Step 5
+    # Step 6
     channel_id: int = 0
 
     # Tracks the active builder view so we can stop it when a new builder message
@@ -143,6 +147,7 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
         tagline=existing.tagline or "",
         logo_url=existing.logo_url or "",
         team_role_id=existing.team_role_id,
+        principal_role_id=existing.principal_role_id,
         channel_id=existing.channel_id,
     )
     for s in existing.slots:
@@ -161,7 +166,7 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
 # on_submit is called when the admin clicks Submit.
 
 
-class _Step1Modal(discord.ui.Modal, title="Team Setup (1/6)"):
+class _Step1Modal(discord.ui.Modal, title="Team Setup (1/7)"):
     team_name = discord.ui.TextInput(
         label="Display name", placeholder="Red Bull Racing", max_length=64
     )
@@ -205,7 +210,7 @@ class _Step1Modal(discord.ui.Modal, title="Team Setup (1/6)"):
 async def _show_step2(interaction: discord.Interaction, state: FlowState) -> None:
     view = _Step2View(state)
     await interaction.response.send_message(
-        "**Step 2 of 6 — Team role**\n"
+        "**Step 2 of 7 — Team role**\n"
         "Pick the Discord role that marks someone as being on this team.",
         view=view,
         ephemeral=True,
@@ -225,14 +230,54 @@ class _Step2View(discord.ui.View):
         sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
         self._state.team_role_id = sel.values[0].id
         self.stop()
-        # Component interaction → edit the same message in place
-        await _show_builder(interaction, self._state, slot_type="staff", step_num=3)
+        await _show_step3(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
 
 
-# ── steps 3 & 4: slot builder loop ───────────────────────────────────────────
+# ── step 3: principal role ────────────────────────────────────────────────────
+
+
+async def _show_step3(interaction: discord.Interaction, state: FlowState) -> None:
+    view = _Step3View(state)
+    await interaction.response.edit_message(
+        content=(
+            "**Step 3 of 7 — Principal role (optional)**\n"
+            "Pick a role whose members can use `/roster sign` and `/roster drop` for this team.\n"
+            "Click **Skip →** to leave it admin-only."
+        ),
+        view=view,
+    )
+
+
+class _Step3View(discord.ui.View):
+    def __init__(self, state: FlowState) -> None:
+        super().__init__(timeout=300)
+        self._state = state
+        sel = discord.ui.RoleSelect(
+            placeholder="Select principal role (optional)…", min_values=1, max_values=1
+        )
+        sel.callback = self._on_select
+        self.add_item(sel)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
+        self._state.principal_role_id = sel.values[0].id
+        self.stop()
+        await _show_builder(interaction, self._state, slot_type="staff", step_num=4)
+
+    @discord.ui.button(label="Skip →", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self._state.principal_role_id = None
+        self.stop()
+        await _show_builder(interaction, self._state, slot_type="staff", step_num=4)
+
+    async def on_timeout(self) -> None:
+        _discard(self._state)
+
+
+# ── steps 4 & 5: slot builder loop ───────────────────────────────────────────
 # The admin can add as many slots as they want.  Each "Add slot" click opens a
 # modal (label + quantity), then a role-select message.  "Done →" advances.
 #
@@ -260,7 +305,7 @@ async def _show_builder(
     slots = state.staff_slots if slot_type == "staff" else state.driver_slots
     label = slot_type.capitalize()
     content = (
-        f"**Step {step_num} of 6 — {label} slots**\n"
+        f"**Step {step_num} of 7 — {label} slots**\n"
         f"Add as many {label.lower()} slots as you need, then click **Done →**.\n\n"
         f"**Current {label.lower()} slots:**\n{_slot_summary(slots)}"
     )
@@ -287,10 +332,10 @@ class _BuilderView(discord.ui.View):
     @discord.ui.button(label="Done →", style=discord.ButtonStyle.success)
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        if self._step_num == 3:
-            await _show_builder(interaction, self._state, slot_type="driver", step_num=4)
+        if self._step_num == 4:
+            await _show_builder(interaction, self._state, slot_type="driver", step_num=5)
         else:
-            await _show_step5(interaction, self._state)
+            await _show_step6(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
@@ -371,21 +416,21 @@ class _SlotRoleView(discord.ui.View):
         pass  # The pending slot is just dropped; the admin can click "Add slot" again
 
 
-# ── step 5: channel ───────────────────────────────────────────────────────────
+# ── step 6: channel ───────────────────────────────────────────────────────────
 
 
-async def _show_step5(interaction: discord.Interaction, state: FlowState) -> None:
-    view = _Step5View(state)
+async def _show_step6(interaction: discord.Interaction, state: FlowState) -> None:
+    view = _Step6View(state)
     await interaction.response.edit_message(
         content=(
-            "**Step 5 of 6 — Channel**\n"
+            "**Step 6 of 7 — Channel**\n"
             "Pick the text channel where the roster will be posted."
         ),
         view=view,
     )
 
 
-class _Step5View(discord.ui.View):
+class _Step6View(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
@@ -402,13 +447,13 @@ class _Step5View(discord.ui.View):
         sel: discord.ui.ChannelSelect = self.children[0]  # type: ignore[assignment]
         self._state.channel_id = sel.values[0].id
         self.stop()
-        await _show_step6(interaction, self._state)
+        await _show_step7(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
 
 
-# ── step 6: preview & confirm ─────────────────────────────────────────────────
+# ── step 7: preview & confirm ─────────────────────────────────────────────────
 
 
 def _preview_team(state: FlowState) -> Team:
@@ -427,17 +472,18 @@ def _preview_team(state: FlowState) -> Team:
         name=state.display_name, team_role_id=state.team_role_id,
         channel_id=state.channel_id,
         tagline=state.tagline or None, logo_url=state.logo_url or None,
+        principal_role_id=state.principal_role_id,
         slots=slots,
     )
 
 
-async def _show_step6(interaction: discord.Interaction, state: FlowState) -> None:
+async def _show_step7(interaction: discord.Interaction, state: FlowState) -> None:
     assert interaction.guild is not None
     embed = build_embed(_preview_team(state), list(interaction.guild.members))
-    view = _Step6View(state)
+    view = _Step7View(state)
     await interaction.response.edit_message(
         content=(
-            "**Step 6 of 6 — Confirm**\n"
+            "**Step 7 of 7 — Confirm**\n"
             "Here's how the roster will look. Member mentions are live.\n"
             f"Posting to <#{state.channel_id}>."
         ),
@@ -446,7 +492,7 @@ async def _show_step6(interaction: discord.Interaction, state: FlowState) -> Non
     )
 
 
-class _Step6View(discord.ui.View):
+class _Step7View(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
@@ -503,6 +549,7 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 guild_id=state.guild_id, key=state.team_key, name=state.display_name,
                 team_role_id=state.team_role_id, channel_id=state.channel_id,
                 tagline=state.tagline or None, logo_url=state.logo_url or None,
+                principal_role_id=state.principal_role_id,
             )
         else:
             team_id = state.existing_team.id
@@ -510,6 +557,7 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 conn, team_id=team_id, name=state.display_name,
                 team_role_id=state.team_role_id, channel_id=state.channel_id,
                 tagline=state.tagline or None, logo_url=state.logo_url or None,
+                principal_role_id=state.principal_role_id,
             )
 
         await queries.replace_slots(conn, team_id, all_slots)

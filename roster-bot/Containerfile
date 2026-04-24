@@ -2,18 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install uv for fast dependency resolution
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Copy project files
-COPY pyproject.toml ./
+# Copy dependency files first so Docker caches this layer
+COPY pyproject.toml uv.lock ./
+RUN uv pip install --system --no-cache -r pyproject.toml
+
+# Copy application code
 COPY bot/ ./bot/
 COPY migrations/ ./migrations/
 
-# Install production deps only (no dev extras)
-RUN uv pip install --system --no-cache .
-
-# DB file lives in a mounted volume; default path matches .env.example
+# DB file lives in a mounted volume
 VOLUME ["/data"]
 ENV DB_PATH=/data/roster.db
 

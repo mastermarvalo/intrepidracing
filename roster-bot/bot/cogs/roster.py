@@ -1,9 +1,9 @@
 """
 /roster command group.
 
-All subcommands require Manage Server, enforced via default_permissions on the
-group. Discord hides these commands from users who lack the permission, and
-rejects invocations server-side even if someone bypasses the UI.
+Admin commands (list, create, edit, remove, config) require Manage Server,
+enforced in-handler. Sign/drop require Manage Server or the team's principal
+role. View and freeagents are open to everyone.
 """
 
 import logging
@@ -13,15 +13,27 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import db, flow, queries
+from bot.render import build_embed
 
 log = logging.getLogger(__name__)
+
+
+def _is_admin(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    return interaction.user.guild_permissions.manage_guild
+
+
+def _has_role(interaction: discord.Interaction, role_id: int) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    return any(r.id == role_id for r in interaction.user.roles)
 
 
 class RosterCog(commands.Cog):
     roster = app_commands.Group(
         name="roster",
         description="Manage team rosters",
-        default_permissions=discord.Permissions(manage_guild=True),
     )
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -31,6 +43,11 @@ class RosterCog(commands.Cog):
 
     @roster.command(name="list", description="List all configured teams in this server")
     async def roster_list(self, interaction: discord.Interaction) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
         assert interaction.guild_id is not None
         async with db.connect() as conn:
             teams = await queries.fetch_all_teams(conn, interaction.guild_id)
@@ -55,6 +72,11 @@ class RosterCog(commands.Cog):
     @roster.command(name="remove", description="Delete a team config and its roster message")
     @app_commands.describe(name="Team identifier (e.g. redbull)")
     async def roster_remove(self, interaction: discord.Interaction, name: str) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
         assert interaction.guild_id is not None
         async with db.connect() as conn:
             team = await queries.fetch_team(conn, interaction.guild_id, name)
@@ -77,6 +99,11 @@ class RosterCog(commands.Cog):
     @roster.command(name="create", description="Create a new team roster")
     @app_commands.describe(name="Team identifier (e.g. redbull)")
     async def roster_create(self, interaction: discord.Interaction, name: str) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
         await flow.start_create(interaction, team_key=name.lower())
 
     # ── /roster edit ──────────────────────────────────────────────────────────
@@ -84,12 +111,22 @@ class RosterCog(commands.Cog):
     @roster.command(name="edit", description="Edit an existing team roster")
     @app_commands.describe(name="Team identifier (e.g. redbull)")
     async def roster_edit(self, interaction: discord.Interaction, name: str) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
         await flow.start_edit(interaction, team_key=name.lower())
 
     # ── /roster config ────────────────────────────────────────────────────────
 
     @roster.command(name="config", description="Configure roster settings for this server")
     async def roster_config(self, interaction: discord.Interaction) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
         assert interaction.guild_id is not None
         async with db.connect() as conn:
             config = await queries.fetch_guild_config(conn, interaction.guild_id)
@@ -106,6 +143,25 @@ class RosterCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ── /roster view ──────────────────────────────────────────────────────────
+
+    @roster.command(name="view", description="View a team's current roster")
+    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    async def roster_view(self, interaction: discord.Interaction, name: str) -> None:
+        assert interaction.guild is not None and interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
+
+        if team is None:
+            await interaction.response.send_message(
+                f"No team named `{name}`.", ephemeral=True
+            )
+            return
+
+        embed = build_embed(team, list(interaction.guild.members))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     # ── /roster sign ──────────────────────────────────────────────────────────
 
     @roster.command(name="sign", description="Sign a player to a team")
@@ -121,6 +177,15 @@ class RosterCog(commands.Cog):
 
         if team is None:
             await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
+            return
+
+        authorized = _is_admin(interaction) or (
+            team.principal_role_id is not None and _has_role(interaction, team.principal_role_id)
+        )
+        if not authorized:
+            await interaction.response.send_message(
+                "You don't have permission to sign players for this team.", ephemeral=True
+            )
             return
 
         team_role = interaction.guild.get_role(team.team_role_id)
@@ -171,6 +236,15 @@ class RosterCog(commands.Cog):
 
         if team is None:
             await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
+            return
+
+        authorized = _is_admin(interaction) or (
+            team.principal_role_id is not None and _has_role(interaction, team.principal_role_id)
+        )
+        if not authorized:
+            await interaction.response.send_message(
+                "You don't have permission to drop players from this team.", ephemeral=True
+            )
             return
 
         team_role = interaction.guild.get_role(team.team_role_id)

@@ -7,5 +7,4 @@ dist/
 build/
 *.db
 .env
-uv.lock
 .pytest_cache/
