@@ -54,29 +54,71 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     """
     Build the roster embed for *team* against current guild members.
 
-    Filters the full member list to those who hold team_role_id, then renders
-    each slot against that pool.
+    Sections are rendered as ## headings inside the embed description so
+    Discord displays them with larger text than field names allow.
     """
     pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
 
     embed = discord.Embed(title=team.name, color=discord.Color.blurple())
 
-    if team.tagline:
-        embed.description = team.tagline
-
     if team.logo_url:
         embed.set_thumbnail(url=team.logo_url)
+
+    sections: list[str] = []
+
+    if team.tagline:
+        sections.append(team.tagline)
 
     staff_text = _section_text(pool, team.slots, "staff")
     driver_text = _section_text(pool, team.slots, "driver")
 
-    # Each section is a single field: underlined bold header as the name,
-    # all slots concatenated as the value. This avoids the blank-line gap
-    # that a separate header field (with a zero-width-space value) creates.
     if staff_text:
-        embed.add_field(name="__**Staff**__", value=staff_text, inline=False)
-
+        sections.append(f"## __Staff__\n{staff_text}")
     if driver_text:
-        embed.add_field(name="__**Drivers**__", value=driver_text, inline=False)
+        sections.append(f"## __Drivers__\n{driver_text}")
+
+    if sections:
+        embed.description = "\n\n".join(sections)
+
+    return embed
+
+
+def _tier_sort_key(role: discord.Role) -> int:
+    parts = role.name.strip().split()
+    return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 999
+
+
+def build_fa_embed(guild: discord.Guild, fa_role_id: int) -> discord.Embed:
+    """Build the free agents embed for a guild."""
+    fa_role = guild.get_role(fa_role_id)
+    if fa_role is None:
+        return discord.Embed(
+            title="Free Agents",
+            description="The configured free agent role no longer exists.",
+            color=discord.Color.red(),
+        )
+
+    tier_roles = {
+        r for r in guild.roles
+        if r.name.strip().lower().startswith("tier ")
+    }
+
+    by_tier: dict[discord.Role, list[discord.Member]] = {}
+    for member in guild.members:
+        if fa_role not in member.roles:
+            continue
+        for role in member.roles:
+            if role in tier_roles:
+                by_tier.setdefault(role, []).append(member)
+
+    embed = discord.Embed(title="Free Agents", color=discord.Color.green())
+
+    if not by_tier:
+        embed.description = "No free agents with tier roles found."
+        return embed
+
+    for role in sorted(by_tier, key=_tier_sort_key):
+        mentions = " ".join(m.mention for m in by_tier[role])
+        embed.add_field(name=role.name, value=mentions, inline=False)
 
     return embed

@@ -13,7 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import db, flow, queries
-from bot.render import build_embed
+from bot.render import build_embed, build_fa_embed
 
 log = logging.getLogger(__name__)
 
@@ -279,8 +279,16 @@ class RosterCog(commands.Cog):
 
     # ── /roster freeagents ────────────────────────────────────────────────────
 
-    @roster.command(name="freeagents", description="List free agents who have a tier role")
-    async def roster_freeagents(self, interaction: discord.Interaction) -> None:
+    @roster.command(
+        name="freeagents",
+        description="View free agents, or post a live board to a channel",
+    )
+    @app_commands.describe(channel="Admin: post the live free-agent board here and keep it updated")
+    async def roster_freeagents(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
         assert interaction.guild is not None and interaction.guild_id is not None
 
         async with db.connect() as conn:
@@ -292,48 +300,26 @@ class RosterCog(commands.Cog):
             )
             return
 
-        fa_role = interaction.guild.get_role(config.free_agent_role_id)
-        if fa_role is None:
-            await interaction.response.send_message(
-                "The configured free agent role no longer exists. "
-                "Run `/roster config` to update it.",
+        embed = build_fa_embed(interaction.guild, config.free_agent_role_id)
+
+        if channel is not None:
+            if not _is_admin(interaction):
+                await interaction.response.send_message(
+                    "You need **Manage Server** to post the free agent board.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            msg = await channel.send(embed=embed)
+            async with db.connect() as conn:
+                await queries.upsert_fa_channel(conn, interaction.guild_id, channel.id)
+                await queries.set_fa_message_id(conn, interaction.guild_id, msg.id)
+                await conn.commit()
+            await interaction.followup.send(
+                f"✅ Free agent board posted to {channel.mention} and will stay updated.",
                 ephemeral=True,
             )
-            return
-
-        # Find members who have the free agent role AND at least one tier role.
-        # Tier roles are detected by name starting with "Tier " (case-insensitive).
-        tier_roles = {
-            r for r in interaction.guild.roles
-            if r.name.strip().lower().startswith("tier ")
-        }
-
-        # Build a map: tier role → list of free agent members who hold it
-        by_tier: dict[discord.Role, list[discord.Member]] = {}
-        for member in interaction.guild.members:
-            if fa_role not in member.roles:
-                continue
-            for role in member.roles:
-                if role in tier_roles:
-                    by_tier.setdefault(role, []).append(member)
-
-        if not by_tier:
-            await interaction.response.send_message(
-                "No free agents with tier roles found.", ephemeral=True
-            )
-            return
-
-        # Sort tiers by the number in their name (e.g. "Tier 1", "Tier 2 🔥")
-        def tier_sort_key(role: discord.Role) -> int:
-            parts = role.name.strip().split()
-            return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 999
-
-        embed = discord.Embed(title="Free Agents", color=discord.Color.green())
-        for role in sorted(by_tier, key=tier_sort_key):
-            mentions = " ".join(m.mention for m in by_tier[role])
-            embed.add_field(name=role.name, value=mentions, inline=False)
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── views ─────────────────────────────────────────────────────────────────────

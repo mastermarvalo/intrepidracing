@@ -13,7 +13,13 @@ def member(id: int, *role_ids: int) -> FakeMember:
 
 
 def driver_value(embed) -> str:
-    return next(f for f in embed.fields if "Driver" in f.name).value
+    desc = embed.description or ""
+    header = "## __Drivers__"
+    if header not in desc:
+        return ""
+    after = desc[desc.index(header) + len(header):]
+    next_h = after.find("## __")
+    return (after[:next_h] if next_h != -1 else after).strip()
 
 
 def test_overflow_members_all_visible():

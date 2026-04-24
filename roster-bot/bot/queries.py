@@ -168,7 +168,12 @@ async def fetch_guild_config(conn: aiosqlite.Connection, guild_id: int) -> Guild
         row = await cur.fetchone()
     if row is None:
         return GuildConfig(guild_id=guild_id)
-    return GuildConfig(guild_id=row["guild_id"], free_agent_role_id=row["free_agent_role_id"])
+    return GuildConfig(
+        guild_id=row["guild_id"],
+        free_agent_role_id=row["free_agent_role_id"],
+        fa_channel_id=row["fa_channel_id"],
+        fa_message_id=row["fa_message_id"],
+    )
 
 
 async def upsert_guild_config(
@@ -180,4 +185,25 @@ async def upsert_guild_config(
         ON CONFLICT(guild_id) DO UPDATE SET free_agent_role_id = excluded.free_agent_role_id
         """,
         (guild_id, free_agent_role_id),
+    )
+
+
+async def upsert_fa_channel(
+    conn: aiosqlite.Connection, guild_id: int, fa_channel_id: int
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO guild_config (guild_id, fa_channel_id) VALUES (?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET fa_channel_id = excluded.fa_channel_id
+        """,
+        (guild_id, fa_channel_id),
+    )
+
+
+async def set_fa_message_id(
+    conn: aiosqlite.Connection, guild_id: int, message_id: int | None
+) -> None:
+    await conn.execute(
+        "UPDATE guild_config SET fa_message_id = ? WHERE guild_id = ?",
+        (message_id, guild_id),
     )
