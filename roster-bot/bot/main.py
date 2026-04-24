@@ -6,6 +6,8 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from bot import db
+
 load_dotenv()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -25,6 +27,7 @@ class RosterBot(commands.Bot):
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
 
     async def setup_hook(self) -> None:
+        await db.init()
         await self.load_extension("bot.cogs.roster")
         # Global sync — commands appear in all servers but propagation takes up to 1h.
         # For faster dev iteration, call tree.sync(guild=discord.Object(id=YOUR_GUILD_ID)).
