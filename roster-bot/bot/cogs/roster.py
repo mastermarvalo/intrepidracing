@@ -131,14 +131,18 @@ class RosterCog(commands.Cog):
         async with db.connect() as conn:
             config = await queries.fetch_guild_config(conn, interaction.guild_id)
 
-        current = (
-            f"Current free agent role: <@&{config.free_agent_role_id}>"
-            if config.free_agent_role_id
-            else "No free agent role set yet."
+        fa_line = (
+            f"Free Agent role: <@&{config.free_agent_role_id}>"
+            if config.free_agent_role_id else "Free Agent role: *not set*"
         )
-        view = _SetFreeAgentView(guild_id=interaction.guild_id)
+        reserve_line = (
+            f"Reserve role: <@&{config.reserve_role_id}>"
+            if config.reserve_role_id else "Reserve role: *not set*"
+        )
+        view = _ConfigView(guild_id=interaction.guild_id)
         await interaction.response.send_message(
-            f"**Roster Config**\n{current}\n\nPick the Free Agent role:",
+            f"**Roster Config**\n{fa_line}\n{reserve_line}\n\n"
+            "Select roles to update, then click **Save**.",
             view=view,
             ephemeral=True,
         )
@@ -203,6 +207,11 @@ class RosterCog(commands.Cog):
             if fa_role and fa_role in member.roles:
                 to_remove.append(fa_role)
 
+        if config.reserve_role_id:
+            reserve_role = interaction.guild.get_role(config.reserve_role_id)
+            if reserve_role and reserve_role in member.roles:
+                to_remove.append(reserve_role)
+
         try:
             await member.add_roles(*to_add, reason=f"Signed to {team.name} by {interaction.user}")
             if to_remove:
@@ -255,6 +264,11 @@ class RosterCog(commands.Cog):
             fa_role = interaction.guild.get_role(config.free_agent_role_id)
             if fa_role and fa_role not in member.roles:
                 to_add.append(fa_role)
+
+        if config.reserve_role_id:
+            reserve_role = interaction.guild.get_role(config.reserve_role_id)
+            if reserve_role and reserve_role not in member.roles:
+                to_add.append(reserve_role)
 
         try:
             if to_remove:
@@ -325,25 +339,46 @@ class RosterCog(commands.Cog):
 # ── views ─────────────────────────────────────────────────────────────────────
 
 
-class _SetFreeAgentView(discord.ui.View):
+class _ConfigView(discord.ui.View):
     def __init__(self, guild_id: int) -> None:
         super().__init__(timeout=120)
         self._guild_id = guild_id
-        sel = discord.ui.RoleSelect(
-            placeholder="Select the Free Agent role…", min_values=1, max_values=1
+        self._fa_sel = discord.ui.RoleSelect(
+            placeholder="Free Agent role…", min_values=0, max_values=1
         )
-        sel.callback = self._on_select
-        self.add_item(sel)
+        self._reserve_sel = discord.ui.RoleSelect(
+            placeholder="Reserve role…", min_values=0, max_values=1
+        )
+        self.add_item(self._fa_sel)
+        self.add_item(self._reserve_sel)
 
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
-        role = sel.values[0]
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        fa_values = self._fa_sel.values
+        reserve_values = self._reserve_sel.values
+
+        if not fa_values and not reserve_values:
+            await interaction.response.send_message(
+                "Select at least one role before saving.", ephemeral=True
+            )
+            return
+
         async with db.connect() as conn:
-            await queries.upsert_guild_config(conn, self._guild_id, role.id)
+            if fa_values:
+                await queries.upsert_guild_config(conn, self._guild_id, fa_values[0].id)
+            if reserve_values:
+                await queries.upsert_reserve_role(conn, self._guild_id, reserve_values[0].id)
             await conn.commit()
+
+        parts = []
+        if fa_values:
+            parts.append(f"Free Agent role → {fa_values[0].mention}")
+        if reserve_values:
+            parts.append(f"Reserve role → {reserve_values[0].mention}")
+
         self.stop()
         await interaction.response.edit_message(
-            content=f"✅ Free Agent role set to {role.mention}.", view=None
+            content="✅ " + "\n".join(parts), view=None
         )
 
 
