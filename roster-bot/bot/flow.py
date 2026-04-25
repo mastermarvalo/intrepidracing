@@ -444,13 +444,12 @@ class _SlotRemoveView(discord.ui.View):
             )
             for i, s in enumerate(slots)
         ]
-        sel = discord.ui.Select(placeholder="Select slot to remove…", options=options)
-        sel.callback = self._on_select
-        self.add_item(sel)
+        self._sel = discord.ui.Select(placeholder="Select slot to remove…", options=options)
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        sel: discord.ui.Select = self.children[0]  # type: ignore[assignment]
-        idx = int(sel.values[0])
+        idx = int(self._sel.values[0])
         slots = self._state.staff_slots if self._slot_type == "staff" else self._state.driver_slots
         if 0 <= idx < len(slots):
             slots.pop(idx)
