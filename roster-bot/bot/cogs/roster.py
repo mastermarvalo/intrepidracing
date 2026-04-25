@@ -6,6 +6,7 @@ enforced in-handler. Sign/drop require Manage Server or the team's principal
 role. View and freeagents are open to everyone.
 """
 
+import asyncio
 import logging
 
 import discord
@@ -13,6 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import db, flow, queries
+from bot.events import _rerender, _rerender_fa
 from bot.render import build_embed, build_fa_embed
 
 log = logging.getLogger(__name__)
@@ -131,14 +133,19 @@ class RosterCog(commands.Cog):
         async with db.connect() as conn:
             config = await queries.fetch_guild_config(conn, interaction.guild_id)
 
-        current = (
-            f"Current free agent role: <@&{config.free_agent_role_id}>"
+        fa_line = (
+            f"Free Agent role: <@&{config.free_agent_role_id}>"
             if config.free_agent_role_id
-            else "No free agent role set yet."
+            else "Free Agent role: *not set*"
         )
-        view = _SetFreeAgentView(guild_id=interaction.guild_id)
+        tx_line = (
+            f"Transactions channel: <#{config.transactions_channel_id}>"
+            if config.transactions_channel_id
+            else "Transactions channel: *not set*"
+        )
+        view = _ConfigView(guild_id=interaction.guild_id)
         await interaction.response.send_message(
-            f"**Roster Config**\n{current}\n\nPick the Free Agent role:",
+            f"**Roster Config**\n{fa_line}\n{tx_line}",
             view=view,
             ephemeral=True,
         )
@@ -218,7 +225,7 @@ class RosterCog(commands.Cog):
             return
 
         await interaction.response.send_message(
-            f"✅ {member.mention} signed to **{team.name}**.", ephemeral=True
+            f"✅ **{member.display_name}** signed to **{team.name}**.", ephemeral=True
         )
 
     # ── /roster drop ──────────────────────────────────────────────────────────
@@ -274,7 +281,7 @@ class RosterCog(commands.Cog):
             return
 
         await interaction.response.send_message(
-            f"✅ {member.mention} dropped from **{team.name}**.", ephemeral=True
+            f"✅ **{member.display_name}** dropped from **{team.name}**.", ephemeral=True
         )
 
     # ── /roster freeagents ────────────────────────────────────────────────────
@@ -321,28 +328,98 @@ class RosterCog(commands.Cog):
         else:
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── /roster refresh ───────────────────────────────────────────────────────
+
+    @roster.command(name="refresh", description="Force-refresh all roster embeds in this server")
+    async def roster_refresh(self, interaction: discord.Interaction) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
+        assert interaction.guild is not None and interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+
+        async with db.connect() as conn:
+            teams = await queries.fetch_all_teams(conn, interaction.guild_id)
+            config = await queries.fetch_guild_config(conn, interaction.guild_id)
+
+        for team in teams:
+            await _rerender(self.bot, interaction.guild, team)
+        await _rerender_fa(self.bot, interaction.guild, config)
+
+        await interaction.followup.send(
+            f"✅ Refreshed **{len(teams)}** roster(s).", ephemeral=True
+        )
+
+    # ── /roster dm ────────────────────────────────────────────────────────────
+
+    @roster.command(name="dm", description="Send a DM to all members with a specific role")
+    @app_commands.describe(role="Role whose members will be DM'd", message="Message to send")
+    async def roster_dm(
+        self, interaction: discord.Interaction, role: discord.Role, message: str
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
+
+        members = [m for m in role.members if not m.bot]
+        if not members:
+            await interaction.response.send_message(
+                f"No non-bot members have the {role.mention} role.", ephemeral=True
+            )
+            return
+
+        preview = message if len(message) <= 500 else message[:497] + "…"
+        view = _ConfirmDMView(role=role, message=message, members=members)
+        await interaction.response.send_message(
+            f"Send the following DM to **{len(members)} member(s)** with {role.mention}?\n\n>>> {preview}",
+            view=view,
+            ephemeral=True,
+        )
+
 
 # ── views ─────────────────────────────────────────────────────────────────────
 
 
-class _SetFreeAgentView(discord.ui.View):
+class _ConfigView(discord.ui.View):
     def __init__(self, guild_id: int) -> None:
         super().__init__(timeout=120)
         self._guild_id = guild_id
-        self._sel = discord.ui.RoleSelect(
-            placeholder="Select the Free Agent role…", min_values=1, max_values=1
-        )
-        self._sel.callback = self._on_select
-        self.add_item(self._sel)
 
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        role = self._sel.values[0]
+        self._role_sel = discord.ui.RoleSelect(
+            placeholder="Change Free Agent role…", min_values=1, max_values=1
+        )
+        self._role_sel.callback = self._on_role
+        self.add_item(self._role_sel)
+
+        self._chan_sel = discord.ui.ChannelSelect(
+            placeholder="Change transactions channel…",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+        )
+        self._chan_sel.callback = self._on_channel
+        self.add_item(self._chan_sel)
+
+    async def _on_role(self, interaction: discord.Interaction) -> None:
+        role = self._role_sel.values[0]
         async with db.connect() as conn:
             await queries.upsert_guild_config(conn, self._guild_id, role.id)
             await conn.commit()
-        self.stop()
         await interaction.response.edit_message(
-            content=f"✅ Free Agent role set to {role.mention}.", view=None
+            content=f"✅ Free Agent role set to {role.mention}.",
+        )
+
+    async def _on_channel(self, interaction: discord.Interaction) -> None:
+        channel = self._chan_sel.values[0]
+        async with db.connect() as conn:
+            await queries.upsert_transactions_channel(conn, self._guild_id, channel.id)
+            await conn.commit()
+        await interaction.response.edit_message(
+            content=f"✅ Transactions channel set to {channel.mention}.",
         )
 
 
@@ -376,6 +453,87 @@ class _ConfirmRemoveView(discord.ui.View):
         await interaction.response.edit_message(
             content=f"**{self._team_name}** removed.", view=None
         )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        pass
+
+
+class _ConfirmDMView(discord.ui.View):
+    def __init__(
+        self, *, role: discord.Role, message: str, members: list[discord.Member]
+    ) -> None:
+        super().__init__(timeout=60)
+        self._role = role
+        self._message = message
+        self._members = members
+
+    @discord.ui.button(label="Send", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        total = len(self._members)
+        await interaction.response.edit_message(
+            content=f"Sending DMs… (0/{total})", view=None
+        )
+
+        sent = 0
+        failed = 0
+        loop = asyncio.get_running_loop()
+        last_edit = loop.time()
+
+        async def update(content: str, *, force: bool = False) -> None:
+            nonlocal last_edit
+            now = loop.time()
+            if force or now - last_edit >= 2.0:
+                await interaction.edit_original_response(content=content)
+                last_edit = loop.time()
+
+        for member in self._members:
+            while True:
+                try:
+                    await member.send(self._message)
+                    sent += 1
+                    break
+                except discord.Forbidden:
+                    failed += 1
+                    break
+                except discord.RateLimited as exc:
+                    secs = round(exc.retry_after)
+                    log.warning("DM rate limited — waiting %ds", secs)
+                    await interaction.edit_original_response(
+                        content=f"⏳ Rate limited — waiting {secs}s… ({sent}/{total} sent)"
+                    )
+                    last_edit = loop.time()
+                    await asyncio.sleep(exc.retry_after)
+                except discord.HTTPException as exc:
+                    if exc.status == 429:
+                        try:
+                            retry_after = float(exc.response.headers["Retry-After"])
+                        except (KeyError, AttributeError, ValueError):
+                            retry_after = 5.0
+                        secs = round(retry_after)
+                        log.warning("DM 429 — waiting %ds", secs)
+                        await interaction.edit_original_response(
+                            content=f"⏳ Rate limited — waiting {secs}s… ({sent}/{total} sent)"
+                        )
+                        last_edit = loop.time()
+                        await asyncio.sleep(retry_after)
+                    else:
+                        failed += 1
+                        break
+
+            tail = f", {failed} failed" if failed else ""
+            await update(f"Sending DMs… ({sent}/{total} sent{tail})")
+            await asyncio.sleep(0.75)
+
+        result = f"✅ Done — **{sent}/{total}** DMs sent to members with {self._role.mention}."
+        if failed:
+            result += f" **{failed}** couldn't be reached (DMs disabled or bot blocked)."
+        await interaction.edit_original_response(content=result)
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)

@@ -1,4 +1,4 @@
-from typing import Protocol
+from typing import Literal, Protocol
 
 import discord
 
@@ -51,20 +51,14 @@ def _section_text(
 
 
 def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
-    """
-    Build the roster embed for *team* against current guild members.
-
-    Sections are rendered as ## headings inside the embed description so
-    Discord displays them with larger text than field names allow.
-    """
     pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
 
-    embed = discord.Embed(title=team.name, color=discord.Color.blurple())
+    embed = discord.Embed(color=discord.Color.blurple())
 
     if team.logo_url:
         embed.set_thumbnail(url=team.logo_url)
 
-    sections: list[str] = []
+    sections: list[str] = [f"# __{team.name}__"]
 
     if team.tagline:
         sections.append(team.tagline)
@@ -77,8 +71,7 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     if driver_text:
         sections.append(f"## __Drivers__\n{driver_text}")
 
-    if sections:
-        embed.description = "\n\n".join(sections)
+    embed.description = "\n\n".join(sections)
 
     return embed
 
@@ -122,5 +115,26 @@ def build_fa_embed(guild: discord.Guild, fa_role_id: int) -> discord.Embed:
     for role in sorted(by_tier, key=_tier_sort_key):
         mentions = " ".join(m.mention for m in by_tier[role])
         embed.add_field(name=role.name, value=mentions, inline=False)
+
+    return embed
+
+
+def build_transaction_embed(
+    team: Team,
+    member: discord.Member,
+    action: Literal["signed", "dropped"],
+) -> discord.Embed:
+    verb = "Signed" if action == "signed" else "Dropped"
+    prep = "to" if action == "signed" else "from"
+    color = discord.Color.green() if action == "signed" else discord.Color.red()
+
+    embed = discord.Embed(
+        description=f"**{member.display_name}** has been **{verb.lower()}** {prep} **{team.name}**",
+        color=color,
+    )
+    embed.set_author(name=f"{verb}: {member.display_name}", icon_url=member.display_avatar.url)
+
+    if team.logo_url:
+        embed.set_thumbnail(url=team.logo_url)
 
     return embed

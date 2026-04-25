@@ -9,7 +9,7 @@ from typing import Sequence
 
 import aiosqlite
 
-from bot.models import GuildConfig, Team, TeamSlot
+from bot.models import GuildConfig, StatBoard, Team, TeamSlot
 
 
 def _row_to_slot(row: aiosqlite.Row) -> TeamSlot:
@@ -173,6 +173,7 @@ async def fetch_guild_config(conn: aiosqlite.Connection, guild_id: int) -> Guild
         free_agent_role_id=row["free_agent_role_id"],
         fa_channel_id=row["fa_channel_id"],
         fa_message_id=row["fa_message_id"],
+        transactions_channel_id=row["transactions_channel_id"],
     )
 
 
@@ -207,3 +208,86 @@ async def set_fa_message_id(
         "UPDATE guild_config SET fa_message_id = ? WHERE guild_id = ?",
         (message_id, guild_id),
     )
+
+
+async def upsert_transactions_channel(
+    conn: aiosqlite.Connection, guild_id: int, channel_id: int
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO guild_config (guild_id, transactions_channel_id) VALUES (?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET transactions_channel_id = excluded.transactions_channel_id
+        """,
+        (guild_id, channel_id),
+    )
+
+
+# ── stat boards ───────────────────────────────────────────────────────────────
+
+
+def _row_to_board(row: aiosqlite.Row) -> StatBoard:
+    return StatBoard(
+        id=row["id"],
+        guild_id=row["guild_id"],
+        title=row["title"],
+        sheet_id=row["sheet_id"],
+        sheet_range=row["sheet_range"],
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
+    )
+
+
+async def fetch_all_stat_boards(conn: aiosqlite.Connection, guild_id: int) -> list[StatBoard]:
+    async with conn.execute(
+        "SELECT * FROM stat_boards WHERE guild_id = ? ORDER BY title", (guild_id,)
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_board(r) for r in rows]
+
+
+async def fetch_stat_board(
+    conn: aiosqlite.Connection, guild_id: int, title: str
+) -> StatBoard | None:
+    async with conn.execute(
+        "SELECT * FROM stat_boards WHERE guild_id = ? AND lower(title) = lower(?)",
+        (guild_id, title),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_board(row) if row else None
+
+
+async def fetch_stat_board_by_id(conn: aiosqlite.Connection, board_id: int) -> StatBoard | None:
+    async with conn.execute("SELECT * FROM stat_boards WHERE id = ?", (board_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_board(row) if row else None
+
+
+async def insert_stat_board(
+    conn: aiosqlite.Connection,
+    guild_id: int,
+    title: str,
+    sheet_id: str,
+    sheet_range: str,
+    channel_id: int,
+) -> int:
+    async with conn.execute(
+        """
+        INSERT INTO stat_boards (guild_id, title, sheet_id, sheet_range, channel_id)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (guild_id, title, sheet_id, sheet_range, channel_id),
+    ) as cur:
+        assert cur.lastrowid is not None
+        return cur.lastrowid
+
+
+async def set_stat_board_message_id(
+    conn: aiosqlite.Connection, board_id: int, message_id: int | None
+) -> None:
+    await conn.execute(
+        "UPDATE stat_boards SET message_id = ? WHERE id = ?", (message_id, board_id)
+    )
+
+
+async def delete_stat_board(conn: aiosqlite.Connection, board_id: int) -> None:
+    await conn.execute("DELETE FROM stat_boards WHERE id = ?", (board_id,))

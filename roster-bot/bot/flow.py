@@ -319,6 +319,9 @@ class _BuilderView(discord.ui.View):
         self._state = state
         self._slot_type = slot_type
         self._step_num = step_num
+        slots = state.staff_slots if slot_type == "staff" else state.driver_slots
+        if not slots:
+            self.remove_slot.disabled = True
 
     @discord.ui.button(label="Add slot", style=discord.ButtonStyle.primary)
     async def add_slot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -326,6 +329,18 @@ class _BuilderView(discord.ui.View):
         # The builder message stays visible; the modal appears on top.
         await interaction.response.send_modal(
             _SlotTextModal(state=self._state, slot_type=self._slot_type, step_num=self._step_num)
+        )
+
+    @discord.ui.button(label="Remove slot", style=discord.ButtonStyle.danger)
+    async def remove_slot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        view = _SlotRemoveView(state=self._state, slot_type=self._slot_type, step_num=self._step_num)
+        slots = self._state.staff_slots if self._slot_type == "staff" else self._state.driver_slots
+        label = self._slot_type.capitalize()
+        await interaction.response.edit_message(
+            content=f"**Remove a {label.lower()} slot — select which one to delete:**\n\n"
+                    f"**Current {label.lower()} slots:**\n{_slot_summary(slots)}",
+            view=view,
         )
 
     @discord.ui.button(label="Done →", style=discord.ButtonStyle.success)
@@ -413,6 +428,42 @@ class _SlotRoleView(discord.ui.View):
 
     async def on_timeout(self) -> None:
         pass  # The pending slot is just dropped; the admin can click "Add slot" again
+
+
+class _SlotRemoveView(discord.ui.View):
+    def __init__(self, *, state: FlowState, slot_type: str, step_num: int) -> None:
+        super().__init__(timeout=120)
+        self._state = state
+        self._slot_type = slot_type
+        self._step_num = step_num
+        slots = state.staff_slots if slot_type == "staff" else state.driver_slots
+        options = [
+            discord.SelectOption(
+                label=f"{s.label} × {s.quantity}",
+                value=str(i),
+            )
+            for i, s in enumerate(slots)
+        ]
+        sel = discord.ui.Select(placeholder="Select slot to remove…", options=options)
+        sel.callback = self._on_select
+        self.add_item(sel)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        sel: discord.ui.Select = self.children[0]  # type: ignore[assignment]
+        idx = int(sel.values[0])
+        slots = self._state.staff_slots if self._slot_type == "staff" else self._state.driver_slots
+        if 0 <= idx < len(slots):
+            slots.pop(idx)
+        self.stop()
+        await _show_builder(interaction, self._state, slot_type=self._slot_type, step_num=self._step_num)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_builder(interaction, self._state, slot_type=self._slot_type, step_num=self._step_num)
+
+    async def on_timeout(self) -> None:
+        pass
 
 
 # ── step 6: channel ───────────────────────────────────────────────────────────

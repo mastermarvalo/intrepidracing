@@ -5,10 +5,12 @@ Two things trigger a roster re-render:
 
 1. on_member_update  — fires whenever a member's roles change.  We check if any
    of the changed roles belong to a team and re-render just those teams.  If the
-   FA role or any tier role changed, the FA board is also re-rendered.
+   FA role or any tier role changed, the FA board is also re-rendered.  If a team
+   role was gained or lost, a transaction announcement is posted.
 
 2. poll_loop  — runs every 15 minutes regardless.  Catches anything missed while
-   the bot was offline, or events Discord dropped.
+   the bot was offline, or events Discord dropped.  Also compares an in-memory
+   roster snapshot to detect sign/drop changes that happened during downtime.
 
 Both paths call _rerender() and _rerender_fa(), the only places that edit messages.
 """
@@ -19,9 +21,14 @@ import discord
 from discord.ext import commands, tasks
 
 from bot import db, queries
-from bot.render import build_embed, build_fa_embed
+from bot.models import GuildConfig, Team
+from bot.render import build_embed, build_fa_embed, build_transaction_embed
 
 log = logging.getLogger(__name__)
+
+# team_id -> frozenset of member IDs currently holding that team's role
+_snapshots: dict[int, frozenset[int]] = {}
+_snapshots_initialized = False
 
 
 class EventsCog(commands.Cog):
@@ -36,24 +43,31 @@ class EventsCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
-        # symmetric_difference gives us roles that were added OR removed
         before_ids = {r.id for r in before.roles}
         after_ids = {r.id for r in after.roles}
         changed_ids = before_ids.symmetric_difference(after_ids)
         if not changed_ids:
-            return  # something else changed (nickname, etc.) — nothing to do
+            return
+
+        added_ids = after_ids - before_ids
+        removed_ids = before_ids - after_ids
 
         async with db.connect() as conn:
             teams = await queries.fetch_all_teams(conn, after.guild.id)
             config = await queries.fetch_guild_config(conn, after.guild.id)
 
-        # Only re-render teams that care about the changed roles
         for team in teams:
             team_role_ids = {team.team_role_id} | {s.slot_role_id for s in team.slots}
             if team_role_ids & changed_ids:
                 await _rerender(self.bot, after.guild, team)
 
-        # Re-render FA board if the FA role or any tier role changed
+            if team.team_role_id in added_ids:
+                await _announce_transaction(self.bot, team, after, "signed", config)
+                _snapshots[team.id] = _snapshots.get(team.id, frozenset()) | {after.id}
+            elif team.team_role_id in removed_ids:
+                await _announce_transaction(self.bot, team, after, "dropped", config)
+                _snapshots[team.id] = _snapshots.get(team.id, frozenset()) - {after.id}
+
         if config.fa_channel_id and config.fa_message_id and config.free_agent_role_id:
             changed_roles = [after.guild.get_role(rid) for rid in changed_ids]
             fa_relevant = config.free_agent_role_id in changed_ids or any(
@@ -66,14 +80,36 @@ class EventsCog(commands.Cog):
 
     @tasks.loop(minutes=15)
     async def poll_loop(self) -> None:
+        global _snapshots_initialized
         log.debug("Poll: refreshing all rosters")
         for guild in self.bot.guilds:
             async with db.connect() as conn:
                 teams = await queries.fetch_all_teams(conn, guild.id)
                 config = await queries.fetch_guild_config(conn, guild.id)
+
             for team in teams:
+                team_role = guild.get_role(team.team_role_id)
+                current_ids: frozenset[int] = (
+                    frozenset(m.id for m in team_role.members) if team_role else frozenset()
+                )
+
+                if _snapshots_initialized:
+                    prev_ids = _snapshots.get(team.id, frozenset())
+                    for member_id in current_ids - prev_ids:
+                        member = guild.get_member(member_id)
+                        if member:
+                            await _announce_transaction(self.bot, team, member, "signed", config)
+                    for member_id in prev_ids - current_ids:
+                        member = guild.get_member(member_id)
+                        if member:
+                            await _announce_transaction(self.bot, team, member, "dropped", config)
+
+                _snapshots[team.id] = current_ids
                 await _rerender(self.bot, guild, team)
+
             await _rerender_fa(self.bot, guild, config)
+
+        _snapshots_initialized = True
         log.debug("Poll: done")
 
     @poll_loop.before_loop
@@ -81,11 +117,29 @@ class EventsCog(commands.Cog):
         await self.bot.wait_until_ready()
 
 
-# ── shared render helpers ─────────────────────────────────────────────────────
+# ── shared helpers ────────────────────────────────────────────────────────────
+
+
+async def _announce_transaction(
+    bot: commands.Bot,
+    team: Team,
+    member: discord.Member,
+    action: str,
+    config: GuildConfig,
+) -> None:
+    if not config.transactions_channel_id:
+        return
+    channel = bot.get_channel(config.transactions_channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    embed = build_transaction_embed(team, member, action)  # type: ignore[arg-type]
+    try:
+        await channel.send(embed=embed)
+    except discord.Forbidden:
+        log.warning("No permission to post transaction in channel %s", config.transactions_channel_id)
 
 
 async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # type: ignore[type-arg]
-    """Rebuild the roster embed and edit the stored Discord message."""
     if team.message_id is None:
         return
 
@@ -108,7 +162,6 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
 
 
 async def _rerender_fa(bot: commands.Bot, guild: discord.Guild, config) -> None:  # type: ignore[type-arg]
-    """Rebuild the free agent board embed and edit the stored Discord message."""
     if not (config.fa_channel_id and config.fa_message_id and config.free_agent_role_id):
         return
 

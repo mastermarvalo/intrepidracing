@@ -22,6 +22,7 @@ class GuildConfig:
     free_agent_role_id: int | None = None
     fa_channel_id: int | None = None
     fa_message_id: int | None = None
+    transactions_channel_id: int | None = None
 
 
 @dataclass
@@ -38,3 +39,15 @@ class Team:
     message_id: int | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     slots: list[TeamSlot] = field(default_factory=list)
+
+
+@dataclass
+class StatBoard:
+    id: int
+    guild_id: int
+    title: str
+    sheet_id: str
+    sheet_range: str
+    channel_id: int
+    message_id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
