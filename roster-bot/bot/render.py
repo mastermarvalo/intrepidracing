@@ -4,6 +4,8 @@ import os
 from io import BytesIO
 from typing import Literal, Protocol
 
+import aiohttp
+
 import discord
 from PIL import Image, ImageDraw, ImageFont
 
@@ -178,6 +180,17 @@ def roster_flair_file(team: Team) -> discord.File:
     return build_flair_file(team.color, team.name, dark_mode=team.dark_mode)
 
 
+async def _fetch_url_bytes(url: str) -> bytes | None:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+    except Exception:
+        pass
+    return None
+
+
 async def _fetch_avatar_bytes(member: discord.Member) -> bytes | None:
     url = str(member.display_avatar.replace(size=128, format="png"))
     if url in _avatar_cache:
@@ -190,25 +203,38 @@ async def _fetch_avatar_bytes(member: discord.Member) -> bytes | None:
         return None
 
 
-async def build_avatar_card(team: Team, members: list[discord.Member]) -> discord.File | None:
+async def build_avatar_card(
+    team: Team,
+    members: list[discord.Member],
+    *,
+    slot_filter: str | None = None,
+) -> discord.File | None:
     pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
     if not pool:
         return None
 
-    results = await asyncio.gather(*(_fetch_avatar_bytes(m) for m in pool))
-    av_bytes: dict[int, bytes | None] = {m.id: data for m, data in zip(pool, results)}
+    async def _none() -> None:
+        return None
+
+    avatar_tasks = [_fetch_avatar_bytes(m) for m in pool]
+    logo_task = _fetch_url_bytes(team.logo_url) if team.logo_url else _none()
+    *av_results, logo_bytes = await asyncio.gather(*avatar_tasks, logo_task)
+    av_bytes: dict[int, bytes | None] = {m.id: data for m, data in zip(pool, av_results)}
 
     # Organise by slot, then any remainder not assigned to a slot
     sections: list[tuple[str, list[discord.Member]]] = []
     seen: set[int] = set()
     for slot in sorted(team.slots, key=lambda s: s.sort_order):
+        if slot_filter and slot.label.lower() != slot_filter.lower():
+            continue
         mems = [m for m in pool if any(r.id == slot.slot_role_id for r in m.roles)]
         if mems:
             sections.append((slot.label, mems))
             seen.update(m.id for m in mems)
-    rest = [m for m in pool if m.id not in seen]
-    if rest:
-        sections.append(("Members", rest))
+    if not slot_filter:
+        rest = [m for m in pool if m.id not in seen]
+        if rest:
+            sections.append(("Members", rest))
 
     if not sections:
         return None
@@ -217,16 +243,16 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
     W        = 960
     AVATAR_D = 80
     CELL_W   = 110   # name zone; avatar is centered within it
-    CELL_GAP = 8     # horizontal gap between cells
+    CELL_GAP = 8
     PAD_X    = 32
     PAD_Y    = 22
-    LABEL_H  = 28
-    LABEL_MB = 12
-    NAME_GAP = 6     # pixels between avatar bottom and name baseline
+    LABEL_H  = 38    # taller to match bigger font
+    LABEL_MB = 14
+    NAME_GAP = 6
     NAME_H   = 20
     ROW_H    = AVATAR_D + NAME_GAP + NAME_H
     ROW_GAP  = 14
-    SEC_GAP  = 24
+    SEC_GAP  = 28
 
     per_row = max(1, (W - 2 * PAD_X + CELL_GAP) // (CELL_W + CELL_GAP))
 
@@ -251,12 +277,11 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
     draw = ImageDraw.Draw(img)
 
     try:
-        label_font: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, 16)
+        label_font: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, 24)
     except OSError:
         label_font = ImageFont.load_default()
 
     def _fit_name(text: str) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, str]:
-        """Largest font (11→7 pt) that fits text within CELL_W; truncates if needed."""
         for size in (11, 10, 9, 8, 7):
             try:
                 f: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, size)
@@ -264,7 +289,6 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
                 f = ImageFont.load_default()
             if draw.textbbox((0, 0), text, font=f)[2] <= CELL_W:
                 return f, text
-        # Still too wide at 7 pt — trim characters until it fits
         try:
             f = ImageFont.truetype(_FONT_PATH, 7)
         except OSError:
@@ -276,6 +300,19 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
                 return f, t + "…"
         return f, t
 
+    # Logo — composited top-right before drawing content
+    LOGO_SIZE = 72
+    LOGO_PAD  = 16
+    if logo_bytes:
+        try:
+            logo_img = Image.open(BytesIO(logo_bytes)).convert("RGBA").resize(
+                (LOGO_SIZE, LOGO_SIZE), Image.LANCZOS
+            )
+            lx = W - LOGO_SIZE - LOGO_PAD
+            img.alpha_composite(logo_img, (lx, LOGO_PAD))
+        except Exception:
+            pass
+
     circle_mask = Image.new("L", (AVATAR_D, AVATAR_D), 0)
     ImageDraw.Draw(circle_mask).ellipse((0, 0, AVATAR_D - 1, AVATAR_D - 1), fill=255)
 
@@ -284,18 +321,16 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
         if i:
             y += SEC_GAP
 
-        # Section label centered horizontally
         lbbox = draw.textbbox((0, 0), label.upper(), font=label_font)
         lx = (W - (lbbox[2] - lbbox[0])) // 2
-        draw.text((lx, y), label.upper(), font=label_font, fill=(255, 255, 255, 200))
+        draw.text((lx, y), label.upper(), font=label_font, fill=(255, 255, 255, 220))
         y += LABEL_H + LABEL_MB
 
-        for row_idx, row_start in enumerate(range(0, len(mems), per_row)):
+        for row_start in range(0, len(mems), per_row):
             row = mems[row_start: row_start + per_row]
 
-            # Center this row regardless of how many members are in it
-            row_w  = len(row) * CELL_W + (len(row) - 1) * CELL_GAP
-            row_x  = (W - row_w) // 2
+            row_w = len(row) * CELL_W + (len(row) - 1) * CELL_GAP
+            row_x = (W - row_w) // 2
 
             for col, member in enumerate(row):
                 cell_x = row_x + col * (CELL_W + CELL_GAP)

@@ -48,11 +48,6 @@ class RosterCog(commands.Cog):
 
     @roster.command(name="list", description="List all configured teams in this server")
     async def roster_list(self, interaction: discord.Interaction) -> None:
-        if not _is_admin(interaction):
-            await interaction.response.send_message(
-                "You need **Manage Server** to use this command.", ephemeral=True
-            )
-            return
         assert interaction.guild_id is not None
         async with db.connect() as conn:
             teams = await queries.fetch_all_teams(conn, interaction.guild_id)
@@ -306,8 +301,16 @@ class RosterCog(commands.Cog):
     # ── /roster graphic ───────────────────────────────────────────────────────
 
     @roster.command(name="graphic", description="Generate the avatar card graphic for a team")
-    @app_commands.describe(name="Team identifier (e.g. red bull)")
-    async def roster_graphic(self, interaction: discord.Interaction, name: str) -> None:
+    @app_commands.describe(
+        name="Team identifier (e.g. red bull)",
+        slot="Show only one slot group (optional)",
+    )
+    async def roster_graphic(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        slot: str | None = None,
+    ) -> None:
         assert interaction.guild is not None and interaction.guild_id is not None
 
         async with db.connect() as conn:
@@ -318,13 +321,37 @@ class RosterCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True)
-        avatar_file = await build_avatar_card(team, list(interaction.guild.members))
+        avatar_file = await build_avatar_card(
+            team, list(interaction.guild.members), slot_filter=slot
+        )
         if avatar_file is None:
-            await interaction.followup.send(
-                f"**{team.name}** has no members assigned to slots yet.", ephemeral=True
+            msg = (
+                f"No members found in slot **{slot}** for **{team.name}**."
+                if slot
+                else f"**{team.name}** has no members assigned to slots yet."
             )
+            await interaction.followup.send(msg, ephemeral=True)
             return
         await interaction.followup.send(file=avatar_file, ephemeral=True)
+
+    @roster_graphic.autocomplete("slot")
+    async def _graphic_slot_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        assert interaction.guild_id is not None
+        # Pull team name from the already-typed options
+        opts = interaction.data.get("options", [])  # type: ignore[union-attr]
+        name_val = next(
+            (o["value"] for o in opts if o.get("name") == "name"), None
+        )
+        if not name_val:
+            return []
+        async with db.connect() as conn:
+            team = await queries.fetch_team(conn, interaction.guild_id, str(name_val).lower())
+        if team is None:
+            return []
+        labels = [s.label for s in team.slots if current.lower() in s.label.lower()]
+        return [app_commands.Choice(name=l, value=l) for l in labels[:25]]
 
     # ── /roster bulksign / bulkdrop ───────────────────────────────────────────
 
