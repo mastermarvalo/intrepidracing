@@ -1,42 +1,75 @@
+import os
 from io import BytesIO
 from typing import Literal, Protocol
 
 import discord
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from bot.models import SlotType, Team, TeamSlot
 
-# bytes cache so we only run Pillow once per unique color
-_flair_cache: dict[int | None, bytes] = {}
+_FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "TitilliumWeb-Bold.ttf")
 
-_FLAIR_W, _FLAIR_H = 800, 48
+# bytes cache keyed by (color, team_name)
+_flair_cache: dict[tuple[int | None, str], bytes] = {}
+
+_FLAIR_W = 800
+_TITLE_H = 60
+_GAP = 8
+_DIAMOND_AREA_H = 52
+_FLAIR_H = _TITLE_H + _GAP + _DIAMOND_AREA_H  # 120
+_DIAMOND_CY = _TITLE_H + _GAP + _DIAMOND_AREA_H // 2  # 94
 _DIAMOND_SIZES = [10, 13, 16, 20, 16, 13, 10]
 
 
-def _render_flair_bytes(color: int | None) -> bytes:
+def _render_flair_bytes(color: int | None, team_name: str) -> bytes:
     rgb_int = color if color is not None else 0x5865F2  # blurple fallback
     r, g, b = (rgb_int >> 16) & 0xFF, (rgb_int >> 8) & 0xFF, rgb_int & 0xFF
 
     img = Image.new("RGBA", (_FLAIR_W, _FLAIR_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
+    # Title bar
+    draw.rectangle([(0, 0), (_FLAIR_W - 1, _TITLE_H - 1)], fill=(r, g, b, 255))
+
+    # Team name in white, auto-sized to fit within padding
+    font_size = 36
+    font: ImageFont.ImageFont | ImageFont.FreeTypeFont = ImageFont.load_default()
+    while font_size >= 10:
+        try:
+            f = ImageFont.truetype(_FONT_PATH, font_size)
+            bbox = draw.textbbox((0, 0), team_name, font=f)
+            if bbox[2] - bbox[0] <= _FLAIR_W - 40:
+                font = f
+                break
+        except OSError:
+            break
+        font_size -= 2
+
+    bbox = draw.textbbox((0, 0), team_name, font=font)
+    tx = (_FLAIR_W - (bbox[2] - bbox[0])) // 2
+    ty = (_TITLE_H - (bbox[3] - bbox[1])) // 2 - bbox[1]
+    draw.text((tx, ty), team_name, font=font, fill=(255, 255, 255, 255))
+
+    # Diamond row below the title bar
     n = len(_DIAMOND_SIZES)
     spacing = _FLAIR_W // (n + 1)
-    cy = _FLAIR_H // 2
-
     for i, s in enumerate(_DIAMOND_SIZES):
         cx = spacing * (i + 1)
-        draw.polygon([(cx, cy - s), (cx + s, cy), (cx, cy + s), (cx - s, cy)], fill=(r, g, b, 255))
+        draw.polygon(
+            [(cx, _DIAMOND_CY - s), (cx + s, _DIAMOND_CY), (cx, _DIAMOND_CY + s), (cx - s, _DIAMOND_CY)],
+            fill=(r, g, b, 255),
+        )
 
     buf = BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
 
 
-def build_flair_file(color: int | None) -> discord.File:
-    if color not in _flair_cache:
-        _flair_cache[color] = _render_flair_bytes(color)
-    return discord.File(BytesIO(_flair_cache[color]), filename="flair.png")
+def build_flair_file(color: int | None, team_name: str) -> discord.File:
+    key = (color, team_name)
+    if key not in _flair_cache:
+        _flair_cache[key] = _render_flair_bytes(color, team_name)
+    return discord.File(BytesIO(_flair_cache[key]), filename="flair.png")
 
 
 class MemberLike(Protocol):
@@ -88,13 +121,14 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
 
     embed = discord.Embed(
-        color=discord.Color(team.color) if team.color is not None else discord.Color.blurple()
+        title=team.name,
+        color=discord.Color(team.color) if team.color is not None else discord.Color.blurple(),
     )
 
     if team.logo_url:
         embed.set_thumbnail(url=team.logo_url)
 
-    sections: list[str] = [f"# __{team.name}__"]
+    sections: list[str] = []
 
     if team.tagline:
         sections.append(team.tagline)
@@ -107,10 +141,26 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     if driver_text:
         sections.append(f"## __Drivers__\n{driver_text}")
 
-    embed.description = "\n\n".join(sections)
-    embed.set_image(url="attachment://flair.png")
+    embed.description = "\n\n".join(sections) if sections else None
+
+    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
+        embed.add_field(name=team.info_label, value=team.info_body, inline=False)
+
+    if team.banner_url:
+        embed.set_image(url=team.banner_url)
+    elif team.logo_url:
+        embed.set_image(url=team.logo_url)  # also shown large at the bottom
+    else:
+        embed.set_image(url="attachment://flair.png")
 
     return embed
+
+
+def roster_flair_file(team: Team) -> discord.File | None:
+    """Returns a generated flair file only when neither banner_url nor logo_url provides a bottom image."""
+    if team.logo_url or team.banner_url:
+        return None
+    return build_flair_file(team.color, team.name)
 
 
 

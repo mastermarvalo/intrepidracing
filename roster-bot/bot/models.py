@@ -35,9 +35,12 @@ class Team:
     channel_id: int
     tagline: str | None = None
     logo_url: str | None = None
+    banner_url: str | None = None
     principal_role_id: int | None = None
     color: int | None = None
     message_id: int | None = None
+    info_label: str | None = None
+    info_body: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     slots: list[TeamSlot] = field(default_factory=list)
 

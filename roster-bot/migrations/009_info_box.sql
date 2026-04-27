@@ -1,0 +1,2 @@
+ALTER TABLE teams ADD COLUMN info_label TEXT;
+ALTER TABLE teams ADD COLUMN info_body TEXT;

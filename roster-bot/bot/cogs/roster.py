@@ -15,7 +15,7 @@ from discord.ext import commands
 
 from bot import db, flow, queries
 from bot.events import _rerender, _rerender_fa
-from bot.render import build_embed, build_fa_embed, build_flair_file
+from bot.render import build_embed, build_fa_embed, roster_flair_file
 
 log = logging.getLogger(__name__)
 
@@ -182,7 +182,11 @@ class RosterCog(commands.Cog):
             return
 
         embed = build_embed(team, list(interaction.guild.members))
-        await interaction.response.send_message(embed=embed, file=build_flair_file(team.color), ephemeral=True)
+        flair = roster_flair_file(team)
+        if flair:
+            await interaction.response.send_message(embed=embed, file=flair, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── /roster sign ──────────────────────────────────────────────────────────
 

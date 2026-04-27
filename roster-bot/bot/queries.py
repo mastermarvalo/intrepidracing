@@ -34,9 +34,12 @@ def _row_to_team(row: aiosqlite.Row, slots: list[TeamSlot]) -> Team:
         channel_id=row["channel_id"],
         tagline=row["tagline"],
         logo_url=row["logo_url"],
+        banner_url=row["banner_url"],
         principal_role_id=row["principal_role_id"],
         color=row["color"],
         message_id=row["message_id"],
+        info_label=row["info_label"],
+        info_body=row["info_body"],
         slots=slots,
     )
 
@@ -92,17 +95,22 @@ async def insert_team(
     channel_id: int,
     tagline: str | None,
     logo_url: str | None,
+    banner_url: str | None,
     principal_role_id: int | None,
     color: int | None = None,
+    info_label: str | None = None,
+    info_body: str | None = None,
 ) -> int:
     """Insert a new team row and return its id."""
     async with conn.execute(
         """
         INSERT INTO teams
-            (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, principal_role_id, color)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, banner_url,
+             principal_role_id, color, info_label, info_body)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, principal_role_id, color),
+        (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, banner_url,
+         principal_role_id, color, info_label, info_body),
     ) as cur:
         assert cur.lastrowid is not None
         return cur.lastrowid
@@ -116,17 +124,21 @@ async def update_team(
     channel_id: int,
     tagline: str | None,
     logo_url: str | None,
+    banner_url: str | None,
     principal_role_id: int | None,
     color: int | None = None,
+    info_label: str | None = None,
+    info_body: str | None = None,
 ) -> None:
     await conn.execute(
         """
         UPDATE teams
-        SET name = ?, team_role_id = ?, channel_id = ?, tagline = ?, logo_url = ?,
-            principal_role_id = ?, color = ?
+        SET name = ?, team_role_id = ?, channel_id = ?, tagline = ?, logo_url = ?, banner_url = ?,
+            principal_role_id = ?, color = ?, info_label = ?, info_body = ?
         WHERE id = ?
         """,
-        (name, team_role_id, channel_id, tagline, logo_url, principal_role_id, color, team_id),
+        (name, team_role_id, channel_id, tagline, logo_url, banner_url,
+         principal_role_id, color, info_label, info_body, team_id),
     )
 
 

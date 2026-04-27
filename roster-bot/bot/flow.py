@@ -1,7 +1,7 @@
 """
 Guided create/edit flow for /roster create and /roster edit.
 
-The flow is eight steps:
+The flow is nine steps:
   1. Modal  — team name, tagline, logo URL
   2. View   — pick team color (presets or custom hex)
   3. View   — pick the "team role" (who counts as on this team)
@@ -9,7 +9,8 @@ The flow is eight steps:
   5. View   — build staff slots (Add/Done loop)
   6. View   — build driver slots (same loop)
   7. View   — pick the channel to post in
-  8. View   — preview and confirm
+  8. View   — optional info box (custom labeled section)
+  9. View   — preview and confirm
 
 State is collected in a FlowState object and stored in `_sessions` while the
 admin works through the steps.  It's discarded when the flow finishes or times out.
@@ -40,7 +41,7 @@ import discord
 
 from bot import db, queries
 from bot.models import Team, TeamSlot
-from bot.render import build_embed, build_flair_file
+from bot.render import build_embed, roster_flair_file
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class FlowState:
     display_name: str = ""
     tagline: str = ""
     logo_url: str = ""
+    banner_url: str = ""
 
     # Step 2
     color: Optional[int] = None
@@ -116,6 +118,10 @@ class FlowState:
 
     # Step 7
     channel_id: int = 0
+
+    # Step 8 — optional info box
+    info_label: str = ""
+    info_body: str = ""
 
     # Set during relink flow — the existing Discord message to take over.
     # When present, step 7 (channel picker) is skipped and _commit_and_post
@@ -205,10 +211,13 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
         display_name=existing.name,
         tagline=existing.tagline or "",
         logo_url=existing.logo_url or "",
+        banner_url=existing.banner_url or "",
         color=existing.color,
         team_role_id=existing.team_role_id,
         principal_role_id=existing.principal_role_id,
         channel_id=existing.channel_id,
+        info_label=existing.info_label or "",
+        info_body=existing.info_body or "",
     )
     for s in existing.slots:
         draft = SlotDraft(
@@ -243,7 +252,7 @@ async def start_relink(interaction: discord.Interaction, team_key: str) -> None:
 # ── step 1: text fields ───────────────────────────────────────────────────────
 
 
-class _Step1Modal(discord.ui.Modal, title="Team Setup (1/8)"):
+class _Step1Modal(discord.ui.Modal, title="Team Setup (1/9)"):
     team_name = discord.ui.TextInput(
         label="Display name", placeholder="Red Bull Racing", max_length=64
     )
@@ -254,8 +263,14 @@ class _Step1Modal(discord.ui.Modal, title="Team Setup (1/8)"):
         max_length=120,
     )
     logo_url = discord.ui.TextInput(
-        label="Logo URL (optional)",
+        label="Logo image (optional)",
         placeholder="https://example.com/logo.png",
+        required=False,
+        max_length=256,
+    )
+    banner_url = discord.ui.TextInput(
+        label="Accent image (optional)",
+        placeholder="https://example.com/banner.png",
         required=False,
         max_length=256,
     )
@@ -269,11 +284,14 @@ class _Step1Modal(discord.ui.Modal, title="Team Setup (1/8)"):
             self.tagline.default = state.tagline
         if state.logo_url:
             self.logo_url.default = state.logo_url
+        if state.banner_url:
+            self.banner_url.default = state.banner_url
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         self._state.display_name = self.team_name.value.strip()
         self._state.tagline = self.tagline.value.strip()
         self._state.logo_url = self.logo_url.value.strip()
+        self._state.banner_url = self.banner_url.value.strip()
         await _show_step2_color(interaction, self._state)
 
 
@@ -290,8 +308,14 @@ class _RelinkStep1Modal(discord.ui.Modal, title="Team Relink — Setup"):
         max_length=120,
     )
     logo_url = discord.ui.TextInput(
-        label="Logo URL (optional)",
+        label="Logo image (optional)",
         placeholder="https://example.com/logo.png",
+        required=False,
+        max_length=256,
+    )
+    banner_url = discord.ui.TextInput(
+        label="Accent image (optional)",
+        placeholder="https://example.com/banner.png",
         required=False,
         max_length=256,
     )
@@ -321,6 +345,7 @@ class _RelinkStep1Modal(discord.ui.Modal, title="Team Relink — Setup"):
         self._state.display_name = self.team_name.value.strip()
         self._state.tagline = self.tagline.value.strip()
         self._state.logo_url = self.logo_url.value.strip()
+        self._state.banner_url = self.banner_url.value.strip()
         self._state.channel_id = channel_id
         self._state.relink_message_id = message_id
         await _show_step2_color(interaction, self._state)
@@ -332,7 +357,7 @@ class _RelinkStep1Modal(discord.ui.Modal, title="Team Relink — Setup"):
 async def _show_step2_color(interaction: discord.Interaction, state: FlowState) -> None:
     view = _Step2ColorView(state)
     await interaction.response.send_message(
-        "**Step 2 of 8 — Team color**\n"
+        "**Step 2 of 9 — Team color**\n"
         "Pick a color for this team's embeds, or enter a custom hex code.\n"
         "This color will appear on all roster and transaction messages.",
         view=view,
@@ -357,6 +382,7 @@ class _Step2ColorView(discord.ui.View):
         self._sel = discord.ui.Select(placeholder="Choose a color…", options=options)
         self._sel.callback = self._on_select
         self.add_item(self._sel)
+        self.finish_editing.disabled = state.existing_team is None
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         value = self._sel.values[0]
@@ -371,6 +397,11 @@ class _Step2ColorView(discord.ui.View):
             self._state.color = int(value)
         self.stop()
         await _show_step3_team_role(interaction, self._state)
+
+    @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary, row=1)
+    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
@@ -409,7 +440,7 @@ async def _show_step3_team_role(
 ) -> None:
     view = _Step3TeamRoleView(state)
     content = (
-        "**Step 3 of 8 — Team role**\n"
+        "**Step 3 of 9 — Team role**\n"
         "Pick the Discord role that marks someone as being on this team."
     )
     if from_modal:
@@ -425,10 +456,8 @@ class _Step3TeamRoleView(discord.ui.View):
         sel = discord.ui.RoleSelect(placeholder="Select team role…", min_values=1, max_values=1)
         sel.callback = self._on_select
         self.add_item(sel)
-        if state.team_role_id:
-            self.keep_current.disabled = False
-        else:
-            self.keep_current.disabled = True
+        self.keep_current.disabled = not bool(state.team_role_id)
+        self.finish_editing.disabled = state.existing_team is None
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
@@ -440,6 +469,11 @@ class _Step3TeamRoleView(discord.ui.View):
     async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
         await _show_step4_principal_role(interaction, self._state)
+
+    @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
+    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
@@ -459,7 +493,7 @@ async def _show_step4_principal_role(interaction: discord.Interaction, state: Fl
     view = _Step4PrincipalRoleView(state)
     await interaction.response.edit_message(
         content=(
-            "**Step 4 of 8 — Principal role (optional)**\n"
+            "**Step 4 of 9 — Principal role (optional)**\n"
             "Pick a role whose members can use `/roster sign` and `/roster drop` for this team.\n"
             + hint
         ),
@@ -482,6 +516,7 @@ class _Step4PrincipalRoleView(discord.ui.View):
             self.skip_or_clear.label = "Clear →"
         else:
             self.keep_current.disabled = True
+        self.finish_editing.disabled = not editing
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         self._state.principal_role_id = self._sel.values[0].id
@@ -498,6 +533,11 @@ class _Step4PrincipalRoleView(discord.ui.View):
         self._state.principal_role_id = None
         self.stop()
         await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
+
+    @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
+    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
@@ -531,7 +571,7 @@ async def _show_builder(
     slots = state.staff_slots if slot_type == "staff" else state.driver_slots
     label = slot_type.capitalize()
     content = (
-        f"**Step {step_num} of 8 — {label} slots**\n"
+        f"**Step {step_num} of 9 — {label} slots**\n"
         f"Add as many {label.lower()} slots as you need, then click **Done →**.\n\n"
         f"**Current {label.lower()} slots:**\n{_slot_summary(slots)}"
     )
@@ -549,6 +589,7 @@ class _BuilderView(discord.ui.View):
         slots = state.staff_slots if slot_type == "staff" else state.driver_slots
         if not slots:
             self.remove_slot.disabled = True
+        self.finish_editing.disabled = state.existing_team is None
 
     @discord.ui.button(label="Add slot", style=discord.ButtonStyle.primary)
     async def add_slot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -574,9 +615,14 @@ class _BuilderView(discord.ui.View):
         if self._step_num == 5:
             await _show_builder(interaction, self._state, slot_type="driver", step_num=6)
         elif self._state.relink_message_id is not None:
-            await _show_step8_confirm(interaction, self._state)
+            await _show_step9_confirm(interaction, self._state)
         else:
             await _show_step7_channel(interaction, self._state)
+
+    @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary, row=1)
+    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
@@ -696,8 +742,8 @@ async def _show_step7_channel(interaction: discord.Interaction, state: FlowState
     hint = f" Click **Keep current →** to keep <#{state.channel_id}>." if state.channel_id else ""
     await interaction.response.edit_message(
         content=(
-            "**Step 7 of 8 — Channel**\n"
-            f"Pick the text channel where the roster will be posted.{hint}"
+            "**Step 7 of 9 — Channel**\n"
+            f"Pick the text or forum channel where the roster will be posted.{hint}"
         ),
         view=view,
     )
@@ -708,31 +754,118 @@ class _Step7ChannelView(discord.ui.View):
         super().__init__(timeout=300)
         self._state = state
         sel = discord.ui.ChannelSelect(
-            placeholder="Select a text channel…",
-            channel_types=[discord.ChannelType.text],
+            placeholder="Select a text or forum channel…",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.forum],
             min_values=1,
             max_values=1,
         )
         sel.callback = self._on_select
         self.add_item(sel)
         self.keep_current.disabled = not bool(state.channel_id)
+        self.finish_editing.disabled = state.existing_team is None
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         sel: discord.ui.ChannelSelect = self.children[0]  # type: ignore[assignment]
         self._state.channel_id = sel.values[0].id
         self.stop()
-        await _show_step8_confirm(interaction, self._state)
+        await _show_step8_info(interaction, self._state)
 
     @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
     async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        await _show_step8_confirm(interaction, self._state)
+        await _show_step8_info(interaction, self._state)
+
+    @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
+    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
 
 
-# ── step 8: preview & confirm ─────────────────────────────────────────────────
+# ── step 8: additional info (optional) ───────────────────────────────────────
+
+
+async def _show_step8_info(
+    interaction: discord.Interaction, state: FlowState, *, from_modal: bool = False
+) -> None:
+    view = _Step8InfoView(state)
+    current = ""
+    if state.info_label and state.info_body:
+        preview = state.info_body[:60] + ("…" if len(state.info_body) > 60 else "")
+        current = f"\n\n**Current:** **{state.info_label}** — {preview}"
+    content = (
+        "**Step 8 of 9 — Additional info (optional)**\n"
+        "Add a custom labeled section to the roster (e.g. accolades, achievements)."
+        + current
+    )
+    if from_modal:
+        await interaction.response.send_message(content, view=view, ephemeral=True)
+    else:
+        await interaction.response.edit_message(content=content, view=view)
+
+
+class _Step8InfoView(discord.ui.View):
+    def __init__(self, state: FlowState) -> None:
+        super().__init__(timeout=300)
+        self._state = state
+        self.clear_info.disabled = not (state.info_label or state.info_body)
+        self.finish_editing.disabled = state.existing_team is None
+
+    @discord.ui.button(label="Set info box", style=discord.ButtonStyle.primary)
+    async def set_info(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(_InfoBoxModal(self._state))
+
+    @discord.ui.button(label="Clear", style=discord.ButtonStyle.danger)
+    async def clear_info(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self._state.info_label = ""
+        self._state.info_body = ""
+        self.stop()
+        await _show_step8_info(interaction, self._state)
+
+    @discord.ui.button(label="Next →", style=discord.ButtonStyle.success)
+    async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
+
+    @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
+    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
+
+    async def on_timeout(self) -> None:
+        _discard(self._state)
+
+
+class _InfoBoxModal(discord.ui.Modal, title="Info Box"):
+    label_input = discord.ui.TextInput(
+        label="Section label",
+        placeholder="Accolades",
+        max_length=64,
+    )
+    body_input = discord.ui.TextInput(
+        label="Content",
+        placeholder="2x WCC | 3x WDC",
+        style=discord.TextStyle.paragraph,
+        max_length=1024,
+    )
+
+    def __init__(self, state: FlowState) -> None:
+        super().__init__()
+        self._state = state
+        if state.info_label:
+            self.label_input.default = state.info_label
+        if state.info_body:
+            self.body_input.default = state.info_body
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self._state.info_label = self.label_input.value.strip()
+        self._state.info_body = self.body_input.value.strip()
+        await _show_step8_info(interaction, self._state, from_modal=True)
+
+
+# ── step 9: preview & confirm ─────────────────────────────────────────────────
 
 
 def _preview_team(state: FlowState) -> Team:
@@ -751,17 +884,21 @@ def _preview_team(state: FlowState) -> Team:
         name=state.display_name, team_role_id=state.team_role_id,
         channel_id=state.channel_id,
         tagline=state.tagline or None, logo_url=state.logo_url or None,
+        banner_url=state.banner_url or None,
         principal_role_id=state.principal_role_id,
         color=state.color,
+        info_label=state.info_label or None,
+        info_body=state.info_body or None,
         slots=slots,
     )
 
 
-async def _show_step8_confirm(interaction: discord.Interaction, state: FlowState) -> None:
+async def _show_step9_confirm(interaction: discord.Interaction, state: FlowState) -> None:
     assert interaction.guild is not None
-    embed = build_embed(_preview_team(state), list(interaction.guild.members))
-    flair = build_flair_file(state.color)
-    view = _Step8ConfirmView(state)
+    preview = _preview_team(state)
+    embed = build_embed(preview, list(interaction.guild.members))
+    flair = roster_flair_file(preview)
+    view = _Step9ConfirmView(state)
     if state.relink_message_id is not None:
         content = (
             "**Confirm — Relink existing roster**\n"
@@ -770,14 +907,16 @@ async def _show_step8_confirm(interaction: discord.Interaction, state: FlowState
         )
     else:
         content = (
-            "**Step 8 of 8 — Confirm**\n"
+            "**Step 9 of 9 — Confirm**\n"
             "Here's how the roster will look. Member mentions are live.\n"
             f"Posting to <#{state.channel_id}>."
         )
-    await interaction.response.edit_message(content=content, embed=embed, view=view, attachments=[flair])
+    await interaction.response.edit_message(
+        content=content, embed=embed, view=view, attachments=[flair] if flair else []
+    )
 
 
-class _Step8ConfirmView(discord.ui.View):
+class _Step9ConfirmView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
@@ -810,14 +949,44 @@ class _Step8ConfirmView(discord.ui.View):
 
 # ── write to DB and post the embed ────────────────────────────────────────────
 
+_RosterChannel = discord.TextChannel | discord.ForumChannel
+
+
+async def _get_thread(client: discord.Client, thread_id: int) -> discord.Thread | None:
+    """Return a Thread from cache, falling back to a fetch."""
+    ch = client.get_channel(thread_id)
+    if isinstance(ch, discord.Thread):
+        return ch
+    try:
+        ch = await client.fetch_channel(thread_id)
+        return ch if isinstance(ch, discord.Thread) else None
+    except (discord.NotFound, discord.Forbidden):
+        return None
+
+
+async def _fetch_roster_msg(
+    client: discord.Client,
+    channel: _RosterChannel,
+    message_id: int,
+) -> discord.Message | None:
+    """Fetch the roster message from either a text channel or a forum thread."""
+    try:
+        if isinstance(channel, discord.TextChannel):
+            return await channel.fetch_message(message_id)
+        else:  # ForumChannel — message_id == thread_id
+            thread = await _get_thread(client, message_id)
+            return await thread.fetch_message(message_id) if thread else None
+    except (discord.NotFound, discord.Forbidden):
+        return None
+
 
 async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -> int:
     """Save the team to the DB and post (or update) the roster embed. Returns the message ID."""
     assert interaction.guild is not None
 
     channel = interaction.guild.get_channel(state.channel_id)
-    if not isinstance(channel, discord.TextChannel):
-        raise ValueError(f"Channel {state.channel_id} is not available as a text channel")
+    if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+        raise ValueError(f"Channel {state.channel_id} is not available as a text or forum channel")
 
     all_slots = [
         (s.slot_role_id, s.label, s.quantity, s.slot_type, i)
@@ -831,8 +1000,11 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 guild_id=state.guild_id, key=state.team_key, name=state.display_name,
                 team_role_id=state.team_role_id, channel_id=state.channel_id,
                 tagline=state.tagline or None, logo_url=state.logo_url or None,
+                banner_url=state.banner_url or None,
                 principal_role_id=state.principal_role_id,
                 color=state.color,
+                info_label=state.info_label or None,
+                info_body=state.info_body or None,
             )
         else:
             team_id = state.existing_team.id
@@ -840,8 +1012,11 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 conn, team_id=team_id, name=state.display_name,
                 team_role_id=state.team_role_id, channel_id=state.channel_id,
                 tagline=state.tagline or None, logo_url=state.logo_url or None,
+                banner_url=state.banner_url or None,
                 principal_role_id=state.principal_role_id,
                 color=state.color,
+                info_label=state.info_label or None,
+                info_body=state.info_body or None,
             )
 
         await queries.replace_slots(conn, team_id, all_slots)
@@ -850,35 +1025,45 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
         assert team is not None
 
     embed = build_embed(team, list(interaction.guild.members))
+    flair = roster_flair_file(team)
+    attachments = [flair] if flair else []
 
     # Relink: take over an existing message
     if state.relink_message_id is not None:
-        try:
-            existing_msg = await channel.fetch_message(state.relink_message_id)
-            await existing_msg.edit(embed=embed, attachments=[build_flair_file(team.color)])
-            async with db.connect() as conn:
-                await queries.set_message_id(conn, team_id, existing_msg.id)
-                await conn.commit()
-            return existing_msg.id
-        except discord.NotFound:
-            log.warning(
-                "Relink target message %s not found — posting a new message instead",
-                state.relink_message_id,
-            )
-        except discord.Forbidden:
-            log.warning("No permission to edit relink target message %s", state.relink_message_id)
+        existing_msg = await _fetch_roster_msg(interaction.client, channel, state.relink_message_id)
+        if existing_msg is not None:
+            try:
+                await existing_msg.edit(embed=embed, attachments=attachments)
+                async with db.connect() as conn:
+                    await queries.set_message_id(conn, team_id, existing_msg.id)
+                    await conn.commit()
+                return existing_msg.id
+            except discord.Forbidden:
+                log.warning("No permission to edit relink target message %s", state.relink_message_id)
+        else:
+            log.warning("Relink target message %s not found — posting new", state.relink_message_id)
 
-    # Normal create, or relink fallback if the target message was gone
+    # Normal edit: update the existing posted message
     if state.existing_team and state.existing_team.message_id:
-        try:
-            old_msg = await channel.fetch_message(state.existing_team.message_id)
-            await old_msg.edit(embed=embed, attachments=[build_flair_file(team.color)])
+        old_msg = await _fetch_roster_msg(interaction.client, channel, state.existing_team.message_id)
+        if old_msg is not None:
+            await old_msg.edit(embed=embed, attachments=attachments)
             return old_msg.id
-        except discord.NotFound:
-            pass  # Message was deleted; fall through and send a new one
+        # Message was deleted; fall through and send a new one
 
-    msg = await channel.send(embed=embed, file=build_flair_file(team.color))
+    # New post
+    if isinstance(channel, discord.ForumChannel):
+        thread = await channel.create_thread(
+            name=team.name, embed=embed, **{"file": flair} if flair else {}
+        )
+        msg_id = thread.id
+    elif flair:
+        msg = await channel.send(embed=embed, file=flair)
+        msg_id = msg.id
+    else:
+        msg = await channel.send(embed=embed)
+        msg_id = msg.id
     async with db.connect() as conn:
-        await queries.set_message_id(conn, team_id, msg.id)
+        await queries.set_message_id(conn, team_id, msg_id)
         await conn.commit()
-    return msg.id
+    return msg_id
