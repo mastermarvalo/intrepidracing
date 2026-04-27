@@ -184,7 +184,7 @@ class RosterCog(commands.Cog):
         roster_embed = build_embed(team, list(interaction.guild.members))
         flair = roster_flair_file(team)
         await interaction.response.send_message(
-            embeds=[build_flair_embed(), roster_embed], file=flair, ephemeral=True
+            embeds=[build_flair_embed(team.color), roster_embed], file=flair, ephemeral=True
         )
 
     # ── /roster sign ──────────────────────────────────────────────────────────

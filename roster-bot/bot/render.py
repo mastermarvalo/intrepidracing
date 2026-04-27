@@ -137,13 +137,15 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     return embed
 
 
-def build_flair_embed() -> discord.Embed:
+def build_flair_embed(color: int | None) -> discord.Embed:
     """A standalone embed whose only content is the flair image.
 
     Sent as the *first* embed in every roster message so the title-card
     appears at the very top, above the roster content embed.
     """
-    e = discord.Embed()
+    e = discord.Embed(
+        color=discord.Color(color) if color is not None else discord.Color.blurple()
+    )
     e.set_image(url="attachment://flair.png")
     return e
 

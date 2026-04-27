@@ -1038,7 +1038,7 @@ async def _show_step9_confirm(interaction: discord.Interaction, state: FlowState
             f"Posting to <#{state.channel_id}>."
         )
     await interaction.response.edit_message(
-        content=content, embeds=[build_flair_embed(), roster_embed], view=view, attachments=[flair]
+        content=content, embeds=[build_flair_embed(preview.color), roster_embed], view=view, attachments=[flair]
     )
 
 
@@ -1152,7 +1152,7 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
 
     roster_embed = build_embed(team, list(interaction.guild.members))
     flair = roster_flair_file(team)
-    embeds = [build_flair_embed(), roster_embed]
+    embeds = [build_flair_embed(team.color), roster_embed]
 
     # Relink: take over an existing message
     if state.relink_message_id is not None:

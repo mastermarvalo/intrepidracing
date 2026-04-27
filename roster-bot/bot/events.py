@@ -150,7 +150,7 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
 
     roster_embed = build_embed(team, list(guild.members))
     flair = roster_flair_file(team)
-    embeds = [build_flair_embed(), roster_embed]
+    embeds = [build_flair_embed(team.color), roster_embed]
 
     try:
         if isinstance(channel, discord.TextChannel):
