@@ -26,17 +26,24 @@ async def _rerender_board(bot: commands.Bot, board) -> None:  # type: ignore[typ
     """Fetch fresh sheet data, rebuild the embed, and edit the pinned message.
 
     If the message was deleted (or never posted), re-posts it so the board is self-healing.
+    Works for both text channels and forum channels.
     """
     embed = await sheets.fetch_and_build_embed(board.title, board.sheet_id, board.sheet_range)
 
     channel = bot.get_channel(board.channel_id)
-    if not isinstance(channel, discord.TextChannel):
+    if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
         log.warning("Stat board %r: channel %s unavailable", board.title, board.channel_id)
         return
 
     if board.message_id is not None:
         try:
-            msg = await channel.fetch_message(board.message_id)
+            if isinstance(channel, discord.TextChannel):
+                msg = await channel.fetch_message(board.message_id)
+            else:  # ForumChannel — message_id == thread_id
+                thread = bot.get_channel(board.message_id)
+                if not isinstance(thread, discord.Thread):
+                    thread = await bot.fetch_channel(board.message_id)
+                msg = await thread.fetch_message(board.message_id)  # type: ignore[union-attr]
             await msg.edit(embed=embed)
             return
         except discord.NotFound:
@@ -51,7 +58,12 @@ async def _rerender_board(bot: commands.Bot, board) -> None:  # type: ignore[typ
 
     # message_id is None or the message was deleted — re-post
     try:
-        msg = await channel.send(embed=embed)
+        if isinstance(channel, discord.ForumChannel):
+            thread = await channel.create_thread(name=board.title, embed=embed)
+            msg_id = thread.id
+        else:
+            msg = await channel.send(embed=embed)
+            msg_id = msg.id
     except discord.Forbidden:
         log.warning(
             "Stat board %r: no permission to post in channel %s",
@@ -60,9 +72,9 @@ async def _rerender_board(bot: commands.Bot, board) -> None:  # type: ignore[typ
         )
         return
     async with db.connect() as conn:
-        await queries.set_stat_board_message_id(conn, board.id, msg.id)
+        await queries.set_stat_board_message_id(conn, board.id, msg_id)
         await conn.commit()
-    log.info("Stat board %r: re-posted as message %s", board.title, msg.id)
+    log.info("Stat board %r: re-posted as message %s", board.title, msg_id)
 
 
 class SheetsCog(commands.Cog):
@@ -84,7 +96,7 @@ class SheetsCog(commands.Cog):
     @app_commands.describe(
         title="Display title for the board",
         url="Google Sheets URL",
-        channel="Channel to post the board in",
+        channel="Text or forum channel to post the board in",
         range="Sheet tab / range (default: Sheet1)",
     )
     async def sheets_add(
@@ -92,7 +104,7 @@ class SheetsCog(commands.Cog):
         interaction: discord.Interaction,
         title: str,
         url: str,
-        channel: discord.TextChannel,
+        channel: discord.TextChannel | discord.ForumChannel,
         range: str = "Sheet1",
     ) -> None:
         if not _is_admin(interaction):
@@ -117,13 +129,18 @@ class SheetsCog(commands.Cog):
         embed = await sheets.fetch_and_build_embed(title, sheet_id, range)
         fetch_failed = embed.color == discord.Color.red()
 
-        msg = await channel.send(embed=embed)
+        if isinstance(channel, discord.ForumChannel):
+            thread = await channel.create_thread(name=title, embed=embed)
+            msg_id = thread.id
+        else:
+            msg = await channel.send(embed=embed)
+            msg_id = msg.id
 
         async with db.connect() as conn:
             board_id = await queries.insert_stat_board(
                 conn, interaction.guild_id, title, sheet_id, range, channel.id
             )
-            await queries.set_stat_board_message_id(conn, board_id, msg.id)
+            await queries.set_stat_board_message_id(conn, board_id, msg_id)
             await conn.commit()
 
         if fetch_failed:
@@ -273,7 +290,13 @@ class _ConfirmRemoveBoardView(discord.ui.View):
             if board.message_id:
                 try:
                     channel = self._bot.get_channel(board.channel_id)
-                    if isinstance(channel, discord.TextChannel):
+                    if isinstance(channel, discord.ForumChannel):
+                        thread = self._bot.get_channel(board.message_id)
+                        if not isinstance(thread, discord.Thread):
+                            thread = await self._bot.fetch_channel(board.message_id)
+                        if isinstance(thread, discord.Thread):
+                            await thread.delete()
+                    elif isinstance(channel, discord.TextChannel):
                         msg = await channel.fetch_message(board.message_id)
                         await msg.delete()
                 except (discord.NotFound, discord.Forbidden):
