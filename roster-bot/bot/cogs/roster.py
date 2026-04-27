@@ -75,7 +75,7 @@ class RosterCog(commands.Cog):
     # ── /roster remove ────────────────────────────────────────────────────────
 
     @roster.command(name="remove", description="Delete a team config and its roster message")
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_remove(self, interaction: discord.Interaction, name: str) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message(
@@ -102,7 +102,7 @@ class RosterCog(commands.Cog):
     # ── /roster create ────────────────────────────────────────────────────────
 
     @roster.command(name="create", description="Create a new team roster")
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_create(self, interaction: discord.Interaction, name: str) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message(
@@ -114,7 +114,7 @@ class RosterCog(commands.Cog):
     # ── /roster edit ──────────────────────────────────────────────────────────
 
     @roster.command(name="edit", description="Edit an existing team roster")
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_edit(self, interaction: discord.Interaction, name: str) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message(
@@ -129,7 +129,7 @@ class RosterCog(commands.Cog):
         name="relink",
         description="Emergency recovery: re-register a team whose DB record was lost",
     )
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_relink(self, interaction: discord.Interaction, name: str) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message(
@@ -171,7 +171,7 @@ class RosterCog(commands.Cog):
     # ── /roster view ──────────────────────────────────────────────────────────
 
     @roster.command(name="view", description="View a team's current roster")
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_view(self, interaction: discord.Interaction, name: str) -> None:
         assert interaction.guild is not None and interaction.guild_id is not None
 
@@ -191,7 +191,7 @@ class RosterCog(commands.Cog):
     # ── /roster sign ──────────────────────────────────────────────────────────
 
     @roster.command(name="sign", description="Sign a player to a team")
-    @app_commands.describe(name="Team identifier (e.g. redbull)", member="Player to sign")
+    @app_commands.describe(name="Team identifier (e.g. red bull)", member="Player to sign")
     async def roster_sign(
         self, interaction: discord.Interaction, name: str, member: discord.Member
     ) -> None:
@@ -250,7 +250,7 @@ class RosterCog(commands.Cog):
     # ── /roster drop ──────────────────────────────────────────────────────────
 
     @roster.command(name="drop", description="Drop a player from a team")
-    @app_commands.describe(name="Team identifier (e.g. redbull)", member="Player to drop")
+    @app_commands.describe(name="Team identifier (e.g. red bull)", member="Player to drop")
     async def roster_drop(
         self, interaction: discord.Interaction, name: str, member: discord.Member
     ) -> None:
@@ -306,7 +306,7 @@ class RosterCog(commands.Cog):
     # ── /roster graphic ───────────────────────────────────────────────────────
 
     @roster.command(name="graphic", description="Generate the avatar card graphic for a team")
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_graphic(self, interaction: discord.Interaction, name: str) -> None:
         assert interaction.guild is not None and interaction.guild_id is not None
 
@@ -329,7 +329,7 @@ class RosterCog(commands.Cog):
     # ── /roster bulksign / bulkdrop ───────────────────────────────────────────
 
     @roster.command(name="bulksign", description="Sign multiple players to a team at once")
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_bulksign(self, interaction: discord.Interaction, name: str) -> None:
         assert interaction.guild is not None and interaction.guild_id is not None
 
@@ -358,7 +358,7 @@ class RosterCog(commands.Cog):
         )
 
     @roster.command(name="bulkdrop", description="Drop multiple players from a team at once")
-    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)")
     async def roster_bulkdrop(self, interaction: discord.Interaction, name: str) -> None:
         assert interaction.guild is not None and interaction.guild_id is not None
 
@@ -389,7 +389,7 @@ class RosterCog(commands.Cog):
     # ── /roster history ───────────────────────────────────────────────────────
 
     @roster.command(name="history", description="Show recent sign/drop history for a team")
-    @app_commands.describe(name="Team identifier (e.g. redbull)", limit="Entries to show (default 20, max 50)")
+    @app_commands.describe(name="Team identifier (e.g. red bull)", limit="Entries to show (default 20, max 50)")
     async def roster_history(
         self, interaction: discord.Interaction, name: str, limit: int = 20
     ) -> None:

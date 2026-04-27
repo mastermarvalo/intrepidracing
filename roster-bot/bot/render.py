@@ -157,58 +157,7 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
 
 
 def build_roster_embeds(team: Team, members: list[MemberLike]) -> list[discord.Embed]:
-    """Return [info_embed, player_embed, …] for a roster message.
-
-    info_embed  — tagline, info box, logo thumbnail, banner image.
-    player_embeds — one per filled slot entry, set_author with avatar + name;
-                    one per open spot, plain text.  Max 8 player embeds total
-                    (keeps the message within Discord's 10-embed limit when
-                    combined with the flair card).
-    """
-    pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
-    color = discord.Color(team.color) if team.color is not None else discord.Color.blurple()
-
-    # Info embed — header content only, no player mentions
-    info = discord.Embed(color=color)
-    parts: list[str] = []
-    if team.tagline:
-        parts.append(f"## {team.tagline}")
-    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
-        parts.append(f"## __{team.info_label}__\n{team.info_body}")
-    info.description = "\n\n".join(parts) if parts else None
-    if team.logo_url:
-        info.set_thumbnail(url=team.logo_url)
-    if team.banner_url:
-        info.set_image(url=team.banner_url)
-
-    # Per-player embeds in slot sort order
-    MAX = 8
-    player_embeds: list[discord.Embed] = []
-    overflow = 0
-
-    for slot in sorted(team.slots, key=lambda s: s.sort_order):
-        slot_members = [m for m in pool if any(r.id == slot.slot_role_id for r in m.roles)]
-        for member in slot_members:
-            if len(player_embeds) < MAX:
-                e = discord.Embed(color=color)
-                e.set_author(name=member.display_name, icon_url=member.display_avatar.url)
-                e.description = slot.label
-                player_embeds.append(e)
-            else:
-                overflow += 1
-        for _ in range(max(0, slot.quantity - len(slot_members))):
-            if len(player_embeds) < MAX:
-                e = discord.Embed(color=discord.Color(0x2C2F33))
-                e.description = f"*Spot Open* — {slot.label}"
-                player_embeds.append(e)
-            else:
-                overflow += 1
-
-    if overflow:
-        suffix = f"\n*… and {overflow} more*"
-        info.description = (info.description or "") + suffix
-
-    return [info] + player_embeds
+    return [build_embed(team, members)]
 
 
 def build_flair_embed(color: int | None) -> discord.Embed:
@@ -230,11 +179,11 @@ def roster_flair_file(team: Team) -> discord.File:
 
 
 async def _fetch_avatar_bytes(member: discord.Member) -> bytes | None:
-    url = str(member.display_avatar.replace(size=64, format="png"))
+    url = str(member.display_avatar.replace(size=128, format="png"))
     if url in _avatar_cache:
         return _avatar_cache[url]
     try:
-        data = await member.display_avatar.replace(size=64, format="png").read()
+        data = await member.display_avatar.replace(size=128, format="png").read()
         _avatar_cache[url] = data
         return data
     except Exception:
@@ -249,7 +198,7 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
     results = await asyncio.gather(*(_fetch_avatar_bytes(m) for m in pool))
     av_bytes: dict[int, bytes | None] = {m.id: data for m, data in zip(pool, results)}
 
-    # Organise by slot then any remainder not in a slot
+    # Organise by slot, then any remainder not assigned to a slot
     sections: list[tuple[str, list[discord.Member]]] = []
     seen: set[int] = set()
     for slot in sorted(team.slots, key=lambda s: s.sort_order):
@@ -264,41 +213,68 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
     if not sections:
         return None
 
-    # Layout
+    # ── layout constants ──────────────────────────────────────────────────────
     W        = 960
-    AVATAR_D = 64
-    H_GAP    = 16
-    PAD_X    = 20
-    PAD_Y    = 16
-    LABEL_H  = 26
-    LABEL_MB = 8
-    NAME_H   = 18
-    ROW_STRIDE = AVATAR_D + 4 + NAME_H + 6
-    SEC_GAP  = 18
-    per_row  = (W - 2 * PAD_X + H_GAP) // (AVATAR_D + H_GAP)
+    AVATAR_D = 80
+    CELL_W   = 110   # name zone; avatar is centered within it
+    CELL_GAP = 8     # horizontal gap between cells
+    PAD_X    = 32
+    PAD_Y    = 22
+    LABEL_H  = 28
+    LABEL_MB = 12
+    NAME_GAP = 6     # pixels between avatar bottom and name baseline
+    NAME_H   = 20
+    ROW_H    = AVATAR_D + NAME_GAP + NAME_H
+    ROW_GAP  = 14
+    SEC_GAP  = 24
 
+    per_row = max(1, (W - 2 * PAD_X + CELL_GAP) // (CELL_W + CELL_GAP))
+
+    # Compute total canvas height
     total_h = PAD_Y
     for i, (_, mems) in enumerate(sections):
         if i:
             total_h += SEC_GAP
-        total_h += LABEL_H + LABEL_MB + math.ceil(len(mems) / per_row) * ROW_STRIDE
+        n_rows = math.ceil(len(mems) / per_row)
+        total_h += LABEL_H + LABEL_MB + n_rows * ROW_H + max(0, n_rows - 1) * ROW_GAP
     total_h += PAD_Y
 
+    # Background — team color tinted dark; floor prevents near-black on dark teams
     rgb_int = team.color if team.color is not None else 0x5865F2
     bg = (
-        int(((rgb_int >> 16) & 0xFF) * 0.12),
-        int(((rgb_int >> 8)  & 0xFF) * 0.12),
-        int((rgb_int         & 0xFF) * 0.12),
+        max(int(((rgb_int >> 16) & 0xFF) * 0.15), 20),
+        max(int(((rgb_int >>  8) & 0xFF) * 0.15), 20),
+        max(int((rgb_int         & 0xFF) * 0.15), 20),
         255,
     )
     img  = Image.new("RGBA", (W, total_h), bg)
     draw = ImageDraw.Draw(img)
 
     try:
-        label_font = ImageFont.truetype(_FONT_PATH, 16)
-        name_font  = ImageFont.truetype(_FONT_PATH, 11)
+        label_font: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, 16)
     except OSError:
-        label_font = name_font = ImageFont.load_default()
+        label_font = ImageFont.load_default()
+
+    def _fit_name(text: str) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, str]:
+        """Largest font (11→7 pt) that fits text within CELL_W; truncates if needed."""
+        for size in (11, 10, 9, 8, 7):
+            try:
+                f: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, size)
+            except OSError:
+                f = ImageFont.load_default()
+            if draw.textbbox((0, 0), text, font=f)[2] <= CELL_W:
+                return f, text
+        # Still too wide at 7 pt — trim characters until it fits
+        try:
+            f = ImageFont.truetype(_FONT_PATH, 7)
+        except OSError:
+            f = ImageFont.load_default()
+        t = text
+        while len(t) > 1:
+            t = t[:-1]
+            if draw.textbbox((0, 0), t + "…", font=f)[2] <= CELL_W:
+                return f, t + "…"
+        return f, t
 
     circle_mask = Image.new("L", (AVATAR_D, AVATAR_D), 0)
     ImageDraw.Draw(circle_mask).ellipse((0, 0, AVATAR_D - 1, AVATAR_D - 1), fill=255)
@@ -307,12 +283,24 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
     for i, (label, mems) in enumerate(sections):
         if i:
             y += SEC_GAP
-        draw.text((PAD_X, y), label.upper(), font=label_font, fill=(255, 255, 255, 180))
+
+        # Section label centered horizontally
+        lbbox = draw.textbbox((0, 0), label.upper(), font=label_font)
+        lx = (W - (lbbox[2] - lbbox[0])) // 2
+        draw.text((lx, y), label.upper(), font=label_font, fill=(255, 255, 255, 200))
         y += LABEL_H + LABEL_MB
 
-        for row_start in range(0, len(mems), per_row):
-            for col, member in enumerate(mems[row_start: row_start + per_row]):
-                ax = PAD_X + col * (AVATAR_D + H_GAP)
+        for row_idx, row_start in enumerate(range(0, len(mems), per_row)):
+            row = mems[row_start: row_start + per_row]
+
+            # Center this row regardless of how many members are in it
+            row_w  = len(row) * CELL_W + (len(row) - 1) * CELL_GAP
+            row_x  = (W - row_w) // 2
+
+            for col, member in enumerate(row):
+                cell_x = row_x + col * (CELL_W + CELL_GAP)
+                av_x   = cell_x + (CELL_W - AVATAR_D) // 2
+
                 data = av_bytes.get(member.id)
                 if data:
                     try:
@@ -321,17 +309,30 @@ async def build_avatar_card(team: Team, members: list[discord.Member]) -> discor
                         )
                         circle = Image.new("RGBA", (AVATAR_D, AVATAR_D), (0, 0, 0, 0))
                         circle.paste(av, mask=circle_mask)
-                        img.alpha_composite(circle, (ax, y))
+                        img.alpha_composite(circle, (av_x, y))
                     except Exception:
-                        draw.ellipse((ax, y, ax + AVATAR_D - 1, y + AVATAR_D - 1), fill=(60, 60, 60, 255))
+                        draw.ellipse(
+                            (av_x, y, av_x + AVATAR_D - 1, y + AVATAR_D - 1),
+                            fill=(60, 60, 60, 255),
+                        )
                 else:
-                    draw.ellipse((ax, y, ax + AVATAR_D - 1, y + AVATAR_D - 1), fill=(60, 60, 60, 255))
+                    draw.ellipse(
+                        (av_x, y, av_x + AVATAR_D - 1, y + AVATAR_D - 1),
+                        fill=(60, 60, 60, 255),
+                    )
 
-                name = member.display_name[:13] + "…" if len(member.display_name) > 14 else member.display_name
-                bbox = draw.textbbox((0, 0), name, font=name_font)
-                nx = ax + (AVATAR_D - (bbox[2] - bbox[0])) // 2
-                draw.text((nx, y + AVATAR_D + 4), name, font=name_font, fill=(204, 204, 204, 255))
-            y += ROW_STRIDE
+                name_font, name = _fit_name(member.display_name)
+                nbbox = draw.textbbox((0, 0), name, font=name_font)
+                nx = cell_x + (CELL_W - (nbbox[2] - nbbox[0])) // 2
+                draw.text(
+                    (nx, y + AVATAR_D + NAME_GAP),
+                    name,
+                    font=name_font,
+                    fill=(210, 210, 210, 255),
+                )
+
+            is_last_row = row_start + per_row >= len(mems)
+            y += ROW_H + (0 if is_last_row else ROW_GAP)
 
     buf = BytesIO()
     img.save(buf, "PNG")
