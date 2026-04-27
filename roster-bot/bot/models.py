@@ -41,6 +41,7 @@ class Team:
     message_id: int | None = None
     info_label: str | None = None
     info_body: str | None = None
+    dark_mode: bool = False
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     slots: list[TeamSlot] = field(default_factory=list)
 

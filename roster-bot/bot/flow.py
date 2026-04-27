@@ -105,6 +105,7 @@ class FlowState:
 
     # Step 2
     color: Optional[int] = None
+    dark_mode: bool = False
 
     # Step 3
     team_role_id: int = 0
@@ -217,6 +218,7 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
         logo_url=existing.logo_url or "",
         banner_url=existing.banner_url or "",
         color=existing.color,
+        dark_mode=existing.dark_mode,
         team_role_id=existing.team_role_id,
         principal_role_id=existing.principal_role_id,
         channel_id=existing.channel_id,
@@ -259,12 +261,13 @@ async def start_relink(interaction: discord.Interaction, team_key: str) -> None:
 
 def _edit_menu_content(state: FlowState) -> str:
     color_hex = f"`#{state.color:06X}`" if state.color else "`default`"
+    dm = " 🌑" if state.dark_mode else ""
     staff = f"{len(state.staff_slots)} slot(s)" if state.staff_slots else "none"
     drivers = f"{len(state.driver_slots)} slot(s)" if state.driver_slots else "none"
     info = f"`{state.info_label}`" if state.info_label else "none"
     return (
         f"**Editing: {state.display_name}**\n"
-        f"Color: {color_hex} | Staff: {staff} | Drivers: {drivers} | Info box: {info}\n\n"
+        f"Color: {color_hex}{dm} | Staff: {staff} | Drivers: {drivers} | Info box: {info}\n\n"
         "Select a section to edit, then click **Finish →** when done."
     )
 
@@ -443,10 +446,11 @@ async def _show_step2_color(
     interaction: discord.Interaction, state: FlowState, *, from_modal: bool = True
 ) -> None:
     view = _Step2ColorView(state)
+    dm_note = "\n**Clarity mode: ON** — flair background darkened so white text shows." if state.dark_mode else ""
     content = (
         "**Step 2 of 9 — Team color**\n"
         "Pick a color for this team's embeds, or enter a custom hex code.\n"
-        "This color will appear on all roster and transaction messages."
+        f"This color will appear on all roster and transaction messages.{dm_note}"
     )
     if from_modal:
         await interaction.response.send_message(content, view=view, ephemeral=True)
@@ -471,6 +475,13 @@ class _Step2ColorView(discord.ui.View):
         self._sel = discord.ui.Select(placeholder="Choose a color…", options=options)
         self._sel.callback = self._on_select
         self.add_item(self._sel)
+
+        dm_label = "🌑 Clarity: ON" if state.dark_mode else "☀️ Clarity: OFF"
+        dm_style = discord.ButtonStyle.primary if state.dark_mode else discord.ButtonStyle.secondary
+        dm_btn = discord.ui.Button(label=dm_label, style=dm_style, row=1)
+        dm_btn.callback = self._toggle_dark_mode
+        self.add_item(dm_btn)
+
         self.finish_editing.disabled = state.existing_team is None
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
@@ -489,6 +500,11 @@ class _Step2ColorView(discord.ui.View):
             await _show_edit_menu(interaction, self._state)
         else:
             await _show_step3_team_role(interaction, self._state)
+
+    async def _toggle_dark_mode(self, interaction: discord.Interaction) -> None:
+        self._state.dark_mode = not self._state.dark_mode
+        self.stop()
+        await _show_step2_color(interaction, self._state, from_modal=False)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary, row=1)
     async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1015,6 +1031,7 @@ def _preview_team(state: FlowState) -> Team:
         color=state.color,
         info_label=state.info_label or None,
         info_body=state.info_body or None,
+        dark_mode=state.dark_mode,
         slots=slots,
     )
 
@@ -1131,6 +1148,7 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 color=state.color,
                 info_label=state.info_label or None,
                 info_body=state.info_body or None,
+                dark_mode=state.dark_mode,
             )
         else:
             team_id = state.existing_team.id
@@ -1143,6 +1161,7 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 color=state.color,
                 info_label=state.info_label or None,
                 info_body=state.info_body or None,
+                dark_mode=state.dark_mode,
             )
 
         await queries.replace_slots(conn, team_id, all_slots)

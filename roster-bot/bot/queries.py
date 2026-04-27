@@ -40,6 +40,7 @@ def _row_to_team(row: aiosqlite.Row, slots: list[TeamSlot]) -> Team:
         message_id=row["message_id"],
         info_label=row["info_label"],
         info_body=row["info_body"],
+        dark_mode=bool(row["dark_mode"]),
         slots=slots,
     )
 
@@ -100,17 +101,18 @@ async def insert_team(
     color: int | None = None,
     info_label: str | None = None,
     info_body: str | None = None,
+    dark_mode: bool = False,
 ) -> int:
     """Insert a new team row and return its id."""
     async with conn.execute(
         """
         INSERT INTO teams
             (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, banner_url,
-             principal_role_id, color, info_label, info_body)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             principal_role_id, color, info_label, info_body, dark_mode)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, banner_url,
-         principal_role_id, color, info_label, info_body),
+         principal_role_id, color, info_label, info_body, int(dark_mode)),
     ) as cur:
         assert cur.lastrowid is not None
         return cur.lastrowid
@@ -129,16 +131,17 @@ async def update_team(
     color: int | None = None,
     info_label: str | None = None,
     info_body: str | None = None,
+    dark_mode: bool = False,
 ) -> None:
     await conn.execute(
         """
         UPDATE teams
         SET name = ?, team_role_id = ?, channel_id = ?, tagline = ?, logo_url = ?, banner_url = ?,
-            principal_role_id = ?, color = ?, info_label = ?, info_body = ?
+            principal_role_id = ?, color = ?, info_label = ?, info_body = ?, dark_mode = ?
         WHERE id = ?
         """,
         (name, team_role_id, channel_id, tagline, logo_url, banner_url,
-         principal_role_id, color, info_label, info_body, team_id),
+         principal_role_id, color, info_label, info_body, int(dark_mode), team_id),
     )
 
 

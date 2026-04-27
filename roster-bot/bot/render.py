@@ -7,18 +7,22 @@ from PIL import Image, ImageDraw, ImageFont
 
 from bot.models import SlotType, Team, TeamSlot
 
-_FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "TitilliumWeb-Bold.ttf")
+_FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "Formula1-Bold_web_0.ttf")
 
-# bytes cache keyed by (color, team_name)
-_flair_cache: dict[tuple[int | None, str], bytes] = {}
+# bytes cache keyed by (color, team_name, dark_mode)
+_flair_cache: dict[tuple[int | None, str, bool], bytes] = {}
 
 _FLAIR_W = 960
 _FLAIR_H = 90
 
 
-def _render_flair_bytes(color: int | None, team_name: str) -> bytes:
+def _render_flair_bytes(color: int | None, team_name: str, *, dark_mode: bool = False) -> bytes:
     rgb_int = color if color is not None else 0x5865F2  # blurple fallback
-    r, g, b = (rgb_int >> 16) & 0xFF, (rgb_int >> 8) & 0xFF, rgb_int & 0xFF
+    r = (rgb_int >> 16) & 0xFF
+    g = (rgb_int >> 8) & 0xFF
+    b = rgb_int & 0xFF
+    if dark_mode:
+        r, g, b = int(r * 0.4), int(g * 0.4), int(b * 0.4)
 
     img = Image.new("RGBA", (_FLAIR_W, _FLAIR_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -48,10 +52,10 @@ def _render_flair_bytes(color: int | None, team_name: str) -> bytes:
     return buf.getvalue()
 
 
-def build_flair_file(color: int | None, team_name: str) -> discord.File:
-    key = (color, team_name)
+def build_flair_file(color: int | None, team_name: str, *, dark_mode: bool = False) -> discord.File:
+    key = (color, team_name, dark_mode)
     if key not in _flair_cache:
-        _flair_cache[key] = _render_flair_bytes(color, team_name)
+        _flair_cache[key] = _render_flair_bytes(color, team_name, dark_mode=dark_mode)
     return discord.File(BytesIO(_flair_cache[key]), filename="flair.png")
 
 
@@ -104,14 +108,13 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
 
     embed = discord.Embed(
-        title=team.name,
         color=discord.Color(team.color) if team.color is not None else discord.Color.blurple(),
     )
 
     sections: list[str] = []
 
     if team.tagline:
-        sections.append(team.tagline)
+        sections.append(f"## {team.tagline}")
 
     staff_text = _section_text(pool, team.slots, "staff")
     driver_text = _section_text(pool, team.slots, "driver")
@@ -152,7 +155,7 @@ def build_flair_embed(color: int | None) -> discord.Embed:
 
 def roster_flair_file(team: Team) -> discord.File:
     """The generated flair/title-card file — always included in roster messages."""
-    return build_flair_file(team.color, team.name)
+    return build_flair_file(team.color, team.name, dark_mode=team.dark_mode)
 
 
 
