@@ -12,13 +12,8 @@ _FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "TitilliumWeb-Bol
 # bytes cache keyed by (color, team_name)
 _flair_cache: dict[tuple[int | None, str], bytes] = {}
 
-_FLAIR_W = 800
-_TITLE_H = 60
-_GAP = 8
-_DIAMOND_AREA_H = 52
-_FLAIR_H = _TITLE_H + _GAP + _DIAMOND_AREA_H  # 120
-_DIAMOND_CY = _TITLE_H + _GAP + _DIAMOND_AREA_H // 2  # 94
-_DIAMOND_SIZES = [10, 13, 16, 20, 16, 13, 10]
+_FLAIR_W = 960
+_FLAIR_H = 90
 
 
 def _render_flair_bytes(color: int | None, team_name: str) -> bytes:
@@ -28,17 +23,15 @@ def _render_flair_bytes(color: int | None, team_name: str) -> bytes:
     img = Image.new("RGBA", (_FLAIR_W, _FLAIR_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Title bar
-    draw.rectangle([(0, 0), (_FLAIR_W - 1, _TITLE_H - 1)], fill=(r, g, b, 255))
+    draw.rectangle([(0, 0), (_FLAIR_W - 1, _FLAIR_H - 1)], fill=(r, g, b, 255))
 
-    # Team name in white, auto-sized to fit within padding
-    font_size = 36
+    font_size = 48
     font: ImageFont.ImageFont | ImageFont.FreeTypeFont = ImageFont.load_default()
     while font_size >= 10:
         try:
             f = ImageFont.truetype(_FONT_PATH, font_size)
             bbox = draw.textbbox((0, 0), team_name, font=f)
-            if bbox[2] - bbox[0] <= _FLAIR_W - 40:
+            if bbox[2] - bbox[0] <= _FLAIR_W - 48:
                 font = f
                 break
         except OSError:
@@ -47,18 +40,8 @@ def _render_flair_bytes(color: int | None, team_name: str) -> bytes:
 
     bbox = draw.textbbox((0, 0), team_name, font=font)
     tx = (_FLAIR_W - (bbox[2] - bbox[0])) // 2
-    ty = (_TITLE_H - (bbox[3] - bbox[1])) // 2 - bbox[1]
+    ty = (_FLAIR_H - (bbox[3] - bbox[1])) // 2 - bbox[1]
     draw.text((tx, ty), team_name, font=font, fill=(255, 255, 255, 255))
-
-    # Diamond row below the title bar
-    n = len(_DIAMOND_SIZES)
-    spacing = _FLAIR_W // (n + 1)
-    for i, s in enumerate(_DIAMOND_SIZES):
-        cx = spacing * (i + 1)
-        draw.polygon(
-            [(cx, _DIAMOND_CY - s), (cx + s, _DIAMOND_CY), (cx, _DIAMOND_CY + s), (cx - s, _DIAMOND_CY)],
-            fill=(r, g, b, 255),
-        )
 
     buf = BytesIO()
     img.save(buf, "PNG")
