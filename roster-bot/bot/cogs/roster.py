@@ -16,8 +16,8 @@ from discord.ext import commands
 from bot import db, flow, queries
 from bot.events import _rerender, _rerender_fa
 from bot.render import (
-    build_avatar_card, build_avatar_embed,
-    build_embed, build_fa_embed, build_flair_embed, roster_flair_file,
+    build_avatar_card, build_fa_embed, build_flair_embed,
+    build_roster_embeds, roster_flair_file,
 )
 
 log = logging.getLogger(__name__)
@@ -184,17 +184,9 @@ class RosterCog(commands.Cog):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
-        members = list(interaction.guild.members)
-        roster_embed = build_embed(team, members)
         flair = roster_flair_file(team)
-        avatar_file = await build_avatar_card(team, members)
-        embeds = [build_flair_embed(team.color), roster_embed]
-        files: list[discord.File] = [flair]
-        if avatar_file:
-            embeds.append(build_avatar_embed(team.color))
-            files.append(avatar_file)
-        await interaction.followup.send(embeds=embeds, files=files, ephemeral=True)
+        embeds = [build_flair_embed(team.color)] + build_roster_embeds(team, list(interaction.guild.members))
+        await interaction.response.send_message(embeds=embeds, file=flair, ephemeral=True)
 
     # ── /roster sign ──────────────────────────────────────────────────────────
 
@@ -310,6 +302,29 @@ class RosterCog(commands.Cog):
         await interaction.response.send_message(
             f"✅ **{member.display_name}** dropped from **{team.name}**.", ephemeral=True
         )
+
+    # ── /roster graphic ───────────────────────────────────────────────────────
+
+    @roster.command(name="graphic", description="Generate the avatar card graphic for a team")
+    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    async def roster_graphic(self, interaction: discord.Interaction, name: str) -> None:
+        assert interaction.guild is not None and interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
+
+        if team is None:
+            await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        avatar_file = await build_avatar_card(team, list(interaction.guild.members))
+        if avatar_file is None:
+            await interaction.followup.send(
+                f"**{team.name}** has no members assigned to slots yet.", ephemeral=True
+            )
+            return
+        await interaction.followup.send(file=avatar_file, ephemeral=True)
 
     # ── /roster bulksign / bulkdrop ───────────────────────────────────────────
 

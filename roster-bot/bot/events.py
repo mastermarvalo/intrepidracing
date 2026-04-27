@@ -23,8 +23,7 @@ from discord.ext import commands, tasks
 from bot import db, queries
 from bot.models import GuildConfig, Team
 from bot.render import (
-    build_avatar_card, build_avatar_embed,
-    build_embed, build_fa_embed, build_flair_embed,
+    build_fa_embed, build_flair_embed, build_roster_embeds,
     build_transaction_embed, roster_flair_file,
 )
 
@@ -157,14 +156,8 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
         return
 
     members = list(guild.members)
-    roster_embed = build_embed(team, members)
     flair = roster_flair_file(team)
-    avatar_file = await build_avatar_card(team, members)
-    embeds = [build_flair_embed(team.color), roster_embed]
-    files: list[discord.File] = [flair]
-    if avatar_file:
-        embeds.append(build_avatar_embed(team.color))
-        files.append(avatar_file)
+    embeds = [build_flair_embed(team.color)] + build_roster_embeds(team, members)
 
     try:
         if isinstance(channel, discord.TextChannel):
@@ -174,7 +167,7 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
             if not isinstance(thread, discord.Thread):
                 thread = await bot.fetch_channel(team.message_id)
             msg = await thread.fetch_message(team.message_id)
-        await msg.edit(embeds=embeds, attachments=files)
+        await msg.edit(embeds=embeds, attachments=[flair])
     except discord.NotFound:
         log.warning("Roster message for team %s was deleted — clearing message_id", team.key)
         async with db.connect() as conn:

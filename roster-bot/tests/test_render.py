@@ -36,15 +36,15 @@ def driver_text(embed) -> str | None:
 # ── title / description ───────────────────────────────────────────────────────
 
 
-def test_embed_title():
+def test_embed_no_title():
     embed = build_embed(make_team(), [])
-    assert embed.title == "Test Team"
+    assert embed.title is None
 
 
 def test_embed_tagline_set():
     embed = build_embed(make_team(tagline="6x WCC"), [])
     assert embed.description is not None
-    assert embed.description.startswith("6x WCC")
+    assert embed.description.startswith("## 6x WCC")
 
 
 def test_embed_tagline_absent():

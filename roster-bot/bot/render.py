@@ -64,6 +64,11 @@ def build_flair_file(color: int | None, team_name: str, *, dark_mode: bool = Fal
     return discord.File(BytesIO(_flair_cache[key]), filename="flair.png")
 
 
+class _AvatarLike(Protocol):
+    @property
+    def url(self) -> str: ...
+
+
 class MemberLike(Protocol):
     """Structural type for discord.Member — lets tests pass plain objects."""
 
@@ -72,6 +77,12 @@ class MemberLike(Protocol):
 
     @property
     def roles(self) -> list[discord.Role]: ...
+
+    @property
+    def display_name(self) -> str: ...
+
+    @property
+    def display_avatar(self) -> _AvatarLike: ...
 
 
 def _slot_block(pool: list[MemberLike], slot: TeamSlot) -> str:
@@ -143,6 +154,61 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
         embed.set_image(url=team.banner_url)
 
     return embed
+
+
+def build_roster_embeds(team: Team, members: list[MemberLike]) -> list[discord.Embed]:
+    """Return [info_embed, player_embed, …] for a roster message.
+
+    info_embed  — tagline, info box, logo thumbnail, banner image.
+    player_embeds — one per filled slot entry, set_author with avatar + name;
+                    one per open spot, plain text.  Max 8 player embeds total
+                    (keeps the message within Discord's 10-embed limit when
+                    combined with the flair card).
+    """
+    pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
+    color = discord.Color(team.color) if team.color is not None else discord.Color.blurple()
+
+    # Info embed — header content only, no player mentions
+    info = discord.Embed(color=color)
+    parts: list[str] = []
+    if team.tagline:
+        parts.append(f"## {team.tagline}")
+    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
+        parts.append(f"## __{team.info_label}__\n{team.info_body}")
+    info.description = "\n\n".join(parts) if parts else None
+    if team.logo_url:
+        info.set_thumbnail(url=team.logo_url)
+    if team.banner_url:
+        info.set_image(url=team.banner_url)
+
+    # Per-player embeds in slot sort order
+    MAX = 8
+    player_embeds: list[discord.Embed] = []
+    overflow = 0
+
+    for slot in sorted(team.slots, key=lambda s: s.sort_order):
+        slot_members = [m for m in pool if any(r.id == slot.slot_role_id for r in m.roles)]
+        for member in slot_members:
+            if len(player_embeds) < MAX:
+                e = discord.Embed(color=color)
+                e.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+                e.description = slot.label
+                player_embeds.append(e)
+            else:
+                overflow += 1
+        for _ in range(max(0, slot.quantity - len(slot_members))):
+            if len(player_embeds) < MAX:
+                e = discord.Embed(color=discord.Color(0x2C2F33))
+                e.description = f"*Spot Open* — {slot.label}"
+                player_embeds.append(e)
+            else:
+                overflow += 1
+
+    if overflow:
+        suffix = f"\n*… and {overflow} more*"
+        info.description = (info.description or "") + suffix
+
+    return [info] + player_embeds
 
 
 def build_flair_embed(color: int | None) -> discord.Embed:

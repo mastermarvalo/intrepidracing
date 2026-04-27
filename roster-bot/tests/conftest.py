@@ -18,9 +18,16 @@ class FakeRole:
 
 
 @dataclass
+class FakeAvatar:
+    url: str = "https://cdn.discordapp.com/embed/avatars/0.png"
+
+
+@dataclass
 class FakeMember:
     id: int
     roles: list[FakeRole] = field(default_factory=list)
+    display_name: str = "TestMember"
+    display_avatar: FakeAvatar = field(default_factory=FakeAvatar)
 
 
 def make_team(
