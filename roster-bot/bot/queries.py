@@ -35,6 +35,7 @@ def _row_to_team(row: aiosqlite.Row, slots: list[TeamSlot]) -> Team:
         tagline=row["tagline"],
         logo_url=row["logo_url"],
         principal_role_id=row["principal_role_id"],
+        color=row["color"],
         message_id=row["message_id"],
         slots=slots,
     )
@@ -92,15 +93,16 @@ async def insert_team(
     tagline: str | None,
     logo_url: str | None,
     principal_role_id: int | None,
+    color: int | None = None,
 ) -> int:
     """Insert a new team row and return its id."""
     async with conn.execute(
         """
         INSERT INTO teams
-            (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, principal_role_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, principal_role_id, color)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, principal_role_id),
+        (guild_id, key, name, team_role_id, channel_id, tagline, logo_url, principal_role_id, color),
     ) as cur:
         assert cur.lastrowid is not None
         return cur.lastrowid
@@ -115,15 +117,16 @@ async def update_team(
     tagline: str | None,
     logo_url: str | None,
     principal_role_id: int | None,
+    color: int | None = None,
 ) -> None:
     await conn.execute(
         """
         UPDATE teams
         SET name = ?, team_role_id = ?, channel_id = ?, tagline = ?, logo_url = ?,
-            principal_role_id = ?
+            principal_role_id = ?, color = ?
         WHERE id = ?
         """,
-        (name, team_role_id, channel_id, tagline, logo_url, principal_role_id, team_id),
+        (name, team_role_id, channel_id, tagline, logo_url, principal_role_id, color, team_id),
     )
 
 

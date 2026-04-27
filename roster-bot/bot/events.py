@@ -22,7 +22,7 @@ from discord.ext import commands, tasks
 
 from bot import db, queries
 from bot.models import GuildConfig, Team
-from bot.render import build_embed, build_fa_embed, build_transaction_embed
+from bot.render import build_embed, build_fa_embed, build_flair_file, build_transaction_embed
 
 log = logging.getLogger(__name__)
 
@@ -149,9 +149,10 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
         return
 
     embed = build_embed(team, list(guild.members))
+    flair = build_flair_file(team.color)
     try:
         msg = await channel.fetch_message(team.message_id)
-        await msg.edit(embed=embed)
+        await msg.edit(embed=embed, attachments=[flair])
     except discord.NotFound:
         log.warning("Roster message for team %s was deleted — clearing message_id", team.key)
         async with db.connect() as conn:

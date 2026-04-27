@@ -15,7 +15,7 @@ from discord.ext import commands
 
 from bot import db, flow, queries
 from bot.events import _rerender, _rerender_fa
-from bot.render import build_embed, build_fa_embed
+from bot.render import build_embed, build_fa_embed, build_flair_file
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +120,21 @@ class RosterCog(commands.Cog):
             return
         await flow.start_edit(interaction, team_key=name.lower())
 
+    # ── /roster relink ────────────────────────────────────────────────────────
+
+    @roster.command(
+        name="relink",
+        description="Emergency recovery: re-register a team whose DB record was lost",
+    )
+    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    async def roster_relink(self, interaction: discord.Interaction, name: str) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this command.", ephemeral=True
+            )
+            return
+        await flow.start_relink(interaction, team_key=name.lower())
+
     # ── /roster config ────────────────────────────────────────────────────────
 
     @roster.command(name="config", description="Configure roster settings for this server")
@@ -167,7 +182,7 @@ class RosterCog(commands.Cog):
             return
 
         embed = build_embed(team, list(interaction.guild.members))
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, file=build_flair_file(team.color), ephemeral=True)
 
     # ── /roster sign ──────────────────────────────────────────────────────────
 

@@ -1,8 +1,42 @@
+from io import BytesIO
 from typing import Literal, Protocol
 
 import discord
+from PIL import Image, ImageDraw
 
 from bot.models import SlotType, Team, TeamSlot
+
+# bytes cache so we only run Pillow once per unique color
+_flair_cache: dict[int | None, bytes] = {}
+
+_FLAIR_W, _FLAIR_H = 800, 48
+_DIAMOND_SIZES = [10, 13, 16, 20, 16, 13, 10]
+
+
+def _render_flair_bytes(color: int | None) -> bytes:
+    rgb_int = color if color is not None else 0x5865F2  # blurple fallback
+    r, g, b = (rgb_int >> 16) & 0xFF, (rgb_int >> 8) & 0xFF, rgb_int & 0xFF
+
+    img = Image.new("RGBA", (_FLAIR_W, _FLAIR_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    n = len(_DIAMOND_SIZES)
+    spacing = _FLAIR_W // (n + 1)
+    cy = _FLAIR_H // 2
+
+    for i, s in enumerate(_DIAMOND_SIZES):
+        cx = spacing * (i + 1)
+        draw.polygon([(cx, cy - s), (cx + s, cy), (cx, cy + s), (cx - s, cy)], fill=(r, g, b, 255))
+
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def build_flair_file(color: int | None) -> discord.File:
+    if color not in _flair_cache:
+        _flair_cache[color] = _render_flair_bytes(color)
+    return discord.File(BytesIO(_flair_cache[color]), filename="flair.png")
 
 
 class MemberLike(Protocol):
@@ -53,7 +87,9 @@ def _section_text(
 def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
 
-    embed = discord.Embed(color=discord.Color.blurple())
+    embed = discord.Embed(
+        color=discord.Color(team.color) if team.color is not None else discord.Color.blurple()
+    )
 
     if team.logo_url:
         embed.set_thumbnail(url=team.logo_url)
@@ -72,6 +108,7 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
         sections.append(f"## __Drivers__\n{driver_text}")
 
     embed.description = "\n\n".join(sections)
+    embed.set_image(url="attachment://flair.png")
 
     return embed
 
@@ -128,8 +165,16 @@ def build_transaction_embed(
     prep = "to" if action == "signed" else "from"
     color = discord.Color.green() if action == "signed" else discord.Color.red()
 
+    if team.message_id:
+        roster_url = (
+            f"https://discord.com/channels/{team.guild_id}/{team.channel_id}/{team.message_id}"
+        )
+        team_ref = f"[{team.name}]({roster_url})"
+    else:
+        team_ref = team.name
+
     embed = discord.Embed(
-        description=f"**{member.display_name}** has been **{verb.lower()}** {prep} **{team.name}**",
+        description=f"**{member.display_name}** has been **{action}** {prep} **{team_ref}**",
         color=color,
     )
     embed.set_author(name=f"{verb}: {member.display_name}", icon_url=member.display_avatar.url)

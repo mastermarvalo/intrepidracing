@@ -13,6 +13,7 @@ dependencies = [
     "aiohttp>=3.9",
     "google-auth>=2.0",
     "requests>=2.31",
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]

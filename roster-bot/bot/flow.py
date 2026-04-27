@@ -1,14 +1,15 @@
 """
 Guided create/edit flow for /roster create and /roster edit.
 
-The flow is seven steps:
+The flow is eight steps:
   1. Modal  — team name, tagline, logo URL
-  2. View   — pick the "team role" (who counts as on this team)
-  3. View   — pick the "principal role" that can sign/drop players (optional)
-  4. View   — build staff slots (Add/Done loop)
-  5. View   — build driver slots (same loop)
-  6. View   — pick the channel to post in
-  7. View   — preview and confirm
+  2. View   — pick team color (presets or custom hex)
+  3. View   — pick the "team role" (who counts as on this team)
+  4. View   — pick the "principal role" that can sign/drop players (optional)
+  5. View   — build staff slots (Add/Done loop)
+  6. View   — build driver slots (same loop)
+  7. View   — pick the channel to post in
+  8. View   — preview and confirm
 
 State is collected in a FlowState object and stored in `_sessions` while the
 admin works through the steps.  It's discarded when the flow finishes or times out.
@@ -24,8 +25,11 @@ be "responded to" exactly once.  The response type matters:
 
 After a MODAL submit, the only valid responses are send_message or defer+followup.
 You cannot edit an existing message from a modal's on_submit.  This is why the
-"Add slot" sub-flow (steps 3/4) sends a SECOND ephemeral message for the role select
+"Add slot" sub-flow (steps 5/6) sends a SECOND ephemeral message for the role select
 instead of editing the builder in place.
+
+The custom hex path in step 2 follows the same pattern: the _CustomHexModal sends a
+new ephemeral message for step 3, leaving the color-picker message stale.
 """
 
 import logging
@@ -36,7 +40,7 @@ import discord
 
 from bot import db, queries
 from bot.models import Team, TeamSlot
-from bot.render import build_embed
+from bot.render import build_embed, build_flair_file
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +48,31 @@ log = logging.getLogger(__name__)
 
 # Keyed by (guild_id, user_id).  One in-flight flow per user per server.
 _sessions: dict[tuple[int, int], "FlowState"] = {}
+
+# ── color presets ─────────────────────────────────────────────────────────────
+
+# (label, rgb_int)
+_PRESET_COLORS: list[tuple[str, int]] = [
+    ("🔴 Red", 0xE74C3C),
+    ("🟠 Orange", 0xE67E22),
+    ("🟡 Gold", 0xF1C40F),
+    ("🟢 Green", 0x27AE60),
+    ("🩵 Teal", 0x1ABC9C),
+    ("🔵 Blue", 0x3498DB),
+    ("🌑 Navy", 0x2C3E50),
+    ("🟣 Purple", 0x9B59B6),
+    ("🩷 Pink", 0xE91E8C),
+    ("⬜ White", 0xECF0F1),
+    ("🩶 Silver", 0x95A5A6),
+    ("⬛ Black", 0x2C2F33),
+]
+
+
+def _parse_hex_color(value: str) -> int | None:
+    value = value.strip().lstrip("#")
+    if len(value) == 6 and all(c in "0123456789abcdefABCDEF" for c in value):
+        return int(value, 16)
+    return None
 
 
 @dataclass
@@ -58,7 +87,7 @@ class SlotDraft:
 
 @dataclass
 class FlowState:
-    """All data collected across the seven steps for a single create/edit session."""
+    """All data collected across the eight steps for a single create/edit session."""
 
     guild_id: int
     user_id: int
@@ -73,17 +102,25 @@ class FlowState:
     logo_url: str = ""
 
     # Step 2
+    color: Optional[int] = None
+
+    # Step 3
     team_role_id: int = 0
 
-    # Step 3 — role allowed to sign/drop players for this team (optional)
+    # Step 4 — role allowed to sign/drop players for this team (optional)
     principal_role_id: Optional[int] = None
 
-    # Steps 4 & 5 — filled incrementally via the slot-builder loop
+    # Steps 5 & 6 — filled incrementally via the slot-builder loop
     staff_slots: list[SlotDraft] = field(default_factory=list)
     driver_slots: list[SlotDraft] = field(default_factory=list)
 
-    # Step 6
+    # Step 7
     channel_id: int = 0
+
+    # Set during relink flow — the existing Discord message to take over.
+    # When present, step 7 (channel picker) is skipped and _commit_and_post
+    # edits this message in place instead of posting a new one.
+    relink_message_id: Optional[int] = None
 
     # Tracks the active builder view so we can stop it when a new builder message
     # appears.  The "Add slot" sub-flow (modal → role select) always creates a new
@@ -104,6 +141,28 @@ def _discard(state: FlowState) -> None:
 
 
 # ── entry points (called by cog) ──────────────────────────────────────────────
+
+
+def _parse_message_link(raw: str) -> tuple[int, int] | None:
+    """Parse a Discord message URL into (channel_id, message_id), or None on failure.
+
+    Accepts:
+      https://discord.com/channels/{guild}/{channel}/{message}
+      https://ptb.discord.com/channels/...
+      {channel_id}/{message_id}
+    """
+    raw = raw.strip()
+    if "discord.com/channels/" in raw:
+        tail = raw.split("/channels/")[-1].rstrip("/")
+        parts = tail.split("/")
+        # tail is guild/channel/message — we want the last two
+        if len(parts) >= 2 and all(p.isdigit() for p in parts[-2:]):
+            return int(parts[-2]), int(parts[-1])
+    # bare channel_id/message_id
+    parts = raw.split("/")
+    if len(parts) == 2 and all(p.isdigit() for p in parts):
+        return int(parts[0]), int(parts[1])
+    return None
 
 
 async def start_create(interaction: discord.Interaction, team_key: str) -> None:
@@ -146,6 +205,7 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
         display_name=existing.name,
         tagline=existing.tagline or "",
         logo_url=existing.logo_url or "",
+        color=existing.color,
         team_role_id=existing.team_role_id,
         principal_role_id=existing.principal_role_id,
         channel_id=existing.channel_id,
@@ -161,12 +221,29 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
     await interaction.response.send_modal(_Step1Modal(state))
 
 
+async def start_relink(interaction: discord.Interaction, team_key: str) -> None:
+    """Kick off the relink flow. Opens a modal that collects team info + the existing message URL."""
+    assert interaction.guild_id is not None
+
+    async with db.connect() as conn:
+        existing = await queries.fetch_team(conn, interaction.guild_id, team_key)
+    if existing is not None:
+        await interaction.response.send_message(
+            f"Team `{team_key}` already exists in the database. "
+            f"Use `/roster edit {team_key}` to modify it.",
+            ephemeral=True,
+        )
+        return
+
+    state = FlowState(guild_id=interaction.guild_id, user_id=interaction.user.id, team_key=team_key)
+    _save(state)
+    await interaction.response.send_modal(_RelinkStep1Modal(state))
+
+
 # ── step 1: text fields ───────────────────────────────────────────────────────
-# A Modal is a popup form with up to 5 TextInput fields.
-# on_submit is called when the admin clicks Submit.
 
 
-class _Step1Modal(discord.ui.Modal, title="Team Setup (1/7)"):
+class _Step1Modal(discord.ui.Modal, title="Team Setup (1/8)"):
     team_name = discord.ui.TextInput(
         label="Display name", placeholder="Red Bull Racing", max_length=64
     )
@@ -186,7 +263,6 @@ class _Step1Modal(discord.ui.Modal, title="Team Setup (1/7)"):
     def __init__(self, state: FlowState) -> None:
         super().__init__()
         self._state = state
-        # Pre-fill when editing
         if state.display_name:
             self.team_name.default = state.display_name
         if state.tagline:
@@ -198,60 +274,200 @@ class _Step1Modal(discord.ui.Modal, title="Team Setup (1/7)"):
         self._state.display_name = self.team_name.value.strip()
         self._state.tagline = self.tagline.value.strip()
         self._state.logo_url = self.logo_url.value.strip()
-        # Modal submit → must send a NEW message (can't edit anything)
-        await _show_step2(interaction, self._state)
+        await _show_step2_color(interaction, self._state)
 
 
-# ── step 2: team role ─────────────────────────────────────────────────────────
-# A View is a set of interactive components attached to a message.
-# RoleSelect lets the admin pick from the server's roles.
+class _RelinkStep1Modal(discord.ui.Modal, title="Team Relink — Setup"):
+    """Step 1 for the relink flow. Same fields as create, plus the existing message URL."""
+
+    team_name = discord.ui.TextInput(
+        label="Display name", placeholder="Red Bull Racing", max_length=64
+    )
+    tagline = discord.ui.TextInput(
+        label="Tagline (optional)",
+        placeholder="6x WCC | 3x WDC | 1x ICC",
+        required=False,
+        max_length=120,
+    )
+    logo_url = discord.ui.TextInput(
+        label="Logo URL (optional)",
+        placeholder="https://example.com/logo.png",
+        required=False,
+        max_length=256,
+    )
+    message_link = discord.ui.TextInput(
+        label="Existing roster message URL",
+        placeholder="https://discord.com/channels/.../.../..",
+        max_length=200,
+    )
+
+    def __init__(self, state: FlowState) -> None:
+        super().__init__()
+        self._state = state
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        parsed = _parse_message_link(self.message_link.value)
+        if parsed is None:
+            await interaction.response.send_message(
+                "Could not parse the message URL. "
+                "Please paste the full Discord message link "
+                "(right-click the message → **Copy Message Link**).",
+                ephemeral=True,
+            )
+            _discard(self._state)
+            return
+
+        channel_id, message_id = parsed
+        self._state.display_name = self.team_name.value.strip()
+        self._state.tagline = self.tagline.value.strip()
+        self._state.logo_url = self.logo_url.value.strip()
+        self._state.channel_id = channel_id
+        self._state.relink_message_id = message_id
+        await _show_step2_color(interaction, self._state)
 
 
-async def _show_step2(interaction: discord.Interaction, state: FlowState) -> None:
-    view = _Step2View(state)
+# ── step 2: team color ────────────────────────────────────────────────────────
+
+
+async def _show_step2_color(interaction: discord.Interaction, state: FlowState) -> None:
+    view = _Step2ColorView(state)
     await interaction.response.send_message(
-        "**Step 2 of 7 — Team role**\n"
-        "Pick the Discord role that marks someone as being on this team.",
+        "**Step 2 of 8 — Team color**\n"
+        "Pick a color for this team's embeds, or enter a custom hex code.\n"
+        "This color will appear on all roster and transaction messages.",
         view=view,
         ephemeral=True,
     )
 
 
-class _Step2View(discord.ui.View):
+class _Step2ColorView(discord.ui.View):
+    def __init__(self, state: FlowState) -> None:
+        super().__init__(timeout=300)
+        self._state = state
+
+        options = [
+            discord.SelectOption(label=label, value=str(rgb))
+            for label, rgb in _PRESET_COLORS
+        ]
+        options.append(discord.SelectOption(label="🎨 Custom hex code…", value="custom"))
+        if state.color is not None:
+            options.append(discord.SelectOption(label="⏩ Keep current color", value="keep"))
+        options.append(discord.SelectOption(label="⏭️ Skip (use default)", value="skip"))
+
+        self._sel = discord.ui.Select(placeholder="Choose a color…", options=options)
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        value = self._sel.values[0]
+        if value == "custom":
+            await interaction.response.send_modal(_CustomHexModal(self._state))
+            return
+        if value == "keep":
+            pass  # retain existing color
+        elif value == "skip":
+            self._state.color = None
+        else:
+            self._state.color = int(value)
+        self.stop()
+        await _show_step3_team_role(interaction, self._state)
+
+    async def on_timeout(self) -> None:
+        _discard(self._state)
+
+
+class _CustomHexModal(discord.ui.Modal, title="Custom Team Color"):
+    hex_input = discord.ui.TextInput(
+        label="Hex color code",
+        placeholder="#FF0000 or FF0000",
+        min_length=6,
+        max_length=7,
+    )
+
+    def __init__(self, state: FlowState) -> None:
+        super().__init__()
+        self._state = state
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        color = _parse_hex_color(self.hex_input.value)
+        if color is None:
+            await interaction.response.send_message(
+                "Invalid hex code. Use a format like `#FF0000` or `FF0000`.",
+                ephemeral=True,
+            )
+            return
+        self._state.color = color
+        # Modal submit → must send_message; step 3 will edit from there
+        await _show_step3_team_role(interaction, self._state, from_modal=True)
+
+
+# ── step 3: team role ─────────────────────────────────────────────────────────
+
+
+async def _show_step3_team_role(
+    interaction: discord.Interaction, state: FlowState, *, from_modal: bool = False
+) -> None:
+    view = _Step3TeamRoleView(state)
+    content = (
+        "**Step 3 of 8 — Team role**\n"
+        "Pick the Discord role that marks someone as being on this team."
+    )
+    if from_modal:
+        await interaction.response.send_message(content, view=view, ephemeral=True)
+    else:
+        await interaction.response.edit_message(content=content, view=view)
+
+
+class _Step3TeamRoleView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
         sel = discord.ui.RoleSelect(placeholder="Select team role…", min_values=1, max_values=1)
         sel.callback = self._on_select
         self.add_item(sel)
+        if state.team_role_id:
+            self.keep_current.disabled = False
+        else:
+            self.keep_current.disabled = True
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        # children[0] is the RoleSelect we added above
         sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
         self._state.team_role_id = sel.values[0].id
         self.stop()
-        await _show_step3(interaction, self._state)
+        await _show_step4_principal_role(interaction, self._state)
+
+    @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
+    async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step4_principal_role(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
 
 
-# ── step 3: principal role ────────────────────────────────────────────────────
+# ── step 4: principal role ────────────────────────────────────────────────────
 
 
-async def _show_step3(interaction: discord.Interaction, state: FlowState) -> None:
-    view = _Step3View(state)
+async def _show_step4_principal_role(interaction: discord.Interaction, state: FlowState) -> None:
+    editing = state.existing_team is not None
+    if editing and state.principal_role_id is not None:
+        hint = "Click **Keep current →** to leave it unchanged, or **Clear →** to remove it."
+    elif editing:
+        hint = "Click **Skip →** to leave it admin-only."
+    else:
+        hint = "Click **Skip →** to leave it admin-only."
+    view = _Step4PrincipalRoleView(state)
     await interaction.response.edit_message(
         content=(
-            "**Step 3 of 7 — Principal role (optional)**\n"
+            "**Step 4 of 8 — Principal role (optional)**\n"
             "Pick a role whose members can use `/roster sign` and `/roster drop` for this team.\n"
-            "Click **Skip →** to leave it admin-only."
+            + hint
         ),
         view=view,
     )
 
 
-class _Step3View(discord.ui.View):
+class _Step4PrincipalRoleView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
@@ -260,23 +476,34 @@ class _Step3View(discord.ui.View):
         )
         self._sel.callback = self._on_select
         self.add_item(self._sel)
+        editing = state.existing_team is not None
+        if editing and state.principal_role_id is not None:
+            self.keep_current.disabled = False
+            self.skip_or_clear.label = "Clear →"
+        else:
+            self.keep_current.disabled = True
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         self._state.principal_role_id = self._sel.values[0].id
         self.stop()
-        await _show_builder(interaction, self._state, slot_type="staff", step_num=4)
+        await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
+
+    @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
+    async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     @discord.ui.button(label="Skip →", style=discord.ButtonStyle.secondary)
-    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def skip_or_clear(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self._state.principal_role_id = None
         self.stop()
-        await _show_builder(interaction, self._state, slot_type="staff", step_num=4)
+        await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
 
 
-# ── steps 4 & 5: slot builder loop ───────────────────────────────────────────
+# ── steps 5 & 6: slot builder loop ───────────────────────────────────────────
 # The admin can add as many slots as they want.  Each "Add slot" click opens a
 # modal (label + quantity), then a role-select message.  "Done →" advances.
 #
@@ -304,7 +531,7 @@ async def _show_builder(
     slots = state.staff_slots if slot_type == "staff" else state.driver_slots
     label = slot_type.capitalize()
     content = (
-        f"**Step {step_num} of 7 — {label} slots**\n"
+        f"**Step {step_num} of 8 — {label} slots**\n"
         f"Add as many {label.lower()} slots as you need, then click **Done →**.\n\n"
         f"**Current {label.lower()} slots:**\n{_slot_summary(slots)}"
     )
@@ -325,8 +552,6 @@ class _BuilderView(discord.ui.View):
 
     @discord.ui.button(label="Add slot", style=discord.ButtonStyle.primary)
     async def add_slot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        # Opening a modal is the response to this button click.
-        # The builder message stays visible; the modal appears on top.
         await interaction.response.send_modal(
             _SlotTextModal(state=self._state, slot_type=self._slot_type, step_num=self._step_num)
         )
@@ -346,10 +571,12 @@ class _BuilderView(discord.ui.View):
     @discord.ui.button(label="Done →", style=discord.ButtonStyle.success)
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        if self._step_num == 4:
-            await _show_builder(interaction, self._state, slot_type="driver", step_num=5)
+        if self._step_num == 5:
+            await _show_builder(interaction, self._state, slot_type="driver", step_num=6)
+        elif self._state.relink_message_id is not None:
+            await _show_step8_confirm(interaction, self._state)
         else:
-            await _show_step6(interaction, self._state)
+            await _show_step7_channel(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
@@ -378,9 +605,6 @@ class _SlotTextModal(discord.ui.Modal):
         label = self.label_input.value.strip()
         qty = int(raw)
 
-        # Can't edit the builder message here (modal submit → must send_message).
-        # We send a new ephemeral message with just the role select.
-        # When the role is picked, THAT message gets edited into the next builder.
         view = _SlotRoleView(
             state=self._state,
             label=label,
@@ -421,7 +645,6 @@ class _SlotRoleView(discord.ui.View):
         target.append(draft)
 
         self.stop()
-        # edit_message turns this role-select message into the refreshed builder.
         await _show_builder(
             interaction, self._state, slot_type=self._slot_type, step_num=self._step_num
         )
@@ -465,21 +688,22 @@ class _SlotRemoveView(discord.ui.View):
         pass
 
 
-# ── step 6: channel ───────────────────────────────────────────────────────────
+# ── step 7: channel ───────────────────────────────────────────────────────────
 
 
-async def _show_step6(interaction: discord.Interaction, state: FlowState) -> None:
-    view = _Step6View(state)
+async def _show_step7_channel(interaction: discord.Interaction, state: FlowState) -> None:
+    view = _Step7ChannelView(state)
+    hint = f" Click **Keep current →** to keep <#{state.channel_id}>." if state.channel_id else ""
     await interaction.response.edit_message(
         content=(
-            "**Step 6 of 7 — Channel**\n"
-            "Pick the text channel where the roster will be posted."
+            "**Step 7 of 8 — Channel**\n"
+            f"Pick the text channel where the roster will be posted.{hint}"
         ),
         view=view,
     )
 
 
-class _Step6View(discord.ui.View):
+class _Step7ChannelView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
@@ -491,18 +715,24 @@ class _Step6View(discord.ui.View):
         )
         sel.callback = self._on_select
         self.add_item(sel)
+        self.keep_current.disabled = not bool(state.channel_id)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         sel: discord.ui.ChannelSelect = self.children[0]  # type: ignore[assignment]
         self._state.channel_id = sel.values[0].id
         self.stop()
-        await _show_step7(interaction, self._state)
+        await _show_step8_confirm(interaction, self._state)
+
+    @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
+    async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step8_confirm(interaction, self._state)
 
     async def on_timeout(self) -> None:
         _discard(self._state)
 
 
-# ── step 7: preview & confirm ─────────────────────────────────────────────────
+# ── step 8: preview & confirm ─────────────────────────────────────────────────
 
 
 def _preview_team(state: FlowState) -> Team:
@@ -522,34 +752,38 @@ def _preview_team(state: FlowState) -> Team:
         channel_id=state.channel_id,
         tagline=state.tagline or None, logo_url=state.logo_url or None,
         principal_role_id=state.principal_role_id,
+        color=state.color,
         slots=slots,
     )
 
 
-async def _show_step7(interaction: discord.Interaction, state: FlowState) -> None:
+async def _show_step8_confirm(interaction: discord.Interaction, state: FlowState) -> None:
     assert interaction.guild is not None
     embed = build_embed(_preview_team(state), list(interaction.guild.members))
-    view = _Step7View(state)
-    await interaction.response.edit_message(
-        content=(
-            "**Step 7 of 7 — Confirm**\n"
+    flair = build_flair_file(state.color)
+    view = _Step8ConfirmView(state)
+    if state.relink_message_id is not None:
+        content = (
+            "**Confirm — Relink existing roster**\n"
+            "Here's how the roster will look. "
+            f"The existing message in <#{state.channel_id}> will be updated in place."
+        )
+    else:
+        content = (
+            "**Step 8 of 8 — Confirm**\n"
             "Here's how the roster will look. Member mentions are live.\n"
             f"Posting to <#{state.channel_id}>."
-        ),
-        embed=embed,
-        view=view,
-    )
+        )
+    await interaction.response.edit_message(content=content, embed=embed, view=view, attachments=[flair])
 
 
-class _Step7View(discord.ui.View):
+class _Step8ConfirmView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
 
     @discord.ui.button(label="Post roster", style=discord.ButtonStyle.success)
     async def post(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        # Defer immediately so we have time to write to the DB and post the message.
-        # After deferring, use edit_original_response to update the ephemeral message.
         await interaction.response.defer(ephemeral=True)
         try:
             message_id = await _commit_and_post(interaction, self._state)
@@ -585,7 +819,6 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
     if not isinstance(channel, discord.TextChannel):
         raise ValueError(f"Channel {state.channel_id} is not available as a text channel")
 
-    # Each slot is stored as (role_id, label, quantity, type, order)
     all_slots = [
         (s.slot_role_id, s.label, s.quantity, s.slot_type, i)
         for i, s in enumerate(state.staff_slots + state.driver_slots)
@@ -599,6 +832,7 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 team_role_id=state.team_role_id, channel_id=state.channel_id,
                 tagline=state.tagline or None, logo_url=state.logo_url or None,
                 principal_role_id=state.principal_role_id,
+                color=state.color,
             )
         else:
             team_id = state.existing_team.id
@@ -607,6 +841,7 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 team_role_id=state.team_role_id, channel_id=state.channel_id,
                 tagline=state.tagline or None, logo_url=state.logo_url or None,
                 principal_role_id=state.principal_role_id,
+                color=state.color,
             )
 
         await queries.replace_slots(conn, team_id, all_slots)
@@ -616,16 +851,33 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
 
     embed = build_embed(team, list(interaction.guild.members))
 
-    # If editing and the old message still exists, update it in place
+    # Relink: take over an existing message
+    if state.relink_message_id is not None:
+        try:
+            existing_msg = await channel.fetch_message(state.relink_message_id)
+            await existing_msg.edit(embed=embed, attachments=[build_flair_file(team.color)])
+            async with db.connect() as conn:
+                await queries.set_message_id(conn, team_id, existing_msg.id)
+                await conn.commit()
+            return existing_msg.id
+        except discord.NotFound:
+            log.warning(
+                "Relink target message %s not found — posting a new message instead",
+                state.relink_message_id,
+            )
+        except discord.Forbidden:
+            log.warning("No permission to edit relink target message %s", state.relink_message_id)
+
+    # Normal create, or relink fallback if the target message was gone
     if state.existing_team and state.existing_team.message_id:
         try:
             old_msg = await channel.fetch_message(state.existing_team.message_id)
-            await old_msg.edit(embed=embed)
+            await old_msg.edit(embed=embed, attachments=[build_flair_file(team.color)])
             return old_msg.id
         except discord.NotFound:
             pass  # Message was deleted; fall through and send a new one
 
-    msg = await channel.send(embed=embed)
+    msg = await channel.send(embed=embed, file=build_flair_file(team.color))
     async with db.connect() as conn:
         await queries.set_message_id(conn, team_id, msg.id)
         await conn.commit()
