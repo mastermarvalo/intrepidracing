@@ -144,22 +144,31 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
     if getattr(team, "info_label", None) and getattr(team, "info_body", None):
         embed.set_footer(text=f"{team.info_label}: {team.info_body}")
 
-    # Logo always thumbnail (top-right). Bottom slot: banner if set, else the
-    # generated title-card flair (so the F1 font text is always visible).
+    # Logo always in thumbnail (top-right).
+    # Banner goes to set_image (bottom) when present.
+    # Flair is sent as a separate first embed (see build_flair_embed), so no
+    # set_image fallback is needed here.
     if team.logo_url:
         embed.set_thumbnail(url=team.logo_url)
     if team.banner_url:
         embed.set_image(url=team.banner_url)
-    else:
-        embed.set_image(url="attachment://flair.png")
 
     return embed
 
 
-def roster_flair_file(team: Team) -> discord.File | None:
-    """Return the generated flair file unless a banner takes the bottom slot."""
-    if team.banner_url:
-        return None
+def build_flair_embed() -> discord.Embed:
+    """A standalone embed whose only content is the flair image.
+
+    Sent as the *first* embed in every roster message so the title-card
+    appears at the very top, above the roster content embed.
+    """
+    e = discord.Embed()
+    e.set_image(url="attachment://flair.png")
+    return e
+
+
+def roster_flair_file(team: Team) -> discord.File:
+    """The generated flair/title-card file — always included in roster messages."""
     return build_flair_file(team.color, team.name)
 
 

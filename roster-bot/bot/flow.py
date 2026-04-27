@@ -41,7 +41,7 @@ import discord
 
 from bot import db, queries
 from bot.models import Team, TeamSlot
-from bot.render import build_embed, roster_flair_file
+from bot.render import build_embed, build_flair_embed, roster_flair_file
 
 log = logging.getLogger(__name__)
 
@@ -1022,7 +1022,7 @@ def _preview_team(state: FlowState) -> Team:
 async def _show_step9_confirm(interaction: discord.Interaction, state: FlowState) -> None:
     assert interaction.guild is not None
     preview = _preview_team(state)
-    embed = build_embed(preview, list(interaction.guild.members))
+    roster_embed = build_embed(preview, list(interaction.guild.members))
     flair = roster_flair_file(preview)
     view = _Step9ConfirmView(state)
     if state.relink_message_id is not None:
@@ -1038,7 +1038,7 @@ async def _show_step9_confirm(interaction: discord.Interaction, state: FlowState
             f"Posting to <#{state.channel_id}>."
         )
     await interaction.response.edit_message(
-        content=content, embed=embed, view=view, attachments=[flair] if flair else []
+        content=content, embeds=[build_flair_embed(), roster_embed], view=view, attachments=[flair]
     )
 
 
@@ -1150,16 +1150,16 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
         team = await queries.fetch_team_by_id(conn, team_id)
         assert team is not None
 
-    embed = build_embed(team, list(interaction.guild.members))
+    roster_embed = build_embed(team, list(interaction.guild.members))
     flair = roster_flair_file(team)
-    attachments = [flair] if flair else []
+    embeds = [build_flair_embed(), roster_embed]
 
     # Relink: take over an existing message
     if state.relink_message_id is not None:
         existing_msg = await _fetch_roster_msg(interaction.client, channel, state.relink_message_id)
         if existing_msg is not None:
             try:
-                await existing_msg.edit(embed=embed, attachments=attachments)
+                await existing_msg.edit(embeds=embeds, attachments=[flair])
                 async with db.connect() as conn:
                     await queries.set_message_id(conn, team_id, existing_msg.id)
                     await conn.commit()
@@ -1173,21 +1173,16 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
     if state.existing_team and state.existing_team.message_id:
         old_msg = await _fetch_roster_msg(interaction.client, channel, state.existing_team.message_id)
         if old_msg is not None:
-            await old_msg.edit(embed=embed, attachments=attachments)
+            await old_msg.edit(embeds=embeds, attachments=[flair])
             return old_msg.id
         # Message was deleted; fall through and send a new one
 
     # New post
     if isinstance(channel, discord.ForumChannel):
-        thread = await channel.create_thread(
-            name=team.name, embed=embed, **{"file": flair} if flair else {}
-        )
+        thread = await channel.create_thread(name=team.name, embeds=embeds, file=flair)
         msg_id = thread.id
-    elif flair:
-        msg = await channel.send(embed=embed, file=flair)
-        msg_id = msg.id
     else:
-        msg = await channel.send(embed=embed)
+        msg = await channel.send(embeds=embeds, file=flair)
         msg_id = msg.id
     async with db.connect() as conn:
         await queries.set_message_id(conn, team_id, msg_id)

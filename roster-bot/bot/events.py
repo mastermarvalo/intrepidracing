@@ -22,7 +22,7 @@ from discord.ext import commands, tasks
 
 from bot import db, queries
 from bot.models import GuildConfig, Team
-from bot.render import build_embed, build_fa_embed, build_transaction_embed, roster_flair_file
+from bot.render import build_embed, build_fa_embed, build_flair_embed, build_transaction_embed, roster_flair_file
 
 log = logging.getLogger(__name__)
 
@@ -148,9 +148,9 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
         log.warning("Channel %s for team %s is unavailable", team.channel_id, team.key)
         return
 
-    embed = build_embed(team, list(guild.members))
+    roster_embed = build_embed(team, list(guild.members))
     flair = roster_flair_file(team)
-    attachments = [flair] if flair else []
+    embeds = [build_flair_embed(), roster_embed]
 
     try:
         if isinstance(channel, discord.TextChannel):
@@ -160,7 +160,7 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
             if not isinstance(thread, discord.Thread):
                 thread = await bot.fetch_channel(team.message_id)
             msg = await thread.fetch_message(team.message_id)
-        await msg.edit(embed=embed, attachments=attachments)
+        await msg.edit(embeds=embeds, attachments=[flair])
     except discord.NotFound:
         log.warning("Roster message for team %s was deleted — clearing message_id", team.key)
         async with db.connect() as conn:
