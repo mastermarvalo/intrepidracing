@@ -1,3 +1,5 @@
+import asyncio
+import math
 import os
 from io import BytesIO
 from typing import Literal, Protocol
@@ -11,6 +13,9 @@ _FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "Formula1-Bold_we
 
 # bytes cache keyed by (color, team_name, dark_mode)
 _flair_cache: dict[tuple[int | None, str, bool], bytes] = {}
+
+# avatar image bytes keyed by CDN URL (auto-invalidates when user changes avatar)
+_avatar_cache: dict[str, bytes] = {}
 
 _FLAIR_W = 960
 _FLAIR_H = 90
@@ -157,6 +162,123 @@ def roster_flair_file(team: Team) -> discord.File:
     """The generated flair/title-card file — always included in roster messages."""
     return build_flair_file(team.color, team.name, dark_mode=team.dark_mode)
 
+
+async def _fetch_avatar_bytes(member: discord.Member) -> bytes | None:
+    url = str(member.display_avatar.replace(size=64, format="png"))
+    if url in _avatar_cache:
+        return _avatar_cache[url]
+    try:
+        data = await member.display_avatar.replace(size=64, format="png").read()
+        _avatar_cache[url] = data
+        return data
+    except Exception:
+        return None
+
+
+async def build_avatar_card(team: Team, members: list[discord.Member]) -> discord.File | None:
+    pool = [m for m in members if any(r.id == team.team_role_id for r in m.roles)]
+    if not pool:
+        return None
+
+    results = await asyncio.gather(*(_fetch_avatar_bytes(m) for m in pool))
+    av_bytes: dict[int, bytes | None] = {m.id: data for m, data in zip(pool, results)}
+
+    # Organise by slot then any remainder not in a slot
+    sections: list[tuple[str, list[discord.Member]]] = []
+    seen: set[int] = set()
+    for slot in sorted(team.slots, key=lambda s: s.sort_order):
+        mems = [m for m in pool if any(r.id == slot.slot_role_id for r in m.roles)]
+        if mems:
+            sections.append((slot.label, mems))
+            seen.update(m.id for m in mems)
+    rest = [m for m in pool if m.id not in seen]
+    if rest:
+        sections.append(("Members", rest))
+
+    if not sections:
+        return None
+
+    # Layout
+    W        = 960
+    AVATAR_D = 64
+    H_GAP    = 16
+    PAD_X    = 20
+    PAD_Y    = 16
+    LABEL_H  = 26
+    LABEL_MB = 8
+    NAME_H   = 18
+    ROW_STRIDE = AVATAR_D + 4 + NAME_H + 6
+    SEC_GAP  = 18
+    per_row  = (W - 2 * PAD_X + H_GAP) // (AVATAR_D + H_GAP)
+
+    total_h = PAD_Y
+    for i, (_, mems) in enumerate(sections):
+        if i:
+            total_h += SEC_GAP
+        total_h += LABEL_H + LABEL_MB + math.ceil(len(mems) / per_row) * ROW_STRIDE
+    total_h += PAD_Y
+
+    rgb_int = team.color if team.color is not None else 0x5865F2
+    bg = (
+        int(((rgb_int >> 16) & 0xFF) * 0.12),
+        int(((rgb_int >> 8)  & 0xFF) * 0.12),
+        int((rgb_int         & 0xFF) * 0.12),
+        255,
+    )
+    img  = Image.new("RGBA", (W, total_h), bg)
+    draw = ImageDraw.Draw(img)
+
+    try:
+        label_font = ImageFont.truetype(_FONT_PATH, 16)
+        name_font  = ImageFont.truetype(_FONT_PATH, 11)
+    except OSError:
+        label_font = name_font = ImageFont.load_default()
+
+    circle_mask = Image.new("L", (AVATAR_D, AVATAR_D), 0)
+    ImageDraw.Draw(circle_mask).ellipse((0, 0, AVATAR_D - 1, AVATAR_D - 1), fill=255)
+
+    y = PAD_Y
+    for i, (label, mems) in enumerate(sections):
+        if i:
+            y += SEC_GAP
+        draw.text((PAD_X, y), label.upper(), font=label_font, fill=(255, 255, 255, 180))
+        y += LABEL_H + LABEL_MB
+
+        for row_start in range(0, len(mems), per_row):
+            for col, member in enumerate(mems[row_start: row_start + per_row]):
+                ax = PAD_X + col * (AVATAR_D + H_GAP)
+                data = av_bytes.get(member.id)
+                if data:
+                    try:
+                        av = Image.open(BytesIO(data)).convert("RGBA").resize(
+                            (AVATAR_D, AVATAR_D), Image.LANCZOS
+                        )
+                        circle = Image.new("RGBA", (AVATAR_D, AVATAR_D), (0, 0, 0, 0))
+                        circle.paste(av, mask=circle_mask)
+                        img.alpha_composite(circle, (ax, y))
+                    except Exception:
+                        draw.ellipse((ax, y, ax + AVATAR_D - 1, y + AVATAR_D - 1), fill=(60, 60, 60, 255))
+                else:
+                    draw.ellipse((ax, y, ax + AVATAR_D - 1, y + AVATAR_D - 1), fill=(60, 60, 60, 255))
+
+                name = member.display_name[:13] + "…" if len(member.display_name) > 14 else member.display_name
+                bbox = draw.textbbox((0, 0), name, font=name_font)
+                nx = ax + (AVATAR_D - (bbox[2] - bbox[0])) // 2
+                draw.text((nx, y + AVATAR_D + 4), name, font=name_font, fill=(204, 204, 204, 255))
+            y += ROW_STRIDE
+
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    return discord.File(buf, filename="avatars.png")
+
+
+def build_avatar_embed(color: int | None) -> discord.Embed:
+    e = discord.Embed(
+        color=discord.Color(color) if color is not None else discord.Color.blurple()
+    )
+    e.set_image(url="attachment://avatars.png")
+    return e
 
 
 def _tier_sort_key(role: discord.Role) -> int:

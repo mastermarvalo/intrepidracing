@@ -15,7 +15,10 @@ from discord.ext import commands
 
 from bot import db, flow, queries
 from bot.events import _rerender, _rerender_fa
-from bot.render import build_embed, build_fa_embed, build_flair_embed, roster_flair_file
+from bot.render import (
+    build_avatar_card, build_avatar_embed,
+    build_embed, build_fa_embed, build_flair_embed, roster_flair_file,
+)
 
 log = logging.getLogger(__name__)
 
@@ -181,11 +184,17 @@ class RosterCog(commands.Cog):
             )
             return
 
-        roster_embed = build_embed(team, list(interaction.guild.members))
+        await interaction.response.defer(ephemeral=True)
+        members = list(interaction.guild.members)
+        roster_embed = build_embed(team, members)
         flair = roster_flair_file(team)
-        await interaction.response.send_message(
-            embeds=[build_flair_embed(team.color), roster_embed], file=flair, ephemeral=True
-        )
+        avatar_file = await build_avatar_card(team, members)
+        embeds = [build_flair_embed(team.color), roster_embed]
+        files: list[discord.File] = [flair]
+        if avatar_file:
+            embeds.append(build_avatar_embed(team.color))
+            files.append(avatar_file)
+        await interaction.followup.send(embeds=embeds, files=files, ephemeral=True)
 
     # ── /roster sign ──────────────────────────────────────────────────────────
 
@@ -301,6 +310,110 @@ class RosterCog(commands.Cog):
         await interaction.response.send_message(
             f"✅ **{member.display_name}** dropped from **{team.name}**.", ephemeral=True
         )
+
+    # ── /roster bulksign / bulkdrop ───────────────────────────────────────────
+
+    @roster.command(name="bulksign", description="Sign multiple players to a team at once")
+    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    async def roster_bulksign(self, interaction: discord.Interaction, name: str) -> None:
+        assert interaction.guild is not None and interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
+            config = await queries.fetch_guild_config(conn, interaction.guild_id)
+
+        if team is None:
+            await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
+            return
+
+        authorized = _is_admin(interaction) or (
+            team.principal_role_id is not None and _has_role(interaction, team.principal_role_id)
+        )
+        if not authorized:
+            await interaction.response.send_message(
+                "You don't have permission to sign players for this team.", ephemeral=True
+            )
+            return
+
+        view = _BulkSignDropView(team, config, drop=False)
+        await interaction.response.send_message(
+            f"**Bulk sign → {team.name}**\nSelect up to 25 players, then click **Sign**.",
+            view=view,
+            ephemeral=True,
+        )
+
+    @roster.command(name="bulkdrop", description="Drop multiple players from a team at once")
+    @app_commands.describe(name="Team identifier (e.g. redbull)")
+    async def roster_bulkdrop(self, interaction: discord.Interaction, name: str) -> None:
+        assert interaction.guild is not None and interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
+            config = await queries.fetch_guild_config(conn, interaction.guild_id)
+
+        if team is None:
+            await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
+            return
+
+        authorized = _is_admin(interaction) or (
+            team.principal_role_id is not None and _has_role(interaction, team.principal_role_id)
+        )
+        if not authorized:
+            await interaction.response.send_message(
+                "You don't have permission to drop players from this team.", ephemeral=True
+            )
+            return
+
+        view = _BulkSignDropView(team, config, drop=True)
+        await interaction.response.send_message(
+            f"**Bulk drop ← {team.name}**\nSelect up to 25 players, then click **Drop**.",
+            view=view,
+            ephemeral=True,
+        )
+
+    # ── /roster history ───────────────────────────────────────────────────────
+
+    @roster.command(name="history", description="Show recent sign/drop history for a team")
+    @app_commands.describe(name="Team identifier (e.g. redbull)", limit="Entries to show (default 20, max 50)")
+    async def roster_history(
+        self, interaction: discord.Interaction, name: str, limit: int = 20
+    ) -> None:
+        assert interaction.guild_id is not None
+        limit = max(1, min(limit, 50))
+
+        async with db.connect() as conn:
+            team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
+            if team is None:
+                await interaction.response.send_message(
+                    f"No team named `{name}`.", ephemeral=True
+                )
+                return
+            rows = await queries.fetch_transactions(conn, interaction.guild_id, team.id, limit)
+
+        if not rows:
+            await interaction.response.send_message(
+                f"No transaction history for **{team.name}** yet.", ephemeral=True
+            )
+            return
+
+        lines: list[str] = []
+        for row in rows:
+            icon = "✅" if row["action"] == "signed" else "🔴"
+            verb = "signed" if row["action"] == "signed" else "dropped"
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
+                ts = f"<t:{int(dt.timestamp())}:D>"
+            except Exception:
+                ts = row["created_at"][:10]
+            lines.append(f"{icon} **{row['member_name']}** {verb} — {ts}")
+
+        embed = discord.Embed(
+            title=f"Transaction History — {team.name}",
+            description="\n".join(lines),
+            color=discord.Color(team.color) if team.color else discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ── /roster freeagents ────────────────────────────────────────────────────
 
@@ -558,6 +671,88 @@ class _ConfirmDMView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.edit_message(content="Cancelled.", view=None)
         self.stop()
+
+    async def on_timeout(self) -> None:
+        pass
+
+
+class _BulkSignDropView(discord.ui.View):
+    def __init__(self, team, config, *, drop: bool) -> None:
+        super().__init__(timeout=120)
+        self._team = team
+        self._config = config
+        self._drop = drop
+        self._selected: list[discord.Member] = []
+
+        verb = "drop" if drop else "sign"
+        self._sel = discord.ui.UserSelect(
+            placeholder=f"Select players to {verb}…",
+            min_values=1,
+            max_values=25,
+        )
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
+
+        self.confirm.label = "Drop" if drop else "Sign"
+        self.confirm.style = discord.ButtonStyle.danger if drop else discord.ButtonStyle.success
+        self.confirm.disabled = True
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        self._selected = list(self._sel.values)
+        self.confirm.disabled = False
+        verb = "Drop" if self._drop else "Sign"
+        names = ", ".join(m.display_name for m in self._selected[:5])
+        if len(self._selected) > 5:
+            names += f" +{len(self._selected) - 5} more"
+        await interaction.response.edit_message(
+            content=f"**{verb}:** {names}\nClick **{verb}** to confirm.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Sign", style=discord.ButtonStyle.success, row=1)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.defer(ephemeral=True)
+        assert interaction.guild is not None
+
+        team_role = interaction.guild.get_role(self._team.team_role_id)
+        fa_role = (
+            interaction.guild.get_role(self._config.free_agent_role_id)
+            if self._config.free_agent_role_id else None
+        )
+        done: list[str] = []
+        failed: list[str] = []
+
+        for member in self._selected:
+            try:
+                if self._drop:
+                    to_remove = [r for r in [team_role] if r and r in member.roles]
+                    to_add = [fa_role] if fa_role and fa_role not in member.roles else []
+                    if to_remove:
+                        await member.remove_roles(*to_remove, reason=f"Bulk drop by {interaction.user}")
+                    if to_add:
+                        await member.add_roles(*to_add, reason=f"Bulk drop by {interaction.user}")
+                else:
+                    to_add = [team_role] if team_role else []
+                    to_remove = [fa_role] if fa_role and fa_role in member.roles else []
+                    if to_add:
+                        await member.add_roles(*to_add, reason=f"Bulk sign by {interaction.user}")
+                    if to_remove:
+                        await member.remove_roles(*to_remove, reason=f"Bulk sign by {interaction.user}")
+                done.append(member.display_name)
+            except discord.Forbidden:
+                failed.append(member.display_name)
+
+        verb_past = "dropped from" if self._drop else "signed to"
+        result = f"✅ **{len(done)}** player(s) {verb_past} **{self._team.name}**."
+        if failed:
+            result += f"\n⚠️ Failed for: {', '.join(failed)} (missing role permissions)"
+        await interaction.followup.send(result, ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled.", view=None)
 
     async def on_timeout(self) -> None:
         pass

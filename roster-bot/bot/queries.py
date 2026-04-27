@@ -176,6 +176,45 @@ async def delete_team(conn: aiosqlite.Connection, team_id: int) -> None:
     await conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
 
 
+# ── transaction log ───────────────────────────────────────────────────────────
+
+
+async def log_transaction(
+    conn: aiosqlite.Connection,
+    guild_id: int,
+    team_id: int,
+    member_id: int,
+    member_name: str,
+    action: str,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO transactions (guild_id, team_id, member_id, member_name, action)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (guild_id, team_id, member_id, member_name, action),
+    )
+
+
+async def fetch_transactions(
+    conn: aiosqlite.Connection,
+    guild_id: int,
+    team_id: int,
+    limit: int = 20,
+) -> list[aiosqlite.Row]:
+    async with conn.execute(
+        """
+        SELECT member_name, action, created_at
+        FROM transactions
+        WHERE guild_id = ? AND team_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (guild_id, team_id, limit),
+    ) as cur:
+        return await cur.fetchall()
+
+
 # ── guild config ──────────────────────────────────────────────────────────────
 
 
