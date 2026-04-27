@@ -137,12 +137,10 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
         sections.append(f"## __Staff__\n{staff_text}")
     if driver_text:
         sections.append(f"## __Drivers__\n{driver_text}")
+    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
+        sections.append(f"## __{team.info_label}__\n{team.info_body}")
 
     embed.description = "\n\n".join(sections) if sections else None
-
-    # Info box sits below the bottom image via the footer slot.
-    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
-        embed.set_footer(text=f"{team.info_label}: {team.info_body}")
 
     # Logo always in thumbnail (top-right).
     # Banner goes to set_image (bottom) when present.
