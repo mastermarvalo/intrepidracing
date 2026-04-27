@@ -125,9 +125,6 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
         color=discord.Color(team.color) if team.color is not None else discord.Color.blurple(),
     )
 
-    if team.logo_url:
-        embed.set_thumbnail(url=team.logo_url)
-
     sections: list[str] = []
 
     if team.tagline:
@@ -140,16 +137,21 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
         sections.append(f"## __Staff__\n{staff_text}")
     if driver_text:
         sections.append(f"## __Drivers__\n{driver_text}")
+    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
+        sections.append(f"## __{team.info_label}__\n{team.info_body}")
 
     embed.description = "\n\n".join(sections) if sections else None
 
-    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
-        embed.add_field(name=team.info_label, value=team.info_body, inline=False)
-
-    if team.banner_url:
+    # Image layout: banner goes to thumbnail (top-right) when both are set so it
+    # appears above the logo; logo then fills the large bottom slot.
+    if team.banner_url and team.logo_url:
+        embed.set_thumbnail(url=team.banner_url)
+        embed.set_image(url=team.logo_url)
+    elif team.banner_url:
         embed.set_image(url=team.banner_url)
     elif team.logo_url:
-        embed.set_image(url=team.logo_url)  # also shown large at the bottom
+        embed.set_thumbnail(url=team.logo_url)
+        embed.set_image(url=team.logo_url)
     else:
         embed.set_image(url="attachment://flair.png")
 

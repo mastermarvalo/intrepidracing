@@ -123,6 +123,10 @@ class FlowState:
     info_label: str = ""
     info_body: str = ""
 
+    # When True (edit flow), each section returns to the edit menu instead of the
+    # next step.  False for create and relink flows (linear progression).
+    menu_mode: bool = False
+
     # Set during relink flow — the existing Discord message to take over.
     # When present, step 7 (channel picker) is skipped and _commit_and_post
     # edits this message in place instead of posting a new one.
@@ -226,8 +230,9 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
         target = state.staff_slots if s.slot_type == "staff" else state.driver_slots
         target.append(draft)
 
+    state.menu_mode = True
     _save(state)
-    await interaction.response.send_modal(_Step1Modal(state))
+    await _show_edit_menu(interaction, state, new_message=True)
 
 
 async def start_relink(interaction: discord.Interaction, team_key: str) -> None:
@@ -247,6 +252,83 @@ async def start_relink(interaction: discord.Interaction, team_key: str) -> None:
     state = FlowState(guild_id=interaction.guild_id, user_id=interaction.user.id, team_key=team_key)
     _save(state)
     await interaction.response.send_modal(_RelinkStep1Modal(state))
+
+
+# ── edit menu (used instead of linear steps when editing) ────────────────────
+
+
+def _edit_menu_content(state: FlowState) -> str:
+    color_hex = f"`#{state.color:06X}`" if state.color else "`default`"
+    staff = f"{len(state.staff_slots)} slot(s)" if state.staff_slots else "none"
+    drivers = f"{len(state.driver_slots)} slot(s)" if state.driver_slots else "none"
+    info = f"`{state.info_label}`" if state.info_label else "none"
+    return (
+        f"**Editing: {state.display_name}**\n"
+        f"Color: {color_hex} | Staff: {staff} | Drivers: {drivers} | Info box: {info}\n\n"
+        "Select a section to edit, then click **Finish →** when done."
+    )
+
+
+async def _show_edit_menu(
+    interaction: discord.Interaction, state: FlowState, *, new_message: bool = False
+) -> None:
+    view = _EditMenuView(state)
+    content = _edit_menu_content(state)
+    if new_message:
+        await interaction.response.send_message(content, view=view, ephemeral=True)
+    else:
+        await interaction.response.edit_message(content=content, view=view, embed=None, attachments=[])
+
+
+class _EditMenuView(discord.ui.View):
+    def __init__(self, state: FlowState) -> None:
+        super().__init__(timeout=600)
+        self._state = state
+        self._sel = discord.ui.Select(
+            placeholder="Select section to edit…",
+            options=[
+                discord.SelectOption(label="Team info", value="info",
+                    description="Name, tagline, logo, accent image"),
+                discord.SelectOption(label="Team color", value="color"),
+                discord.SelectOption(label="Team role", value="team_role"),
+                discord.SelectOption(label="Principal role", value="principal"),
+                discord.SelectOption(label="Staff slots", value="staff"),
+                discord.SelectOption(label="Driver slots", value="drivers"),
+                discord.SelectOption(label="Channel", value="channel"),
+                discord.SelectOption(label="Info box", value="info_box",
+                    description="Custom labeled section"),
+            ],
+        )
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        value = self._sel.values[0]
+        self.stop()
+        if value == "info":
+            await interaction.response.send_modal(_Step1Modal(self._state))
+        elif value == "color":
+            await _show_step2_color(interaction, self._state, from_modal=False)
+        elif value == "team_role":
+            await _show_step3_team_role(interaction, self._state)
+        elif value == "principal":
+            await _show_step4_principal_role(interaction, self._state)
+        elif value == "staff":
+            await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
+        elif value == "drivers":
+            await _show_builder(interaction, self._state, slot_type="driver", step_num=6)
+        elif value == "channel":
+            await _show_step7_channel(interaction, self._state)
+        elif value == "info_box":
+            await _show_step8_info(interaction, self._state)
+
+    @discord.ui.button(label="Finish →", style=discord.ButtonStyle.success, row=1)
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await _show_step9_confirm(interaction, self._state)
+
+    async def on_timeout(self) -> None:
+        _discard(self._state)
 
 
 # ── step 1: text fields ───────────────────────────────────────────────────────
@@ -292,7 +374,10 @@ class _Step1Modal(discord.ui.Modal, title="Team Setup (1/9)"):
         self._state.tagline = self.tagline.value.strip()
         self._state.logo_url = self.logo_url.value.strip()
         self._state.banner_url = self.banner_url.value.strip()
-        await _show_step2_color(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state, new_message=True)
+        else:
+            await _show_step2_color(interaction, self._state)
 
 
 class _RelinkStep1Modal(discord.ui.Modal, title="Team Relink — Setup"):
@@ -354,15 +439,19 @@ class _RelinkStep1Modal(discord.ui.Modal, title="Team Relink — Setup"):
 # ── step 2: team color ────────────────────────────────────────────────────────
 
 
-async def _show_step2_color(interaction: discord.Interaction, state: FlowState) -> None:
+async def _show_step2_color(
+    interaction: discord.Interaction, state: FlowState, *, from_modal: bool = True
+) -> None:
     view = _Step2ColorView(state)
-    await interaction.response.send_message(
+    content = (
         "**Step 2 of 9 — Team color**\n"
         "Pick a color for this team's embeds, or enter a custom hex code.\n"
-        "This color will appear on all roster and transaction messages.",
-        view=view,
-        ephemeral=True,
+        "This color will appear on all roster and transaction messages."
     )
+    if from_modal:
+        await interaction.response.send_message(content, view=view, ephemeral=True)
+    else:
+        await interaction.response.edit_message(content=content, view=view)
 
 
 class _Step2ColorView(discord.ui.View):
@@ -396,7 +485,10 @@ class _Step2ColorView(discord.ui.View):
         else:
             self._state.color = int(value)
         self.stop()
-        await _show_step3_team_role(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_step3_team_role(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary, row=1)
     async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -428,8 +520,10 @@ class _CustomHexModal(discord.ui.Modal, title="Custom Team Color"):
             )
             return
         self._state.color = color
-        # Modal submit → must send_message; step 3 will edit from there
-        await _show_step3_team_role(interaction, self._state, from_modal=True)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state, new_message=True)
+        else:
+            await _show_step3_team_role(interaction, self._state, from_modal=True)
 
 
 # ── step 3: team role ─────────────────────────────────────────────────────────
@@ -463,12 +557,18 @@ class _Step3TeamRoleView(discord.ui.View):
         sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
         self._state.team_role_id = sel.values[0].id
         self.stop()
-        await _show_step4_principal_role(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_step4_principal_role(interaction, self._state)
 
     @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
     async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        await _show_step4_principal_role(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_step4_principal_role(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
     async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -521,18 +621,27 @@ class _Step4PrincipalRoleView(discord.ui.View):
     async def _on_select(self, interaction: discord.Interaction) -> None:
         self._state.principal_role_id = self._sel.values[0].id
         self.stop()
-        await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
     async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     @discord.ui.button(label="Skip →", style=discord.ButtonStyle.secondary)
     async def skip_or_clear(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self._state.principal_role_id = None
         self.stop()
-        await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
     async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -612,7 +721,9 @@ class _BuilderView(discord.ui.View):
     @discord.ui.button(label="Done →", style=discord.ButtonStyle.success)
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        if self._step_num == 5:
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        elif self._step_num == 5:
             await _show_builder(interaction, self._state, slot_type="driver", step_num=6)
         elif self._state.relink_message_id is not None:
             await _show_step9_confirm(interaction, self._state)
@@ -768,12 +879,18 @@ class _Step7ChannelView(discord.ui.View):
         sel: discord.ui.ChannelSelect = self.children[0]  # type: ignore[assignment]
         self._state.channel_id = sel.values[0].id
         self.stop()
-        await _show_step8_info(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_step8_info(interaction, self._state)
 
     @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
     async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        await _show_step8_info(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_step8_info(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
     async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -822,12 +939,18 @@ class _Step8InfoView(discord.ui.View):
         self._state.info_label = ""
         self._state.info_body = ""
         self.stop()
-        await _show_step8_info(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_step8_info(interaction, self._state)
 
     @discord.ui.button(label="Next →", style=discord.ButtonStyle.success)
     async def next_step(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        await _show_step9_confirm(interaction, self._state)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state)
+        else:
+            await _show_step9_confirm(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
     async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -862,7 +985,10 @@ class _InfoBoxModal(discord.ui.Modal, title="Info Box"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         self._state.info_label = self.label_input.value.strip()
         self._state.info_body = self.body_input.value.strip()
-        await _show_step8_info(interaction, self._state, from_modal=True)
+        if self._state.menu_mode:
+            await _show_edit_menu(interaction, self._state, new_message=True)
+        else:
+            await _show_step8_info(interaction, self._state, from_modal=True)
 
 
 # ── step 9: preview & confirm ─────────────────────────────────────────────────
