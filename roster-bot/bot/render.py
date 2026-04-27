@@ -137,21 +137,19 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
         sections.append(f"## __Staff__\n{staff_text}")
     if driver_text:
         sections.append(f"## __Drivers__\n{driver_text}")
-    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
-        sections.append(f"## __{team.info_label}__\n{team.info_body}")
 
     embed.description = "\n\n".join(sections) if sections else None
 
-    # Image layout: banner goes to thumbnail (top-right) when both are set so it
-    # appears above the logo; logo then fills the large bottom slot.
-    if team.banner_url and team.logo_url:
-        embed.set_thumbnail(url=team.banner_url)
-        embed.set_image(url=team.logo_url)
-    elif team.banner_url:
-        embed.set_image(url=team.banner_url)
-    elif team.logo_url:
+    # Info box sits below the bottom image via the footer slot.
+    if getattr(team, "info_label", None) and getattr(team, "info_body", None):
+        embed.set_footer(text=f"{team.info_label}: {team.info_body}")
+
+    # Logo always thumbnail (top-right). Bottom slot: banner if set, else the
+    # generated title-card flair (so the F1 font text is always visible).
+    if team.logo_url:
         embed.set_thumbnail(url=team.logo_url)
-        embed.set_image(url=team.logo_url)
+    if team.banner_url:
+        embed.set_image(url=team.banner_url)
     else:
         embed.set_image(url="attachment://flair.png")
 
@@ -159,8 +157,8 @@ def build_embed(team: Team, members: list[MemberLike]) -> discord.Embed:
 
 
 def roster_flair_file(team: Team) -> discord.File | None:
-    """Returns a generated flair file only when neither banner_url nor logo_url provides a bottom image."""
-    if team.logo_url or team.banner_url:
+    """Return the generated flair file unless a banner takes the bottom slot."""
+    if team.banner_url:
         return None
     return build_flair_file(team.color, team.name)
 
