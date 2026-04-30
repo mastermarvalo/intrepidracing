@@ -132,7 +132,6 @@ async def _announce_transaction(
 ) -> None:
     async with db.connect() as conn:
         await queries.log_transaction(conn, team.guild_id, team.id, member.id, member.display_name, action)
-        await conn.commit()
 
     if not config.transactions_channel_id:
         return
@@ -172,7 +171,6 @@ async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # t
         log.warning("Roster message for team %s was deleted — clearing message_id", team.key)
         async with db.connect() as conn:
             await queries.set_message_id(conn, team.id, None)
-            await conn.commit()
     except discord.Forbidden:
         log.warning("No permission to edit roster message in channel %s", team.channel_id)
 
@@ -193,7 +191,6 @@ async def _rerender_fa(bot: commands.Bot, guild: discord.Guild, config) -> None:
         log.warning("FA board message was deleted — clearing fa_message_id")
         async with db.connect() as conn:
             await queries.set_fa_message_id(conn, guild.id, None)
-            await conn.commit()
     except discord.Forbidden:
         log.warning("No permission to edit FA board in channel %s", config.fa_channel_id)
 

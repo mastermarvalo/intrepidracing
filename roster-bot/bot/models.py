@@ -55,4 +55,5 @@ class StatBoard:
     sheet_range: str
     channel_id: int
     message_id: int | None = None
+    forum_thread_id: int | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

@@ -442,12 +442,8 @@ class RosterCog(commands.Cog):
         for row in rows:
             icon = "✅" if row["action"] == "signed" else "🔴"
             verb = "signed" if row["action"] == "signed" else "dropped"
-            try:
-                from datetime import datetime, timezone
-                dt = datetime.fromisoformat(row["created_at"]).replace(tzinfo=timezone.utc)
-                ts = f"<t:{int(dt.timestamp())}:D>"
-            except Exception:
-                ts = row["created_at"][:10]
+            # asyncpg returns TIMESTAMPTZ as a tz-aware datetime
+            ts = f"<t:{int(row['created_at'].timestamp())}:D>"
             lines.append(f"{icon} **{row['member_name']}** {verb} — {ts}")
 
         embed = discord.Embed(
@@ -493,7 +489,6 @@ class RosterCog(commands.Cog):
             async with db.connect() as conn:
                 await queries.upsert_fa_channel(conn, interaction.guild_id, channel.id)
                 await queries.set_fa_message_id(conn, interaction.guild_id, msg.id)
-                await conn.commit()
             await interaction.followup.send(
                 f"✅ Free agent board posted to {channel.mention} and will stay updated.",
                 ephemeral=True,
@@ -581,7 +576,6 @@ class _ConfigView(discord.ui.View):
         role = self._role_sel.values[0]
         async with db.connect() as conn:
             await queries.upsert_guild_config(conn, self._guild_id, role.id)
-            await conn.commit()
         await interaction.response.edit_message(
             content=f"✅ Free Agent role set to {role.mention}.",
         )
@@ -590,7 +584,6 @@ class _ConfigView(discord.ui.View):
         channel = self._chan_sel.values[0]
         async with db.connect() as conn:
             await queries.upsert_transactions_channel(conn, self._guild_id, channel.id)
-            await conn.commit()
         await interaction.response.edit_message(
             content=f"✅ Transactions channel set to {channel.mention}.",
         )
@@ -621,7 +614,6 @@ class _ConfirmRemoveView(discord.ui.View):
                     pass
 
             await queries.delete_team(conn, self._team_id)
-            await conn.commit()
 
         await interaction.response.edit_message(
             content=f"**{self._team_name}** removed.", view=None

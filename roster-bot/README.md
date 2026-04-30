@@ -25,13 +25,26 @@ make logs      # follow logs
 make build     # build image only
 ```
 
-The database lives in a named Docker volume (`roster-data`) and persists across restarts and rebuilds.
+The database is Postgres (service: `postgres`, image `postgres:16-alpine`); data
+lives in the `postgres-data` named volume and persists across restarts/rebuilds.
+Schema migrations apply automatically on bot startup from `migrations/`.
 
-**First-time setup only** — if you have an existing `roster.db` to migrate:
+**Importing an existing SQLite roster.db** (one-time, e.g. after upgrading from
+the SQLite-only version):
 
 ```sh
-sudo docker compose create
-sudo docker compose cp roster.db roster-bot:/data/roster.db
+# 1. Stop the bot only (Postgres keeps running)
+sudo docker compose stop roster-bot
+
+# 2. Apply the schema (start the bot once so migrations run, then stop again,
+#    OR psql -f migrations/001_init.sql)
+sudo docker compose up -d roster-bot && sleep 5 && sudo docker compose stop roster-bot
+
+# 3. Run the data migration (from inside a Python venv with asyncpg installed)
+DATABASE_URL=postgresql://roster:roster@127.0.0.1:5432/roster \
+  uv run python scripts/migrate_sqlite_to_pg.py /path/to/roster.db
+
+# 4. Bring everything back up
 make up
 ```
 
@@ -115,7 +128,8 @@ uv run ruff check bot/
 |---|---|---|
 | `DISCORD_TOKEN` | *(required)* | Bot token |
 | `LOG_LEVEL` | `INFO` | Python logging level |
-| `DB_PATH` | `./roster.db` | Path to SQLite database file |
+| `DATABASE_URL` | `postgresql://roster:roster@postgres:5432/roster` (set by compose) | Postgres connection string |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `roster` | Postgres credentials (compose only) |
 
 ## Architecture notes
 
@@ -123,4 +137,4 @@ uv run ruff check bot/
 - **Render is idempotent** — `build_embed` edits the stored message in place. If the message was deleted, `message_id` is cleared and `/roster list` flags the team as broken.
 - **Two update triggers**: `on_member_update` (event-driven, immediate) + 15-min poll (safety net for missed events).
 - **In-flight flow state** lives in memory, keyed by `(guild_id, user_id)`. A bot restart abandons any in-progress create/edit flows.
-- **SQLite** via aiosqlite; migrations run automatically on startup from the `migrations/` directory.
+- **Postgres 16** via asyncpg with a connection pool; migrations run automatically on startup from the `migrations/` directory. Historical SQLite migration files (001–012) are archived under `migrations/sqlite/` for reference; the live PG schema is the single baseline `001_init.sql`.

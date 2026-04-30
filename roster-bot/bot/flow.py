@@ -1167,7 +1167,6 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
             )
 
         await queries.replace_slots(conn, team_id, all_slots)
-        await conn.commit()
         team = await queries.fetch_team_by_id(conn, team_id)
         assert team is not None
 
@@ -1183,7 +1182,6 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                 await existing_msg.edit(embeds=embeds, attachments=[flair])
                 async with db.connect() as conn:
                     await queries.set_message_id(conn, team_id, existing_msg.id)
-                    await conn.commit()
                 return existing_msg.id
             except discord.Forbidden:
                 log.warning("No permission to edit relink target message %s", state.relink_message_id)
@@ -1207,5 +1205,4 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
         msg_id = msg.id
     async with db.connect() as conn:
         await queries.set_message_id(conn, team_id, msg_id)
-        await conn.commit()
     return msg_id

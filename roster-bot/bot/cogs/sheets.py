@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from bot import db, queries, sheets
+from bot.queries import fetch_forum_thread_for_channel, set_stat_board_forum_thread_id
 
 log = logging.getLogger(__name__)
 
@@ -22,12 +23,20 @@ def _is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.manage_guild
 
 
-async def _rerender_board(bot: commands.Bot, board) -> None:  # type: ignore[type-arg]
-    """Fetch fresh sheet data, rebuild the embed, and edit the pinned message.
+async def _get_forum_thread(
+    bot: commands.Bot, channel: discord.ForumChannel, thread_id: int
+) -> discord.Thread | None:
+    thread = bot.get_channel(thread_id)
+    if isinstance(thread, discord.Thread):
+        return thread
+    try:
+        thread = await bot.fetch_channel(thread_id)
+        return thread if isinstance(thread, discord.Thread) else None
+    except (discord.NotFound, discord.Forbidden):
+        return None
 
-    If the message was deleted (or never posted), re-posts it so the board is self-healing.
-    Works for both text channels and forum channels.
-    """
+
+async def _rerender_board(bot: commands.Bot, board) -> None:  # type: ignore[type-arg]
     embed = await sheets.fetch_and_build_embed(board.title, board.sheet_id, board.sheet_range)
 
     channel = bot.get_channel(board.channel_id)
@@ -35,46 +44,62 @@ async def _rerender_board(bot: commands.Bot, board) -> None:  # type: ignore[typ
         log.warning("Stat board %r: channel %s unavailable", board.title, board.channel_id)
         return
 
-    if board.message_id is not None:
+    needs_post = board.message_id is None
+
+    # Try to edit the existing message
+    if not needs_post:
         try:
             if isinstance(channel, discord.TextChannel):
                 msg = await channel.fetch_message(board.message_id)
-            else:  # ForumChannel — message_id == thread_id
-                thread = bot.get_channel(board.message_id)
-                if not isinstance(thread, discord.Thread):
-                    thread = await bot.fetch_channel(board.message_id)
-                msg = await thread.fetch_message(board.message_id)  # type: ignore[union-attr]
-            await msg.edit(embed=embed)
-            return
+                await msg.edit(embed=embed)
+                return
+            else:
+                thread = (
+                    await _get_forum_thread(bot, channel, board.forum_thread_id)
+                    if board.forum_thread_id
+                    else None
+                )
+                if thread is not None:
+                    msg = await thread.fetch_message(board.message_id)
+                    await msg.edit(embed=embed)
+                    return
+                needs_post = True
         except discord.NotFound:
-            log.info("Stat board %r: message was deleted — re-posting", board.title)
+            log.info("Stat board %r: message gone — re-posting", board.title)
+            needs_post = True
         except discord.Forbidden:
             log.warning(
-                "Stat board %r: no permission to edit message in channel %s",
-                board.title,
-                board.channel_id,
+                "Stat board %r: no permission to edit in channel %s",
+                board.title, board.channel_id,
             )
             return
 
-    # message_id is None or the message was deleted — re-post
+    # Post (or re-post): for forum channels reuse the existing thread where possible
     try:
         if isinstance(channel, discord.ForumChannel):
-            thread = await channel.create_thread(name=board.title, embed=embed)
-            msg_id = thread.id
+            thread = (
+                await _get_forum_thread(bot, channel, board.forum_thread_id)
+                if board.forum_thread_id
+                else None
+            )
+            if thread is not None:
+                msg = await thread.send(embed=embed)
+            else:
+                thread, msg = await channel.create_thread(name=board.title, embed=embed)
+            async with db.connect() as conn:
+                await queries.set_stat_board_message_id(conn, board.id, msg.id)
+                await set_stat_board_forum_thread_id(conn, board.id, thread.id)
         else:
             msg = await channel.send(embed=embed)
-            msg_id = msg.id
+            async with db.connect() as conn:
+                await queries.set_stat_board_message_id(conn, board.id, msg.id)
     except discord.Forbidden:
         log.warning(
             "Stat board %r: no permission to post in channel %s",
-            board.title,
-            board.channel_id,
+            board.title, board.channel_id,
         )
         return
-    async with db.connect() as conn:
-        await queries.set_stat_board_message_id(conn, board.id, msg_id)
-        await conn.commit()
-    log.info("Stat board %r: re-posted as message %s", board.title, msg_id)
+    log.info("Stat board %r: posted as message %s", board.title, msg.id)
 
 
 class SheetsCog(commands.Cog):
@@ -97,6 +122,7 @@ class SheetsCog(commands.Cog):
         title="Display title for the board",
         url="Google Sheets URL",
         channel="Text or forum channel to post the board in",
+        thread="Forum thread to post into (optional — picks or creates one automatically if omitted)",
         range="Sheet tab / range (default: Sheet1)",
     )
     async def sheets_add(
@@ -105,6 +131,7 @@ class SheetsCog(commands.Cog):
         title: str,
         url: str,
         channel: discord.TextChannel | discord.ForumChannel,
+        thread: discord.Thread | None = None,
         range: str = "Sheet1",
     ) -> None:
         if not _is_admin(interaction):
@@ -113,6 +140,13 @@ class SheetsCog(commands.Cog):
             )
             return
         assert interaction.guild is not None and interaction.guild_id is not None
+
+        # Validate thread belongs to the chosen channel
+        if thread is not None and thread.parent_id != channel.id:
+            await interaction.response.send_message(
+                f"That thread doesn't belong to {channel.mention}.", ephemeral=True
+            )
+            return
 
         sheet_id = sheets.parse_sheet_id(url)
         if sheet_id is None:
@@ -129,9 +163,30 @@ class SheetsCog(commands.Cog):
         embed = await sheets.fetch_and_build_embed(title, sheet_id, range)
         fetch_failed = embed.color == discord.Color.red()
 
+        forum_thread_id: int | None = None
         if isinstance(channel, discord.ForumChannel):
-            thread = await channel.create_thread(name=title, embed=embed)
-            msg_id = thread.id
+            if thread is not None:
+                # Explicit thread chosen by user
+                target_thread = thread
+            else:
+                # Auto-detect: reuse the thread already used by another board in this channel
+                async with db.connect() as conn:
+                    existing_thread_id = await fetch_forum_thread_for_channel(
+                        conn, interaction.guild_id, channel.id
+                    )
+                target_thread = (
+                    await _get_forum_thread(self.bot, channel, existing_thread_id)
+                    if existing_thread_id
+                    else None
+                )
+
+            if target_thread is not None:
+                msg = await target_thread.send(embed=embed)
+                forum_thread_id = target_thread.id
+            else:
+                target_thread, msg = await channel.create_thread(name=title, embed=embed)
+                forum_thread_id = target_thread.id
+            msg_id = msg.id
         else:
             msg = await channel.send(embed=embed)
             msg_id = msg.id
@@ -141,18 +196,20 @@ class SheetsCog(commands.Cog):
                 conn, interaction.guild_id, title, sheet_id, range, channel.id
             )
             await queries.set_stat_board_message_id(conn, board_id, msg_id)
-            await conn.commit()
+            if forum_thread_id is not None:
+                await set_stat_board_forum_thread_id(conn, board_id, forum_thread_id)
 
+        dest = thread.mention if thread else channel.mention
         if fetch_failed:
             await interaction.followup.send(
-                f"Board **{title}** created in {channel.mention}, but the initial fetch failed "
+                f"Board **{title}** created in {dest}, but the initial fetch failed "
                 "(see the posted embed for details). Fix the URL or API key and use "
                 "`/sheets refresh` when ready.",
                 ephemeral=True,
             )
         else:
             await interaction.followup.send(
-                f"Stat board **{title}** posted to {channel.mention} and will update every 10 minutes.",
+                f"Stat board **{title}** posted to {dest} and will update every 10 minutes.",
                 ephemeral=True,
             )
 
@@ -290,12 +347,20 @@ class _ConfirmRemoveBoardView(discord.ui.View):
             if board.message_id:
                 try:
                     channel = self._bot.get_channel(board.channel_id)
-                    if isinstance(channel, discord.ForumChannel):
-                        thread = self._bot.get_channel(board.message_id)
-                        if not isinstance(thread, discord.Thread):
-                            thread = await self._bot.fetch_channel(board.message_id)
-                        if isinstance(thread, discord.Thread):
-                            await thread.delete()
+                    if isinstance(channel, discord.ForumChannel) and board.forum_thread_id:
+                        thread = await _get_forum_thread(self._bot, channel, board.forum_thread_id)
+                        if thread is not None:
+                            # Only delete the whole thread if no other boards share it
+                            sibling_count = await conn.fetchval(
+                                "SELECT COUNT(*) FROM stat_boards "
+                                "WHERE forum_thread_id = $1 AND id != $2",
+                                board.forum_thread_id, self._board_id,
+                            )
+                            if sibling_count == 0:
+                                await thread.delete()
+                            else:
+                                msg = await thread.fetch_message(board.message_id)
+                                await msg.delete()
                     elif isinstance(channel, discord.TextChannel):
                         msg = await channel.fetch_message(board.message_id)
                         await msg.delete()
@@ -303,7 +368,6 @@ class _ConfirmRemoveBoardView(discord.ui.View):
                     pass
 
             await queries.delete_stat_board(conn, self._board_id)
-            await conn.commit()
 
         await interaction.response.edit_message(
             content=f"Stat board **{self._board_title}** removed.", view=None

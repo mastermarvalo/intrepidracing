@@ -11,7 +11,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 from bot.models import SlotType, Team, TeamSlot
 
-_FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "Formula1-Bold_web_0.ttf")
+_FONT_PATH     = os.path.join(os.path.dirname(__file__), "assets", "Formula1-Bold_web_0.ttf")
+_BOT_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "bot_logo.png")
 
 # bytes cache keyed by (color, team_name, dark_mode)
 _flair_cache: dict[tuple[int | None, str, bool], bytes] = {}
@@ -245,14 +246,15 @@ async def build_avatar_card(
     CELL_W   = 110   # name zone; avatar is centered within it
     CELL_GAP = 8
     PAD_X    = 32
-    PAD_Y    = 22
-    LABEL_H  = 38    # taller to match bigger font
+    LABEL_H  = 38
     LABEL_MB = 14
     NAME_GAP = 6
     NAME_H   = 20
     ROW_H    = AVATAR_D + NAME_GAP + NAME_H
     ROW_GAP  = 14
     SEC_GAP  = 28
+
+    PAD_Y = 20
 
     per_row = max(1, (W - 2 * PAD_X + CELL_GAP) // (CELL_W + CELL_GAP))
 
@@ -263,7 +265,7 @@ async def build_avatar_card(
             total_h += SEC_GAP
         n_rows = math.ceil(len(mems) / per_row)
         total_h += LABEL_H + LABEL_MB + n_rows * ROW_H + max(0, n_rows - 1) * ROW_GAP
-    total_h += PAD_Y
+    total_h += 20
 
     # Background — team color tinted dark; floor prevents near-black on dark teams
     rgb_int = team.color if team.color is not None else 0x5865F2
@@ -275,6 +277,34 @@ async def build_avatar_card(
     )
     img  = Image.new("RGBA", (W, total_h), bg)
     draw = ImageDraw.Draw(img)
+
+    # ── corner logos: bot logo always top-left, team logo beside it if present ─
+    LOGO_SIZE = 48
+    LOGO_PAD  = 8
+    box_size  = LOGO_SIZE + LOGO_PAD * 2
+    corner_x  = LOGO_PAD
+
+    def _corner_box(image_data: bytes | None, path: str | None = None) -> Image.Image | None:
+        try:
+            if image_data:
+                src = Image.open(BytesIO(image_data)).convert("RGBA")
+            elif path:
+                src = Image.open(path).convert("RGBA")
+            else:
+                return None
+            src = src.resize((LOGO_SIZE, LOGO_SIZE), Image.LANCZOS)
+            box = Image.new("RGBA", (box_size, box_size), (0, 0, 0, 200))
+            box.alpha_composite(src, (LOGO_PAD, LOGO_PAD))
+            return box
+        except Exception:
+            return None
+
+    bot_box  = _corner_box(None, _BOT_LOGO_PATH)
+    team_box = _corner_box(logo_bytes)
+
+    for box in filter(None, [bot_box, team_box]):
+        img.alpha_composite(box, (corner_x, LOGO_PAD))
+        corner_x += box_size + 4
 
     try:
         label_font: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, 24)
@@ -299,19 +329,6 @@ async def build_avatar_card(
             if draw.textbbox((0, 0), t + "…", font=f)[2] <= CELL_W:
                 return f, t + "…"
         return f, t
-
-    # Logo — composited top-right before drawing content
-    LOGO_SIZE = 72
-    LOGO_PAD  = 16
-    if logo_bytes:
-        try:
-            logo_img = Image.open(BytesIO(logo_bytes)).convert("RGBA").resize(
-                (LOGO_SIZE, LOGO_SIZE), Image.LANCZOS
-            )
-            lx = W - LOGO_SIZE - LOGO_PAD
-            img.alpha_composite(logo_img, (lx, LOGO_PAD))
-        except Exception:
-            pass
 
     circle_mask = Image.new("L", (AVATAR_D, AVATAR_D), 0)
     ImageDraw.Draw(circle_mask).ellipse((0, 0, AVATAR_D - 1, AVATAR_D - 1), fill=255)

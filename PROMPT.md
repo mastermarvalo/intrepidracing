@@ -1,194 +1,157 @@
-# Discord Roster Bot — Build Spec
+# Discord League Management Bot — Project Context
 
-## What this is
-A Discord bot that maintains a live, self-updating team roster message in a channel. Admin runs one command to create a team, fills out a form, bot posts the roster. After that it maintains itself by watching Discord role changes.
+## What this is now
 
-Design comes from a mockup for an F1 sim racing league.
+A Discord bot for managing F1 sim racing leagues end-to-end. Started as a roster
+manager (`roster-bot`) for a friend's 400-member F1 25 league with a 4-tier
+structure mirroring real F1 — constructors, drivers, principals, free agents.
 
-## Commands
+The roster/transaction layer is built and working in production on a single
+server. The next phase expands this into a complete league management
+platform: races, standings, stewarding, driver profiles, schedule, and
+F1-game-specific integrations.
 
-All under `/roster`, all require Manage Server permission.
+## What this is becoming
 
-- `/roster create <name>` — opens setup form for a new team. Name is the identifier (e.g. `redbull`). Admin picks target channel as part of the flow; roster posts there on submit.
-- `/roster edit <name>` — opens the same form, pre-filled with current values.
-- `/roster list` — lists all teams configured in this server.
-- `/roster remove <name>` — deletes team config and its roster message. Confirmation required.
+A commercial Discord bot, sold to F1 leagues on a tiered pricing model. F1
+focus is the marketing wedge and the v1 feature set. The codebase is built
+with eventual generalization to other league formats (other sim racing titles,
+non-racing competitive leagues) as a v2 expansion path — but **don't build
+generic abstractions until they're needed**. Build F1-specific features with
+clean seams so they can be generalized later, not generic-from-day-one.
 
-That's it. Four commands.
+See `docs/ADR-001-f1-with-generic-future.md` for the architectural
+philosophy and the specific patterns to follow.
 
-## The setup form
+## Pricing model (informs feature gating)
 
-One form, used by both create and edit. Admin fills in:
+- **Free tier** — basic roster management, 1–3 teams, plain embeds, role-based
+  auto-update. Already-built features in `roster-bot/`.
+- **Premium tier ($5–10/mo per server)** — visual flair (Pillow-rendered
+  cards), Google Sheets integration, custom team colors, banner images,
+  transaction logging, free agent board, principal role delegation, race
+  results, standings, stewarding, schedule.
+- **Enterprise tier ($30–75/mo)** — private hosting, custom bot branding,
+  F1 game UDP telemetry integration, OCR results parsing.
 
-- **Team name** — display name ("Red Bull Racing")
-- **Team role** — the primary role that marks someone as on this team (@Red Bull)
-- **Tagline** — optional free text under team name ("6x WCC | 3x WDC | 1x ICC")
-- **Logo URL** — optional
-- **Staff slots** — list of (role, label, quantity) for staff positions
-- **Driver slots** — list of (role, label, quantity) for driver tiers
+Feature gating is enforced via a `guild_tier` table. Functions that produce
+premium output check tier first and either render the premium version or fall
+back to a basic version with an upgrade hint.
 
-### How the form actually works in Discord
+## League structure (the friend's league, our reference customer)
 
-Discord modals max at 5 text inputs and don't allow role selects inside them, so the form is a short guided flow, not a single screen. On `/roster create redbull`:
+- 4 tiers, mirroring real F1 sub-leagues
+- 10 constructor teams per tier (Red Bull, Ferrari, McLaren, etc.) — using
+  real F1 team names and colors
+- 2 drivers per constructor per tier
+- 1 team principal per constructor (manages signings, drops, lineup)
+- Free agents pool for substitutes and call-ups
+- Sprint and standard race weekends, real F1 points system
+- 12-point license system over rolling 12 months
 
-1. **Modal** — team name, tagline, logo URL (3 text inputs)
-2. **Role select** — pick the team role
-3. **Staff slots builder** — ephemeral message with "Add staff slot" button. Each click opens a modal for label + quantity, plus a role select. Admin adds as many as they want, clicks "Done".
-4. **Driver slots builder** — same pattern.
-5. **Channel select** — pick the channel to post the roster in.
-6. **Confirm** — preview the roster, admin clicks "Post" or "Cancel".
+This shape is the v1 target. Build for this exactly. Generalize later.
 
-On `/roster edit redbull`, same flow but every field is pre-filled and the admin can skip straight to confirm if nothing needs changing.
+## Conventions
 
-The whole flow uses ephemeral messages so it doesn't clutter the channel. Only the final roster message is public.
+These are non-negotiable, carried over from the original prompt and reinforced
+by experience:
 
-## Scope
+- **Don't guess APIs.** discord.py 2.x signatures, F1 telemetry packet specs,
+  Codemasters UDP format — verify before writing code. If unsure, say so.
+- **Explain as you go.** When introducing a pattern (UDP socket listener,
+  preset system, tier gating), a couple sentences on why it works that way.
+- **Small commits, one logical change each.** Each phase below is multiple
+  commits, not one mega-commit.
+- **Type hints everywhere.** Existing code is well-typed; keep it that way.
+- **Tests for rendering and pure logic.** Mock Discord objects. The render
+  module already has good test coverage; new pure-logic code (points
+  calculation, standings, license points) gets the same treatment.
+- **No magic numbers in code.** Points tables, tier counts, penalty values,
+  seat counts — all in DB or config. See the ADR for why.
+- **Migrations are append-only.** Existing migrations 001–011 stay as-is.
+  New schema goes in 012+.
 
-**In:**
-- Multiple teams per server
-- Event-driven updates (role add/remove) + 15-minute safety poll
-- Soft overflow: show everyone assigned to a slot's role, flag extras past configured quantity
-- SQLite persistence, single file
-
-**Out:**
-- Web dashboard
-- Stats/achievements
-- Any non-admin user commands
-- Cross-server teams
-
-## Stack
+## Stack (unchanged)
 
 - Python 3.11+, discord.py 2.x
-- `aiosqlite` for DB
-- `.env` for bot token, `roster.db` for everything else
-- Local for dev, Podman container for n3rvnas deployment
-- `ruff` for lint/format
+- aiosqlite (will move to Postgres for multi-tenant; not yet)
+- Pillow for image generation
+- aiohttp for outbound HTTP
+- ruff for lint/format
+- pytest + pytest-asyncio for tests
+- Container deploy via Podman (Containerfile in repo)
 
-## Data model
-
-```
-teams
-  id           INTEGER PK
-  guild_id     INTEGER
-  key          TEXT         -- command identifier ("redbull")
-  name         TEXT         -- display name ("Red Bull Racing")
-  team_role_id INTEGER
-  tagline      TEXT NULL
-  logo_url     TEXT NULL
-  channel_id   INTEGER
-  message_id   INTEGER NULL
-  created_at   TIMESTAMP
-  UNIQUE(guild_id, key)
-
-team_slots
-  id           INTEGER PK
-  team_id      INTEGER FK
-  slot_role_id INTEGER
-  label        TEXT
-  quantity     INTEGER
-  slot_type    TEXT         -- 'staff' or 'driver'
-  sort_order   INTEGER
-```
-
-No members table — source of truth is Discord. Query `guild.members` filtered by role at render time.
-
-## Update logic
-
-Two triggers, same render path:
-
-1. **`on_member_update`** — if roles changed, find teams in that guild whose `team_role_id` or any `slot_role_id` is in the old-or-new role set. Re-render those.
-2. **Poll** — every 15 min, re-render every team. Catches bot-offline gaps and event drops.
-
-Render is idempotent: read DB config → query members → build embed → edit the stored message. If the message was deleted, log a warning and null out `message_id`; next `/roster list` shows it as broken.
-
-## Render algorithm
-
-For a team:
-1. Find all members with `team_role_id` — the team pool.
-2. For each staff slot in sort_order: filter pool by `slot_role_id`, display under label. If count > quantity, show all with an overflow indicator.
-3. Same for driver slots, under a "Drivers" header.
-4. Empty slots show *Spot Open* in italics, repeated to fill quantity.
-5. Build Discord embed: name as title, tagline as description, logo as thumbnail, staff + drivers as fields.
-
-Members render as `<@userid>` mentions — Discord shows those as colored pills, matching the mockup.
-
-## Project structure
+## Repository layout (current and planned)
 
 ```
-roster-bot/
+roster-bot/                 # current, working code
   bot/
-    __init__.py
-    main.py              # entry, load cogs, start poll loop
-    db.py                # aiosqlite helper, migrations
-    models.py            # Team, TeamSlot dataclasses
-    render.py            # build_embed(team, guild) -> discord.Embed
     cogs/
-      roster.py          # all four /roster commands
-    flow.py              # the create/edit guided flow (modals, selects, builders)
-    events.py            # on_member_update
-    poll.py              # 15-min refresh loop
+      roster.py             # /roster command group (built)
+      sheets.py             # /sheets command group (built)
+      race.py               # NEW — /race command group
+      steward.py            # NEW — /steward command group
+      schedule.py           # NEW — /schedule command group
+    flow.py                 # roster create/edit guided flow (built)
+    render.py               # embed + Pillow image generation (built)
+    queries.py              # DB access (built; extend for new tables)
+    models.py               # dataclasses (built; extend for new entities)
+    db.py                   # connection helper (built)
+    events.py               # role-change events + 15-min poll (built)
+    presets/                # NEW — F1 league preset data (constructors,
+      f1_constructors.py    #   colors, points systems, penalty types)
+      f1_points.py
+      f1_penalties.py
+    integrations/           # NEW — external integrations
+      f1_telemetry.py       #   UDP listener for F1 25/26
+      results_ocr.py        #   screenshot OCR fallback
   migrations/
-    001_init.sql
-  tests/
-    test_render.py       # render with mocked members
-    test_overflow.py
-  .env.example
-  Containerfile
-  pyproject.toml
-  README.md
+    001_init.sql … 011_transaction_log.sql   # existing
+    012_seasons.sql         # NEW — season scoping
+    013_races.sql           # NEW — race events and results
+    014_standings.sql       # NEW — points and standings
+    015_stewarding.sql      # NEW — incidents, penalties, license points
+    016_guild_tier.sql      # NEW — pricing tier per guild
+  docs/
+    ADR-001-f1-with-generic-future.md   # NEW
 ```
 
-## Build order (one commit per step)
+## Build phases
 
-1. Scaffold, pyproject.toml, .env.example, main.py that connects and logs "ready"
-2. DB layer: migrations, models, connection helper
-3. Render module + tests (mocked Members and Roles, no Discord needed)
-4. `/roster list` and `/roster remove` — the easy commands first
-5. `/roster create` — the full guided flow. Do this in one focused session since the flow is the hard part.
-6. `/roster edit` — reuses the flow with pre-filled values
-7. `on_member_update` event handler
-8. 15-min poll loop
-9. Containerfile + README with Podman deploy notes
+Each phase is a self-contained body of work. **Do them in order.** Don't start
+phase N+1 before phase N is shipped, tested, and used in production by the
+reference league.
 
-## Conventions I care about
+1. **Foundation refactor** — guild_tier table + feature gating helpers, season
+   scoping for existing teams, F1 preset module structure. No user-facing
+   features change. This is the substrate the rest is built on.
 
-- **Don't guess APIs.** If you're unsure about a discord.py 2.x signature or behavior, say so — we'll check the docs. I've been burned by AI hallucinating library calls.
-- **Explain as you go.** I want to understand each piece, not just get working code. When you introduce a pattern (app_commands groups, cogs, View/Modal classes, aiosqlite context managers), a couple sentences on why it works that way.
-- **Small commits.** Each build-order step is a separate commit with a clear message.
-- **Tests for render.** It's the most bug-prone part. Mock `discord.Member` and `discord.Role` and unit-test the embed builder thoroughly.
-- **Type hints everywhere.**
+2. **Race results + standings** — the highest-value addition. Manual results
+   entry first (admin types finishing order), then standings calculation,
+   then standings image generation. Sprint weekend support included from day 1.
 
-## Visual target
+3. **Stewarding system** — incident reports, steward decisions, penalties,
+   license points with rolling 12-month window. F1-specific penalty types.
 
-Roster embed should look roughly like the mockup:
+4. **Schedule + attendance** — season calendar, Discord events auto-creation,
+   RSVP tracking, no-show alerts to principals.
 
-> **🐂 Red Bull Racing**
-> *6x WCC | 3x WDC | 1x ICC*
->
-> **Staff**
-> Team Principal
-> @Davis
-> Sporting Director
-> *Spot Open*
->
-> **Drivers**
-> Tier 1 Drivers
-> @Scorenzy
-> @Zezin
-> Tier 2 Drivers
-> @Mersaki
-> @Scen
-> *(etc)*
+5. **Driver profiles** — career stats card per driver, leveraging existing
+   transaction_log plus new race results data.
 
-Logo goes in the thumbnail slot.
+6. **F1 game integration** — UDP telemetry listener for live results capture.
+   This is the enterprise tier moat. Build last because it's the most complex
+   and benefits from having the rest of the system stable.
 
-## Environment
+Each phase has its own implementation prompt. Ask me for the next phase's
+prompt when you've completed the current one.
 
-- `.env`: `DISCORD_TOKEN`, optional `LOG_LEVEL`
-- DB file path configurable, defaults to `./roster.db`
-- Required intents: `guilds`, `guild_members` (privileged — must enable in dev portal)
-- `message_content` NOT needed
+## What you (Claude Code) should do when starting a session
 
-## Start here
-
-Read this whole file. Ask me questions before writing code. Then start with step 1.
+1. Read this file.
+2. Read `docs/ADR-001-f1-with-generic-future.md`.
+3. Read the implementation prompt for the current phase.
+4. Look at the existing code for the area you're touching — don't re-derive
+   patterns that already exist in the codebase.
+5. Ask clarifying questions before writing code. Especially about the F1
+   game's actual rules and behaviors — I'll verify against the real spec.

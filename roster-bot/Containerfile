@@ -12,8 +12,6 @@ RUN uv pip install --system --no-cache -r pyproject.toml
 COPY bot/ ./bot/
 COPY migrations/ ./migrations/
 
-# DB file lives in a mounted volume
-VOLUME ["/data"]
-ENV DB_PATH=/data/roster.db
+# Database is Postgres; DATABASE_URL is supplied at runtime via docker-compose.
 
 CMD ["python", "-m", "bot"]
