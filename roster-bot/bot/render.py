@@ -90,9 +90,9 @@ class MemberLike(Protocol):
 
 def _slot_block(pool: list[MemberLike], slot: TeamSlot) -> str:
     """
-    Build the text block for one slot: bold label followed by member mentions.
+    Build the text block for one slot: bold label followed by member names.
 
-    Members within the seat count get plain mentions. Extras get *(overflow)*.
+    Members within the seat count get plain names. Extras get *(overflow)*.
     Empty seats are padded with *Spot Open*.
     """
     assigned = [m for m in pool if any(r.id == slot.slot_role_id for r in m.roles)]
@@ -100,12 +100,12 @@ def _slot_block(pool: list[MemberLike], slot: TeamSlot) -> str:
     lines = [f"**{slot.label}**"]
     for i, member in enumerate(assigned):
         if i < slot.quantity:
-            lines.append(f"<@{member.id}>")
+            lines.append(member.display_name)
         else:
-            lines.append(f"<@{member.id}> *(overflow)*")
+            lines.append(f"{member.display_name} *(overflow)*")
 
     open_spots = max(0, slot.quantity - len(assigned))
-    lines.extend(["*Spot Open*"] * open_spots)
+    lines.extend(["-# Spot Open"] * open_spots)
 
     return "\n".join(lines)
 
@@ -436,8 +436,8 @@ def build_fa_embed(guild: discord.Guild, fa_role_id: int) -> discord.Embed:
         return embed
 
     for role in sorted(by_tier, key=_tier_sort_key):
-        mentions = " ".join(m.mention for m in by_tier[role])
-        embed.add_field(name=role.name, value=mentions, inline=False)
+        names = "\n".join(m.display_name for m in by_tier[role])
+        embed.add_field(name=role.name, value=names, inline=False)
 
     return embed
 

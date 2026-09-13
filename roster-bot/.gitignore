@@ -6,5 +6,10 @@ __pycache__/
 dist/
 build/
 *.db
+db/
+*.sql.gz
+*.dump
 .env
+.env.*
+!.env.example
 .pytest_cache/

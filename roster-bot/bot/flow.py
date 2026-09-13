@@ -563,15 +563,14 @@ class _Step3TeamRoleView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
-        sel = discord.ui.RoleSelect(placeholder="Select team role…", min_values=1, max_values=1)
-        sel.callback = self._on_select
-        self.add_item(sel)
+        self._sel = discord.ui.RoleSelect(placeholder="Select team role…", min_values=1, max_values=1)
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
         self.keep_current.disabled = not bool(state.team_role_id)
         self.finish_editing.disabled = state.existing_team is None
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
-        self._state.team_role_id = sel.values[0].id
+        self._state.team_role_id = self._sel.values[0].id
         self.stop()
         if self._state.menu_mode:
             await _show_edit_menu(interaction, self._state)
@@ -800,18 +799,17 @@ class _SlotRoleView(discord.ui.View):
         self._qty = qty
         self._slot_type = slot_type
         self._step_num = step_num
-        sel = discord.ui.RoleSelect(
+        self._sel = discord.ui.RoleSelect(
             placeholder="Select role for this slot…", min_values=1, max_values=1
         )
-        sel.callback = self._on_select
-        self.add_item(sel)
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        sel: discord.ui.RoleSelect = self.children[0]  # type: ignore[assignment]
         draft = SlotDraft(
             label=self._label,
             quantity=self._qty,
-            slot_role_id=sel.values[0].id,
+            slot_role_id=self._sel.values[0].id,
             slot_type=self._slot_type,
         )
         target = self._state.staff_slots if draft.slot_type == "staff" else self._state.driver_slots
@@ -880,20 +878,19 @@ class _Step7ChannelView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
-        sel = discord.ui.ChannelSelect(
+        self._sel = discord.ui.ChannelSelect(
             placeholder="Select a text or forum channel…",
             channel_types=[discord.ChannelType.text, discord.ChannelType.forum],
             min_values=1,
             max_values=1,
         )
-        sel.callback = self._on_select
-        self.add_item(sel)
+        self._sel.callback = self._on_select
+        self.add_item(self._sel)
         self.keep_current.disabled = not bool(state.channel_id)
         self.finish_editing.disabled = state.existing_team is None
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        sel: discord.ui.ChannelSelect = self.children[0]  # type: ignore[assignment]
-        self._state.channel_id = sel.values[0].id
+        self._state.channel_id = self._sel.values[0].id
         self.stop()
         if self._state.menu_mode:
             await _show_edit_menu(interaction, self._state)
