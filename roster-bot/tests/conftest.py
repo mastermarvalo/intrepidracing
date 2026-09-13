@@ -1,13 +1,33 @@
 """
-Shared fixtures for render tests.
+Shared fixtures.
 
-FakeRole and FakeMember satisfy the MemberLike protocol without touching discord.py
-internals. They're plain dataclasses — no mocking framework needed.
+Render fixtures (FakeMember / FakeRole / make_team / make_slot) satisfy the
+MemberLike protocol without touching discord.py internals — plain
+dataclasses, no mocking framework needed.
+
+DB fixtures (`pg_conn`, `pg_conn_migrated`) let migration and preset tests
+run against a real Postgres. They isolate per-test in a temporary schema so
+tests never leak into each other or into the developer's dev database, and
+they skip cleanly when TEST_DATABASE_URL is not set — matching the
+existing convention that plain `uv run pytest` should work without any
+external services.
+
+To run the DB-backed tests locally:
+    TEST_DATABASE_URL=postgresql://roster:roster@127.0.0.1:5432/roster \
+        uv run pytest
 """
 
+import os
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
+
+try:
+    import asyncpg
+except ImportError:  # pragma: no cover - asyncpg is a hard dep of the bot itself
+    asyncpg = None  # type: ignore[assignment]
 
 from bot.models import Team, TeamSlot
 
@@ -67,3 +87,65 @@ def make_slot(
         slot_type=slot_type,  # type: ignore[arg-type]
         sort_order=sort_order,
     )
+
+
+# ── DB fixtures ─────────────────────────────────────────────────────────
+
+MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
+
+
+def _test_dsn() -> str | None:
+    return os.getenv("TEST_DATABASE_URL")
+
+
+@pytest.fixture
+async def pg_conn():
+    """
+    Isolated per-test Postgres connection scoped to a fresh temporary schema.
+
+    Skips if TEST_DATABASE_URL isn't set so `uv run pytest` still passes on
+    a machine without Postgres. Every table the migrations create lands in
+    the throwaway schema and vanishes at teardown.
+    """
+    dsn = _test_dsn()
+    if not dsn:
+        pytest.skip("TEST_DATABASE_URL not set")
+    if asyncpg is None:
+        pytest.skip("asyncpg not installed")
+
+    conn = await asyncpg.connect(dsn)
+    schema = f"test_{uuid.uuid4().hex[:16]}"
+    await conn.execute(f'CREATE SCHEMA "{schema}"')
+    await conn.execute(f'SET search_path TO "{schema}"')
+    try:
+        yield conn
+    finally:
+        try:
+            await conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        finally:
+            await conn.close()
+
+
+async def apply_migrations(conn, *, up_to: str | None = None) -> list[str]:
+    """
+    Apply migrations/*.sql in sorted filename order.
+
+    If `up_to` is provided, stops after applying that filename (inclusive).
+    Returns the list of filenames actually applied so tests can assert on
+    the sequence. Mirrors bot.db._run_migrations but does not require the
+    pool — the fixture provides the connection directly.
+    """
+    applied: list[str] = []
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        await conn.execute(path.read_text())
+        applied.append(path.name)
+        if up_to is not None and path.name == up_to:
+            break
+    return applied
+
+
+@pytest.fixture
+async def pg_conn_migrated(pg_conn):
+    """Convenience: pg_conn with every migration applied."""
+    await apply_migrations(pg_conn)
+    return pg_conn

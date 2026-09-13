@@ -6,11 +6,21 @@ boundaries. Use inside `async with db.connect() as conn:` (which already wraps
 the work in a transaction).
 """
 
+from decimal import Decimal
 from typing import Sequence
 
 import asyncpg
 
-from bot.models import GuildConfig, StatBoard, Team, TeamSlot
+from bot.models import (
+    Driver,
+    GuildConfig,
+    LeagueConfig,
+    Season,
+    StatBoard,
+    Team,
+    TeamSlot,
+    Tier,
+)
 
 
 def _row_to_slot(row: asyncpg.Record) -> TeamSlot:
@@ -363,3 +373,342 @@ async def fetch_forum_thread_for_channel(
 
 async def delete_stat_board(conn: asyncpg.Connection, board_id: int) -> None:
     await conn.execute("DELETE FROM stat_boards WHERE id = $1", board_id)
+
+
+# ── seasons ───────────────────────────────────────────────────────────────────
+
+
+def _row_to_season(row: asyncpg.Record) -> Season:
+    return Season(
+        id=row["id"],
+        guild_id=row["guild_id"],
+        name=row["name"],
+        is_active=row["is_active"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_season(
+    conn: asyncpg.Connection, guild_id: int, name: str, is_active: bool = False
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO seasons (guild_id, name, is_active) VALUES ($1, $2, $3)
+        RETURNING id
+        """,
+        guild_id, name, is_active,
+    )
+
+
+async def fetch_season_by_name(
+    conn: asyncpg.Connection, guild_id: int, name: str
+) -> Season | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM seasons WHERE guild_id = $1 AND name = $2", guild_id, name
+    )
+    return _row_to_season(row) if row else None
+
+
+async def fetch_season_by_id(conn: asyncpg.Connection, season_id: int) -> Season | None:
+    row = await conn.fetchrow("SELECT * FROM seasons WHERE id = $1", season_id)
+    return _row_to_season(row) if row else None
+
+
+async def fetch_active_season(conn: asyncpg.Connection, guild_id: int) -> Season | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM seasons WHERE guild_id = $1 AND is_active LIMIT 1", guild_id
+    )
+    return _row_to_season(row) if row else None
+
+
+async def fetch_all_seasons(conn: asyncpg.Connection, guild_id: int) -> list[Season]:
+    rows = await conn.fetch(
+        "SELECT * FROM seasons WHERE guild_id = $1 ORDER BY created_at DESC", guild_id
+    )
+    return [_row_to_season(r) for r in rows]
+
+
+async def activate_season(conn: asyncpg.Connection, season_id: int) -> None:
+    """Make season_id the sole active season for its guild."""
+    guild_id = await conn.fetchval("SELECT guild_id FROM seasons WHERE id = $1", season_id)
+    if guild_id is None:
+        raise ValueError(f"Season {season_id} does not exist")
+    await conn.execute(
+        "UPDATE seasons SET is_active = FALSE WHERE guild_id = $1 AND is_active", guild_id
+    )
+    await conn.execute("UPDATE seasons SET is_active = TRUE WHERE id = $1", season_id)
+
+
+# ── tiers ─────────────────────────────────────────────────────────────────────
+
+
+def _row_to_tier(row: asyncpg.Record) -> Tier:
+    return Tier(
+        id=row["id"],
+        season_id=row["season_id"],
+        code=row["code"],
+        label=row["label"],
+        rank_order=row["rank_order"],
+        tier_role_id=row["tier_role_id"],
+        accent_color=row["accent_color"],
+    )
+
+
+async def insert_tier(
+    conn: asyncpg.Connection,
+    season_id: int,
+    code: str,
+    label: str,
+    rank_order: int,
+    tier_role_id: int | None = None,
+    accent_color: int | None = None,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO tiers (season_id, code, label, rank_order, tier_role_id, accent_color)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id
+        """,
+        season_id, code, label, rank_order, tier_role_id, accent_color,
+    )
+
+
+async def fetch_tier(
+    conn: asyncpg.Connection, season_id: int, code: str
+) -> Tier | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM tiers WHERE season_id = $1 AND code = $2", season_id, code
+    )
+    return _row_to_tier(row) if row else None
+
+
+async def fetch_tier_by_id(conn: asyncpg.Connection, tier_id: int) -> Tier | None:
+    row = await conn.fetchrow("SELECT * FROM tiers WHERE id = $1", tier_id)
+    return _row_to_tier(row) if row else None
+
+
+async def fetch_all_tiers(conn: asyncpg.Connection, season_id: int) -> list[Tier]:
+    rows = await conn.fetch(
+        "SELECT * FROM tiers WHERE season_id = $1 ORDER BY rank_order", season_id
+    )
+    return [_row_to_tier(r) for r in rows]
+
+
+async def update_tier(
+    conn: asyncpg.Connection,
+    tier_id: int,
+    label: str,
+    rank_order: int,
+    tier_role_id: int | None,
+    accent_color: int | None,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE tiers SET label = $1, rank_order = $2, tier_role_id = $3, accent_color = $4
+        WHERE id = $5
+        """,
+        label, rank_order, tier_role_id, accent_color, tier_id,
+    )
+
+
+# ── drivers ───────────────────────────────────────────────────────────────────
+
+
+def _row_to_driver(row: asyncpg.Record) -> Driver:
+    return Driver(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        member_id=row["member_id"],
+        display_name=row["display_name"],
+        status=row["status"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_driver(
+    conn: asyncpg.Connection,
+    season_id: int,
+    tier_id: int,
+    member_id: int,
+    display_name: str,
+    status: str,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO drivers (season_id, tier_id, member_id, display_name, status)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        season_id, tier_id, member_id, display_name, status,
+    )
+
+
+async def fetch_driver(
+    conn: asyncpg.Connection, season_id: int, tier_id: int, member_id: int
+) -> Driver | None:
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM drivers
+        WHERE season_id = $1 AND tier_id = $2 AND member_id = $3
+        """,
+        season_id, tier_id, member_id,
+    )
+    return _row_to_driver(row) if row else None
+
+
+async def fetch_drivers_in_tier(
+    conn: asyncpg.Connection, tier_id: int
+) -> list[Driver]:
+    rows = await conn.fetch(
+        "SELECT * FROM drivers WHERE tier_id = $1 ORDER BY display_name", tier_id
+    )
+    return [_row_to_driver(r) for r in rows]
+
+
+async def set_driver_status(
+    conn: asyncpg.Connection, driver_id: int, status: str
+) -> None:
+    await conn.execute("UPDATE drivers SET status = $1 WHERE id = $2", status, driver_id)
+
+
+# ── league config ─────────────────────────────────────────────────────────────
+
+
+def _row_to_league_config(row: asyncpg.Record) -> LeagueConfig:
+    return LeagueConfig(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        salary_cap=row["salary_cap"],
+        min_salary=row["min_salary"],
+        max_salary=row["max_salary"],
+        active_driver_slots=row["active_driver_slots"],
+        weekly_move_cap=row["weekly_move_cap"],
+        exceptional_move_cap=row["exceptional_move_cap"],
+        max_term_seasons=row["max_term_seasons"],
+        max_incentive_pct=row["max_incentive_pct"],
+        offer_ttl_hours=row["offer_ttl_hours"],
+        free_agency_open=row["free_agency_open"],
+        market_channel_id=row["market_channel_id"],
+        transactions_channel_id=row["transactions_channel_id"],
+        approvals_channel_id=row["approvals_channel_id"],
+        commissioner_role_id=row["commissioner_role_id"],
+    )
+
+
+async def upsert_league_config(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int | None,
+    salary_cap: Decimal,
+    min_salary: Decimal,
+    max_salary: Decimal | None,
+    active_driver_slots: int,
+    weekly_move_cap: Decimal,
+    exceptional_move_cap: Decimal,
+    max_term_seasons: int,
+    max_incentive_pct: Decimal,
+    offer_ttl_hours: int,
+) -> int:
+    """
+    Insert or replace the league_config row for (season_id, tier_id).
+    A tier_id of None writes the season-default row.
+    """
+    existing = await conn.fetchval(
+        """
+        SELECT id FROM league_config
+        WHERE season_id = $1 AND tier_id IS NOT DISTINCT FROM $2
+        """,
+        season_id, tier_id,
+    )
+    if existing is None:
+        return await conn.fetchval(
+            """
+            INSERT INTO league_config (
+                season_id, tier_id, salary_cap, min_salary, max_salary,
+                active_driver_slots, weekly_move_cap, exceptional_move_cap,
+                max_term_seasons, max_incentive_pct, offer_ttl_hours
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING id
+            """,
+            season_id, tier_id, salary_cap, min_salary, max_salary,
+            active_driver_slots, weekly_move_cap, exceptional_move_cap,
+            max_term_seasons, max_incentive_pct, offer_ttl_hours,
+        )
+    await conn.execute(
+        """
+        UPDATE league_config SET
+            salary_cap = $1, min_salary = $2, max_salary = $3,
+            active_driver_slots = $4, weekly_move_cap = $5,
+            exceptional_move_cap = $6, max_term_seasons = $7,
+            max_incentive_pct = $8, offer_ttl_hours = $9
+        WHERE id = $10
+        """,
+        salary_cap, min_salary, max_salary, active_driver_slots,
+        weekly_move_cap, exceptional_move_cap, max_term_seasons,
+        max_incentive_pct, offer_ttl_hours, existing,
+    )
+    return existing
+
+
+async def fetch_league_config_row(
+    conn: asyncpg.Connection, season_id: int, tier_id: int | None
+) -> LeagueConfig | None:
+    """
+    Fetch the exact (season, tier) row. Does not fall back — use
+    bot/market/config.py (Phase 2) for resolution with tier→season default.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM league_config
+        WHERE season_id = $1 AND tier_id IS NOT DISTINCT FROM $2
+        """,
+        season_id, tier_id,
+    )
+    return _row_to_league_config(row) if row else None
+
+
+async def set_league_config_channels(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int | None,
+    market_channel_id: int | None = None,
+    transactions_channel_id: int | None = None,
+    approvals_channel_id: int | None = None,
+    commissioner_role_id: int | None = None,
+    free_agency_open: bool | None = None,
+) -> None:
+    """
+    Update channel/role/flag fields on an existing league_config row.
+    Only sets fields the caller passed in.
+    """
+    sets: list[str] = []
+    args: list[object] = []
+    if market_channel_id is not None:
+        sets.append(f"market_channel_id = ${len(args) + 1}")
+        args.append(market_channel_id)
+    if transactions_channel_id is not None:
+        sets.append(f"transactions_channel_id = ${len(args) + 1}")
+        args.append(transactions_channel_id)
+    if approvals_channel_id is not None:
+        sets.append(f"approvals_channel_id = ${len(args) + 1}")
+        args.append(approvals_channel_id)
+    if commissioner_role_id is not None:
+        sets.append(f"commissioner_role_id = ${len(args) + 1}")
+        args.append(commissioner_role_id)
+    if free_agency_open is not None:
+        sets.append(f"free_agency_open = ${len(args) + 1}")
+        args.append(free_agency_open)
+    if not sets:
+        return
+    args.extend([season_id, tier_id])
+    sql = (
+        f"UPDATE league_config SET {', '.join(sets)} "
+        f"WHERE season_id = ${len(args) - 1} "
+        f"AND tier_id IS NOT DISTINCT FROM ${len(args)}"
+    )
+    await conn.execute(sql, *args)

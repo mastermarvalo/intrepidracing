@@ -1,3 +1,38 @@
+# Upgrade & migration notes
+
+## Phase 1 (Market & Contracts foundations)
+
+Phase 1 ships migrations `002_seasons_tiers.sql`,
+`003_drivers_and_tier_membership.sql`, and
+`006_league_config_and_presets.sql`. On next bot start,
+`db._run_migrations` applies each one in order and records it in
+`schema_migrations`.
+
+**What changes for the live database:**
+
+- New tables: `seasons`, `tiers`, `drivers`, `driver_statuses`,
+  `contract_types`, `contract_states`, `offer_states`,
+  `transaction_kinds`, `board_kinds`, `valuation_factors`,
+  `league_config`.
+- `teams` gains two nullable columns: `season_id` and `tier_id`. Both
+  reference the new tables but stay `NULL` for every existing row.
+  `NULL` means "belongs to the active season" — no data migration is
+  required, and `/roster` behaves identically until a commissioner opts
+  in to the new market system via `/market-admin season create --preset f1`.
+- Numbers 004/005/007 are reserved for later phases and do not exist
+  yet; the runner is fine with the gap (files apply in sorted order and
+  each records independently).
+
+**No manual data migration is required.** Ship the code, restart the
+bot, done.
+
+**Rollback plan:** the new tables are all additive and self-contained.
+If Phase 1 must be reverted, dropping the new tables and the two new
+`teams` columns is safe — but nothing in `bot/cogs/roster.py` reads them,
+so there is no code-level dependency to unwind first.
+
+---
+
 # Cutover runbook: local → cloud VM
 
 The bot can only run in **one** place at a time — Discord allows a single

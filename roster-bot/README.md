@@ -108,6 +108,47 @@ uv run ruff check bot/
 | `/roster view <name>` | Show a team's current roster embed |
 | `/roster freeagents` | List members who have the Free Agent role and at least one Tier role |
 
+## Market & Contracts (Phase 1)
+
+The market/contract system lives alongside `/roster` and is being built in
+phases. Phase 1 lays down the schema, the F1 preset, and the commissioner
+setup surface — `/market` and `/contract` (Phase 3–4) are not shipped yet.
+
+Every dollar amount is a `Decimal` end to end (no floats); every business
+number the league can tune (salary cap, movement caps, contract term
+limits, valuation weights) lives in DB config rows seeded by the F1
+preset — never as a Python literal in market/contract code. See
+`docs/ADR-001-f1-with-generic-future.md` for the rules and
+`scripts/check_magic_numbers.py` for the CI guard that enforces them.
+
+### `/market-admin` (require Manage Server)
+
+| Command | Description |
+|---|---|
+| `/market-admin season create <name> [preset]` | Create a season; `preset: F1 25/26` seeds tiers, lookups, valuation factors, and default league config |
+| `/market-admin season activate <name>` | Make a season the active one for this guild |
+| `/market-admin season list` | List all seasons |
+| `/market-admin tier add <code> <label> <rank> [role] [color]` | Add a tier to the active season |
+| `/market-admin tier edit <code> ...` | Edit an existing tier (labels, roles, colors) |
+| `/market-admin tier list` | List tiers for the active season |
+| `/market-admin config show [tier]` | Show league config (season default or tier override) |
+| `/market-admin config edit [tier]` | Modal to edit the five most-tuned numeric values |
+| `/market-admin config channel <kind> <#channel> [tier]` | Set market / transactions / approvals channel |
+| `/market-admin config role <@role> [tier]` | Set the commissioner role |
+| `/market-admin config free-agency <open\|closed> [tier]` | Open or close the free-agency window |
+
+### Quick start for a new league
+
+```text
+/market-admin season create name: "F1 2026 Season" preset: F1 25/26
+/market-admin season activate name: "F1 2026 Season"
+/market-admin tier edit code: t1 label: "Tier 1" rank_order: 1 role: @Tier-1
+/market-admin tier edit code: t2 label: "Tier 2" rank_order: 2 role: @Tier-2
+/market-admin tier edit code: t3 label: "Tier 3" rank_order: 3 role: @Tier-3
+/market-admin config show
+/market-admin config edit               # tune the numeric defaults
+```
+
 ## Team setup flow
 
 `/roster create` walks through 7 steps:
