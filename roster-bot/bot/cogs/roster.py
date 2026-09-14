@@ -16,8 +16,11 @@ from discord.ext import commands
 from bot import db, flow, queries
 from bot.events import _rerender, _rerender_fa
 from bot.render import (
-    build_avatar_card, build_fa_embed, build_flair_embed,
-    build_roster_embeds, roster_flair_file,
+    build_avatar_card,
+    build_fa_embed,
+    build_flair_embed,
+    build_roster_embeds,
+    roster_flair_file,
 )
 
 log = logging.getLogger(__name__)
@@ -180,7 +183,9 @@ class RosterCog(commands.Cog):
             return
 
         flair = roster_flair_file(team)
-        embeds = [build_flair_embed(team.color)] + build_roster_embeds(team, list(interaction.guild.members))
+        embeds = [build_flair_embed(team.color)] + build_roster_embeds(
+            team, list(interaction.guild.members)
+        )
         await interaction.response.send_message(embeds=embeds, file=flair, ephemeral=True)
 
     # ── /roster sign ──────────────────────────────────────────────────────────
@@ -351,7 +356,7 @@ class RosterCog(commands.Cog):
         if team is None:
             return []
         labels = [s.label for s in team.slots if current.lower() in s.label.lower()]
-        return [app_commands.Choice(name=l, value=l) for l in labels[:25]]
+        return [app_commands.Choice(name=label, value=label) for label in labels[:25]]
 
     # ── /roster bulksign / bulkdrop ───────────────────────────────────────────
 
@@ -416,7 +421,10 @@ class RosterCog(commands.Cog):
     # ── /roster history ───────────────────────────────────────────────────────
 
     @roster.command(name="history", description="Show recent sign/drop history for a team")
-    @app_commands.describe(name="Team identifier (e.g. red bull)", limit="Entries to show (default 20, max 50)")
+    @app_commands.describe(
+        name="Team identifier (e.g. red bull)",
+        limit="Entries to show (default 20, max 50)",
+    )
     async def roster_history(
         self, interaction: discord.Interaction, name: str, limit: int = 20
     ) -> None:
@@ -543,7 +551,8 @@ class RosterCog(commands.Cog):
         preview = message if len(message) <= 500 else message[:497] + "…"
         view = _ConfirmDMView(role=role, message=message, members=members)
         await interaction.response.send_message(
-            f"Send the following DM to **{len(members)} member(s)** with {role.mention}?\n\n>>> {preview}",
+            f"Send the following DM to **{len(members)} member(s)** with "
+            f"{role.mention}?\n\n>>> {preview}",
             view=view,
             ephemeral=True,
         )
@@ -763,16 +772,24 @@ class _BulkSignDropView(discord.ui.View):
                     to_remove = [r for r in [team_role] if r and r in member.roles]
                     to_add = [fa_role] if fa_role and fa_role not in member.roles else []
                     if to_remove:
-                        await member.remove_roles(*to_remove, reason=f"Bulk drop by {interaction.user}")
+                        await member.remove_roles(
+                            *to_remove, reason=f"Bulk drop by {interaction.user}"
+                        )
                     if to_add:
-                        await member.add_roles(*to_add, reason=f"Bulk drop by {interaction.user}")
+                        await member.add_roles(
+                            *to_add, reason=f"Bulk drop by {interaction.user}"
+                        )
                 else:
                     to_add = [team_role] if team_role else []
                     to_remove = [fa_role] if fa_role and fa_role in member.roles else []
                     if to_add:
-                        await member.add_roles(*to_add, reason=f"Bulk sign by {interaction.user}")
+                        await member.add_roles(
+                            *to_add, reason=f"Bulk sign by {interaction.user}"
+                        )
                     if to_remove:
-                        await member.remove_roles(*to_remove, reason=f"Bulk sign by {interaction.user}")
+                        await member.remove_roles(
+                            *to_remove, reason=f"Bulk sign by {interaction.user}"
+                        )
                 done.append(member.display_name)
             except discord.Forbidden:
                 failed.append(member.display_name)

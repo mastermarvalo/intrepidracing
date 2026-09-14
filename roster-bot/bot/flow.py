@@ -41,7 +41,7 @@ import discord
 
 from bot import db, queries
 from bot.models import Team, TeamSlot
-from bot.render import build_embed, build_flair_embed, build_roster_embeds, roster_flair_file
+from bot.render import build_flair_embed, build_roster_embeds, roster_flair_file
 
 log = logging.getLogger(__name__)
 
@@ -238,7 +238,10 @@ async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
 
 
 async def start_relink(interaction: discord.Interaction, team_key: str) -> None:
-    """Kick off the relink flow. Opens a modal that collects team info + the existing message URL."""
+    """Kick off the relink flow.
+
+    Opens a modal that collects team info + the existing message URL.
+    """
     assert interaction.guild_id is not None
 
     async with db.connect() as conn:
@@ -280,7 +283,9 @@ async def _show_edit_menu(
     if new_message:
         await interaction.response.send_message(content, view=view, ephemeral=True)
     else:
-        await interaction.response.edit_message(content=content, view=view, embed=None, attachments=[])
+        await interaction.response.edit_message(
+            content=content, view=view, embed=None, attachments=[]
+        )
 
 
 class _EditMenuView(discord.ui.View):
@@ -446,7 +451,11 @@ async def _show_step2_color(
     interaction: discord.Interaction, state: FlowState, *, from_modal: bool = True
 ) -> None:
     view = _Step2ColorView(state)
-    dm_note = "\n**Clarity mode: ON** — flair background darkened so white text shows." if state.dark_mode else ""
+    dm_note = (
+        "\n**Clarity mode: ON** — flair background darkened so white text shows."
+        if state.dark_mode
+        else ""
+    )
     content = (
         "**Step 2 of 9 — Team color**\n"
         "Pick a color for this team's embeds, or enter a custom hex code.\n"
@@ -507,7 +516,9 @@ class _Step2ColorView(discord.ui.View):
         await _show_step2_color(interaction, self._state, from_modal=False)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary, row=1)
-    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def finish_editing(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         await _show_step9_confirm(interaction, self._state)
 
@@ -563,7 +574,9 @@ class _Step3TeamRoleView(discord.ui.View):
     def __init__(self, state: FlowState) -> None:
         super().__init__(timeout=300)
         self._state = state
-        self._sel = discord.ui.RoleSelect(placeholder="Select team role…", min_values=1, max_values=1)
+        self._sel = discord.ui.RoleSelect(
+            placeholder="Select team role…", min_values=1, max_values=1
+        )
         self._sel.callback = self._on_select
         self.add_item(self._sel)
         self.keep_current.disabled = not bool(state.team_role_id)
@@ -578,7 +591,9 @@ class _Step3TeamRoleView(discord.ui.View):
             await _show_step4_principal_role(interaction, self._state)
 
     @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
-    async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def keep_current(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         if self._state.menu_mode:
             await _show_edit_menu(interaction, self._state)
@@ -586,7 +601,9 @@ class _Step3TeamRoleView(discord.ui.View):
             await _show_step4_principal_role(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
-    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def finish_editing(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         await _show_step9_confirm(interaction, self._state)
 
@@ -642,7 +659,9 @@ class _Step4PrincipalRoleView(discord.ui.View):
             await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
-    async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def keep_current(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         if self._state.menu_mode:
             await _show_edit_menu(interaction, self._state)
@@ -650,7 +669,9 @@ class _Step4PrincipalRoleView(discord.ui.View):
             await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     @discord.ui.button(label="Skip →", style=discord.ButtonStyle.secondary)
-    async def skip_or_clear(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def skip_or_clear(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self._state.principal_role_id = None
         self.stop()
         if self._state.menu_mode:
@@ -659,7 +680,9 @@ class _Step4PrincipalRoleView(discord.ui.View):
             await _show_builder(interaction, self._state, slot_type="staff", step_num=5)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
-    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def finish_editing(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         await _show_step9_confirm(interaction, self._state)
 
@@ -722,9 +745,13 @@ class _BuilderView(discord.ui.View):
         )
 
     @discord.ui.button(label="Remove slot", style=discord.ButtonStyle.danger)
-    async def remove_slot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def remove_slot(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
-        view = _SlotRemoveView(state=self._state, slot_type=self._slot_type, step_num=self._step_num)
+        view = _SlotRemoveView(
+            state=self._state, slot_type=self._slot_type, step_num=self._step_num
+        )
         slots = self._state.staff_slots if self._slot_type == "staff" else self._state.driver_slots
         label = self._slot_type.capitalize()
         await interaction.response.edit_message(
@@ -746,7 +773,9 @@ class _BuilderView(discord.ui.View):
             await _show_step7_channel(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary, row=1)
-    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def finish_editing(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         await _show_step9_confirm(interaction, self._state)
 
@@ -848,12 +877,16 @@ class _SlotRemoveView(discord.ui.View):
         if 0 <= idx < len(slots):
             slots.pop(idx)
         self.stop()
-        await _show_builder(interaction, self._state, slot_type=self._slot_type, step_num=self._step_num)
+        await _show_builder(
+            interaction, self._state, slot_type=self._slot_type, step_num=self._step_num
+        )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.stop()
-        await _show_builder(interaction, self._state, slot_type=self._slot_type, step_num=self._step_num)
+        await _show_builder(
+            interaction, self._state, slot_type=self._slot_type, step_num=self._step_num
+        )
 
     async def on_timeout(self) -> None:
         pass
@@ -898,7 +931,9 @@ class _Step7ChannelView(discord.ui.View):
             await _show_step8_info(interaction, self._state)
 
     @discord.ui.button(label="Keep current →", style=discord.ButtonStyle.secondary)
-    async def keep_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def keep_current(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         if self._state.menu_mode:
             await _show_edit_menu(interaction, self._state)
@@ -906,7 +941,9 @@ class _Step7ChannelView(discord.ui.View):
             await _show_step8_info(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
-    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def finish_editing(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         await _show_step9_confirm(interaction, self._state)
 
@@ -966,7 +1003,9 @@ class _Step8InfoView(discord.ui.View):
             await _show_step9_confirm(interaction, self._state)
 
     @discord.ui.button(label="Finish editing →", style=discord.ButtonStyle.primary)
-    async def finish_editing(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def finish_editing(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
         self.stop()
         await _show_step9_confirm(interaction, self._state)
 
@@ -1052,7 +1091,9 @@ async def _show_step9_confirm(interaction: discord.Interaction, state: FlowState
         )
     await interaction.response.edit_message(
         content=content,
-        embeds=[build_flair_embed(preview.color)] + build_roster_embeds(preview, list(interaction.guild.members)),
+        embeds=[build_flair_embed(preview.color)] + build_roster_embeds(
+            preview, list(interaction.guild.members)
+        ),
         view=view,
         attachments=[flair],
     )
@@ -1181,13 +1222,21 @@ async def _commit_and_post(interaction: discord.Interaction, state: FlowState) -
                     await queries.set_message_id(conn, team_id, existing_msg.id)
                 return existing_msg.id
             except discord.Forbidden:
-                log.warning("No permission to edit relink target message %s", state.relink_message_id)
+                log.warning(
+                    "No permission to edit relink target message %s",
+                    state.relink_message_id,
+                )
         else:
-            log.warning("Relink target message %s not found — posting new", state.relink_message_id)
+            log.warning(
+                "Relink target message %s not found — posting new",
+                state.relink_message_id,
+            )
 
     # Normal edit: update the existing posted message
     if state.existing_team and state.existing_team.message_id:
-        old_msg = await _fetch_roster_msg(interaction.client, channel, state.existing_team.message_id)
+        old_msg = await _fetch_roster_msg(
+            interaction.client, channel, state.existing_team.message_id
+        )
         if old_msg is not None:
             await old_msg.edit(embeds=embeds, attachments=[flair])
             return old_msg.id

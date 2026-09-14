@@ -122,7 +122,10 @@ class SheetsCog(commands.Cog):
         title="Display title for the board",
         url="Google Sheets URL",
         channel="Text or forum channel to post the board in",
-        thread="Forum thread to post into (optional — picks or creates one automatically if omitted)",
+        thread=(
+            "Forum thread to post into "
+            "(optional — picks or creates one automatically if omitted)"
+        ),
         range="Sheet tab / range (default: Sheet1)",
     )
     async def sheets_add(
@@ -287,7 +290,9 @@ class SheetsCog(commands.Cog):
 
     # ── /sheets refresh ───────────────────────────────────────────────────────
 
-    @sheets_group.command(name="refresh", description="Force-refresh all stat boards in this server")
+    @sheets_group.command(
+        name="refresh", description="Force-refresh all stat boards in this server"
+    )
     async def sheets_refresh(self, interaction: discord.Interaction) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message(

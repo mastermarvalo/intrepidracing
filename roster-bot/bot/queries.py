@@ -279,7 +279,8 @@ async def upsert_transactions_channel(
     await conn.execute(
         """
         INSERT INTO guild_config (guild_id, transactions_channel_id) VALUES ($1, $2)
-        ON CONFLICT (guild_id) DO UPDATE SET transactions_channel_id = excluded.transactions_channel_id
+        ON CONFLICT (guild_id) DO UPDATE
+            SET transactions_channel_id = excluded.transactions_channel_id
         """,
         guild_id, channel_id,
     )

@@ -139,7 +139,10 @@ async def _get_request_kwargs() -> tuple[dict, dict] | None:
 async def fetch_and_build_embed(
     title: str, sheet_id: str, sheet_range: str
 ) -> discord.Embed:
-    """Fetch sheet values and build a Discord embed. Never raises — returns error embed on failure."""
+    """Fetch sheet values and build a Discord embed.
+
+    Never raises — returns an error embed on failure.
+    """
     auth = await _get_request_kwargs()
     if auth is None:
         return _error_embed(
@@ -157,8 +160,10 @@ async def fetch_and_build_embed(
                 if resp.status == 403:
                     return _error_embed(
                         f"Access denied (403) for sheet `{sheet_id}`.\n"
-                        "• **Service account**: share the sheet with the service account email (Viewer).\n"
-                        "• **API key**: make sure the sheet is shared publicly (Viewer)."
+                        "• **Service account**: share the sheet with the "
+                        "service account email (Viewer).\n"
+                        "• **API key**: make sure the sheet is shared "
+                        "publicly (Viewer)."
                     )
                 if resp.status == 404:
                     return _error_embed(

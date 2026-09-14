@@ -23,8 +23,11 @@ from discord.ext import commands, tasks
 from bot import db, queries
 from bot.models import GuildConfig, Team
 from bot.render import (
-    build_fa_embed, build_flair_embed, build_roster_embeds,
-    build_transaction_embed, roster_flair_file,
+    build_fa_embed,
+    build_flair_embed,
+    build_roster_embeds,
+    build_transaction_embed,
+    roster_flair_file,
 )
 
 log = logging.getLogger(__name__)
@@ -131,7 +134,9 @@ async def _announce_transaction(
     config: GuildConfig,
 ) -> None:
     async with db.connect() as conn:
-        await queries.log_transaction(conn, team.guild_id, team.id, member.id, member.display_name, action)
+        await queries.log_transaction(
+            conn, team.guild_id, team.id, member.id, member.display_name, action
+        )
 
     if not config.transactions_channel_id:
         return
@@ -142,7 +147,10 @@ async def _announce_transaction(
     try:
         await channel.send(embed=embed)
     except discord.Forbidden:
-        log.warning("No permission to post transaction in channel %s", config.transactions_channel_id)
+        log.warning(
+            "No permission to post transaction in channel %s",
+            config.transactions_channel_id,
+        )
 
 
 async def _rerender(bot: commands.Bot, guild: discord.Guild, team) -> None:  # type: ignore[type-arg]

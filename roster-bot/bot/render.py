@@ -5,7 +5,6 @@ from io import BytesIO
 from typing import Literal, Protocol
 
 import aiohttp
-
 import discord
 from PIL import Image, ImageDraw, ImageFont
 
@@ -306,15 +305,16 @@ async def build_avatar_card(
         img.alpha_composite(box, (corner_x, LOGO_PAD))
         corner_x += box_size + 4
 
+    _FontT = ImageFont.FreeTypeFont | ImageFont.ImageFont
     try:
-        label_font: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, 24)
+        label_font: _FontT = ImageFont.truetype(_FONT_PATH, 24)
     except OSError:
         label_font = ImageFont.load_default()
 
-    def _fit_name(text: str) -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, str]:
+    def _fit_name(text: str) -> tuple[_FontT, str]:
         for size in (11, 10, 9, 8, 7):
             try:
-                f: ImageFont.FreeTypeFont | ImageFont.ImageFont = ImageFont.truetype(_FONT_PATH, size)
+                f: _FontT = ImageFont.truetype(_FONT_PATH, size)
             except OSError:
                 f = ImageFont.load_default()
             if draw.textbbox((0, 0), text, font=f)[2] <= CELL_W:
