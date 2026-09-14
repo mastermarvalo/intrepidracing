@@ -21,6 +21,7 @@ import discord
 from discord.ext import commands, tasks
 
 from bot import db, queries
+from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
 from bot.models import GuildConfig, Team
 from bot.render import (
@@ -124,6 +125,18 @@ class EventsCog(commands.Cog):
             await market_boards.refresh_all_boards(self.bot)
         except Exception:
             log.exception("Poll: market board refresh failed")
+
+        # Expire any offers past their TTL. Lazy expiry (in the
+        # service transition path) is the primary defence — this loop
+        # catches offers that never get a state-transition read while
+        # sitting past their expiry.
+        try:
+            async with db.connect() as conn:
+                expired_count = await contracts_service.expire_all_past_ttl(conn)
+            if expired_count:
+                log.info("Poll: expired %d offer(s)", expired_count)
+        except Exception:
+            log.exception("Poll: offer expiry sweep failed")
 
         _snapshots_initialized = True
         log.debug("Poll: done")

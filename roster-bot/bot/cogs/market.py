@@ -1,19 +1,20 @@
 """
 /market command group — public read-only market surfaces.
 
-Commands (Phase 3):
-  /market view tier:<code> [page]     paginated tier market
-  /market movers tier:<code>          top risers & fallers
-  /market driver member:<@user>       driver card: value + trend
-  /market dashboard                   cross-tier top-of-tier summary
+Commands:
+  Phase 3:
+    /market view tier:<code> [page]     paginated tier market
+    /market movers tier:<code>          top risers & fallers
+    /market driver member:<@user>       driver card: value + trend
+    /market dashboard                   cross-tier top-of-tier summary
+  Phase 4:
+    /market team name:<key>             cap sheet + per-driver P/L
+    /market surplus tier:<code>         best P/L (market − contract)
+    /market underwater tier:<code>      worst P/L
 
 Every reply is ephemeral (matching `/roster view`'s convention) —
 public boards are the shared artifact and are posted separately via
 `/market-admin board add`.
-
-Contract-facing surfaces (`/market team`, `/market surplus`,
-`/market underwater`) land in Phase 4 alongside the contracts table
-they read from.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import db, limits, queries
+from bot.contracts import render as contract_render
 from bot.market import render as market_render
 
 
@@ -142,6 +144,105 @@ class MarketCog(commands.Cog):
             accent_color=tier.accent_color if tier else None,
             latest=latest,
             history=history,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── /market team ─────────────────────────────────────────────────────
+
+    @market.command(name="team", description="Cap sheet + per-driver P/L for a team")
+    @app_commands.describe(name="Team key (e.g. red-bull)")
+    async def market_team(
+        self, interaction: discord.Interaction, name: str
+    ) -> None:
+        assert interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            team_row = await queries.fetch_team(
+                conn, interaction.guild_id, name.lower()
+            )
+            if team_row is None:
+                await interaction.followup.send(
+                    f"No team `{name}`.", ephemeral=True
+                )
+                return
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send(
+                    "No active season.", ephemeral=True
+                )
+                return
+            cfg = (
+                await queries.fetch_league_config_row(conn, season.id, None)
+            )
+            if cfg is None:
+                await interaction.followup.send(
+                    "No league_config for the active season.", ephemeral=True
+                )
+                return
+            payroll = await queries.fetch_team_payroll(conn, team_row.id)
+            slots_used = await queries.fetch_team_active_slot_count(conn, team_row.id)
+            cap_rows = await queries.fetch_team_cap_sheet_rows(conn, team_row.id)
+
+        embed = contract_render.render_cap_sheet(
+            team_name=team_row.name,
+            color=team_row.color,
+            contracts_with_market=cap_rows,
+            payroll=payroll,
+            salary_cap=cfg.salary_cap,
+            active_slots_used=slots_used,
+            active_slots_max=cfg.active_driver_slots,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── /market surplus | underwater ────────────────────────────────────
+
+    @market.command(name="surplus", description="Best contracts by P/L in a tier")
+    @app_commands.describe(tier="Tier code (e.g. t1)")
+    async def market_surplus(
+        self, interaction: discord.Interaction, tier: str
+    ) -> None:
+        await self._render_pl_for_tier(interaction, tier, top_first=True)
+
+    @market.command(name="underwater", description="Worst contracts by P/L in a tier")
+    @app_commands.describe(tier="Tier code (e.g. t1)")
+    async def market_underwater(
+        self, interaction: discord.Interaction, tier: str
+    ) -> None:
+        await self._render_pl_for_tier(interaction, tier, top_first=False)
+
+    async def _render_pl_for_tier(
+        self,
+        interaction: discord.Interaction,
+        tier_code: str,
+        *,
+        top_first: bool,
+    ) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            ctx = await _resolve_tier_view_context(
+                conn, interaction.guild_id, tier_code
+            )
+            if isinstance(ctx, str):
+                await interaction.followup.send(ctx, ephemeral=True)
+                return
+            season, tier_row = ctx
+            rows = await queries.fetch_tier_contracts_with_market(
+                conn, tier_row.id
+            )
+            round_label = await _latest_round_label(conn, tier_row.id)
+
+        title = (
+            f"Surplus — {tier_row.label}" if top_first
+            else f"Underwater — {tier_row.label}"
+        )
+        embed = contract_render.render_pl_table(
+            title=title,
+            color=tier_row.accent_color,
+            rows=rows,
+            top_first=top_first,
+            round_label=round_label,
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 

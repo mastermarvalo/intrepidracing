@@ -21,9 +21,15 @@ Phase 3 surface:
   /market-admin board refresh [board_id:<id>]
   /market-admin board list
 
-Later phases add approval, void, adjust-cap, and free-agency window
-subcommands. This module is `/market-admin` only; public /market is
-Phase 3, /contract is Phase 4.
+Phase 4 surface:
+  /market-admin approve offer_id:<id>
+  /market-admin reject offer_id:<id> [note]
+  /market-admin void contract_id:<id> [note]
+  /market-admin set-status driver:<@member> status:<code>
+  /market-admin adjust-cap team:<key> delta:<amount> [note]
+
+Later phases add trade/release/rollover surfaces. This module is
+`/market-admin` only; public /market is Phase 3, /contract is Phase 4.
 
 Authority: Manage Server (mirrors `_is_admin` in cogs/roster.py). A
 commissioner role assigned via `/market-admin config role commissioner`
@@ -39,7 +45,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import db, queries
+from bot import db, queries, roster_ops
+from bot.contracts import render as contract_render
+from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
 from bot.market import valuation as valuation_engine
 from bot.market.money import format_money, format_pl
@@ -854,6 +862,8 @@ class AdminMarketCog(commands.Cog):
             app_commands.Choice(name="Market table", value="market"),
             app_commands.Choice(name="Movers (risers & fallers)", value="movers"),
             app_commands.Choice(name="Cross-tier dashboard", value="dashboard"),
+            app_commands.Choice(name="Surplus (best P/L)", value="surplus"),
+            app_commands.Choice(name="Underwater (worst P/L)", value="underwater"),
         ]
     )
     async def board_add(
@@ -867,7 +877,7 @@ class AdminMarketCog(commands.Cog):
             return
         assert interaction.guild_id is not None
 
-        needs_tier = kind.value in ("market", "movers")
+        needs_tier = kind.value in ("market", "movers", "surplus", "underwater")
         if needs_tier and tier is None:
             await interaction.response.send_message(
                 f"`{kind.value}` boards require a `tier:` argument.",
@@ -1007,6 +1017,263 @@ class AdminMarketCog(commands.Cog):
                 f"<#{b.channel_id}> · {status}"
             )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ── /market-admin approvals + void + status + adjust-cap ──────────────
+
+    @admin.command(
+        name="approve",
+        description="Approve an accepted offer → create the active contract",
+    )
+    @app_commands.describe(offer_id="Offer id (state must be pending_approval)")
+    async def admin_approve(
+        self, interaction: discord.Interaction, offer_id: int
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild is not None and interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            offer = await queries.fetch_offer_by_id(conn, offer_id)
+            if offer is None:
+                await interaction.followup.send(
+                    f"No offer `{offer_id}`.", ephemeral=True
+                )
+                return
+            market_value = await queries.fetch_latest_published_valuation(
+                conn, offer.driver_id
+            )
+            try:
+                approval = await contracts_service.commissioner_approve(
+                    conn, offer_id,
+                    actor_id=interaction.user.id,
+                    value_at_signing=market_value,
+                )
+            except contracts_service.TransitionError as exc:
+                await interaction.followup.send(str(exc), ephemeral=True)
+                return
+            contract = await queries.fetch_contract_by_id(conn, approval.contract_id)
+            assert contract is not None
+            team = await queries.fetch_team_by_id(conn, contract.team_id)
+            tier = await queries.fetch_tier_by_id(conn, contract.tier_id)
+            driver_row = await conn.fetchrow(
+                "SELECT member_id, display_name FROM drivers WHERE id = $1",
+                contract.driver_id,
+            )
+            guild_config = await queries.fetch_guild_config(
+                conn, interaction.guild_id
+            )
+
+        # Role assignment via the shared helper (same code path as
+        # /roster sign, per CLAUDE.md §8 invariant).
+        member = interaction.guild.get_member(driver_row["member_id"])
+        role_note: str | None = None
+        if member is not None and team is not None:
+            try:
+                await roster_ops.sign_to_team(
+                    guild=interaction.guild,
+                    member=member,
+                    team=team,
+                    actor=interaction.user,
+                    reason=f"Contract {approval.external_ref} approved",
+                )
+            except roster_ops.RoleAssignmentError as exc:
+                role_note = f"\n⚠ Role not assigned: {exc}"
+
+        # Public signed post to the transactions channel.
+        if guild_config.transactions_channel_id and team is not None and tier is not None:
+            channel = self.bot.get_channel(guild_config.transactions_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.send(embed=contract_render.render_signed_contract_post(
+                        team_name=team.name,
+                        driver_name=driver_row["display_name"],
+                        tier_label=tier.label,
+                        contract_value=contract.contract_value,
+                        signing_bonus=contract.signing_bonus,
+                        term_seasons=contract.term_seasons,
+                        contract_type=contract.contract_type,
+                        value_at_signing=contract.value_at_signing,
+                        external_ref=approval.external_ref,
+                        approved_by_mention=interaction.user.mention,
+                    ))
+                except discord.Forbidden:
+                    log.warning(
+                        "No permission to post signed-contract to channel %s",
+                        guild_config.transactions_channel_id,
+                    )
+
+        await interaction.followup.send(
+            f"✅ Approved offer `{offer_id}` → contract `{approval.contract_id}` "
+            f"(ref `{approval.external_ref}`).{role_note or ''}",
+            ephemeral=True,
+        )
+
+    @admin.command(name="reject", description="Reject an offer awaiting approval")
+    @app_commands.describe(
+        offer_id="Offer id (state must be pending_approval)",
+        note="Optional note for the audit log",
+    )
+    async def admin_reject(
+        self,
+        interaction: discord.Interaction,
+        offer_id: int,
+        note: str | None = None,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        async with db.connect() as conn:
+            try:
+                await contracts_service.commissioner_reject(
+                    conn, offer_id, actor_id=interaction.user.id, note=note
+                )
+            except contracts_service.TransitionError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"✅ Rejected offer `{offer_id}`.", ephemeral=True
+        )
+
+    @admin.command(name="void", description="Void an active contract")
+    @app_commands.describe(
+        contract_id="Contract id to void",
+        note="Optional note for the audit log",
+    )
+    async def admin_void(
+        self,
+        interaction: discord.Interaction,
+        contract_id: int,
+        note: str | None = None,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        async with db.connect() as conn:
+            try:
+                await contracts_service.void_contract(
+                    conn, contract_id, actor_id=interaction.user.id, note=note
+                )
+            except contracts_service.TransitionError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"✅ Voided contract `{contract_id}`.", ephemeral=True
+        )
+
+    @admin.command(name="set-status", description="Set a driver's status")
+    @app_commands.describe(
+        driver="Driver's Discord account",
+        status="New status",
+    )
+    @app_commands.choices(status=[
+        app_commands.Choice(name="Active", value="active"),
+        app_commands.Choice(name="Reserve", value="reserve"),
+        app_commands.Choice(name="Free agent", value="free_agent"),
+        app_commands.Choice(name="Restricted FA", value="restricted_fa"),
+        app_commands.Choice(name="Inactive", value="inactive"),
+        app_commands.Choice(name="Suspended", value="suspended"),
+    ])
+    async def admin_set_status(
+        self,
+        interaction: discord.Interaction,
+        driver: discord.Member,
+        status: app_commands.Choice[str],
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.response.send_message(
+                    "No active season.", ephemeral=True
+                )
+                return
+            driver_row = await queries.fetch_driver_by_member(
+                conn, season.id, driver.id
+            )
+            if driver_row is None:
+                await interaction.response.send_message(
+                    f"{driver.display_name} isn't registered as a driver.",
+                    ephemeral=True,
+                )
+                return
+            prior_status = driver_row.status
+            await queries.set_driver_status(conn, driver_row.id, status.value)
+            await queries.append_ledger(
+                conn,
+                season_id=driver_row.season_id,
+                tier_id=driver_row.tier_id,
+                driver_id=driver_row.id,
+                kind="status_change",
+                detail={"from": prior_status, "to": status.value},
+                actor_id=interaction.user.id,
+            )
+        await interaction.response.send_message(
+            f"✅ {driver.display_name}: `{prior_status}` → `{status.value}`.",
+            ephemeral=True,
+        )
+
+    @admin.command(
+        name="adjust-cap",
+        description="Log a cap adjustment for a team (audit trail only in Phase 4)",
+    )
+    @app_commands.describe(
+        team="Team key",
+        delta_m="Adjustment in $M (positive = more cap space, negative = less)",
+        note="Reason (required — audit trail)",
+    )
+    async def admin_adjust_cap(
+        self,
+        interaction: discord.Interaction,
+        team: str,
+        delta_m: str,
+        note: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        try:
+            delta = Decimal(delta_m.strip().lstrip("$").rstrip("Mm"))
+        except InvalidOperation as exc:
+            await interaction.response.send_message(
+                f"Could not parse delta: {exc}", ephemeral=True
+            )
+            return
+        async with db.connect() as conn:
+            team_row = await queries.fetch_team(conn, interaction.guild_id, team.lower())
+            if team_row is None:
+                await interaction.response.send_message(
+                    f"No team `{team}`.", ephemeral=True
+                )
+                return
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.response.send_message(
+                    "No active season.", ephemeral=True
+                )
+                return
+            # Cap adjustments are per-team, not per-tier, so the tier
+            # column takes any tier in the season for schema
+            # satisfaction. The ledger detail carries the semantic
+            # meaning; render layers can filter on kind = 'cap_adjustment'.
+            tier_row = (await queries.fetch_all_tiers(conn, season.id))[0]
+            await queries.append_ledger(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                team_id=team_row.id,
+                kind="cap_adjustment",
+                amount=delta,
+                detail={"note": note, "team_key": team_row.key},
+                actor_id=interaction.user.id,
+            )
+        sign = "+" if delta >= Decimal("0") else ""
+        await interaction.response.send_message(
+            f"✅ Cap adjustment logged for **{team_row.name}**: {sign}{delta}$M.\n"
+            f"Note: {note}\n"
+            "*(Phase 4 records this in the ledger only; enforcement lands in Phase 5.)*",
+            ephemeral=True,
+        )
 
 
 # ── helpers ──────────────────────────────────────────────────────────────

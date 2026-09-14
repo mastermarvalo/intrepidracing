@@ -120,8 +120,10 @@ phases.
 - **Phase 3** — public `/market` surfaces + self-updating market boards
   that mirror the `stat_boards` refresh pattern (`bot/market/render.py`,
   `bot/market/boards.py`).
-- Later phases — `/contract` offer/negotiate/approve flow, trades,
-  releases, rollover.
+- **Phase 4** — contracts: offer → negotiate → approve cycle with cap
+  enforcement, per-driver P/L, offer expiry, and an append-only ledger
+  (`bot/contracts/{rules,service,render}.py`).
+- Later phases — trades, releases, buyouts, rollover.
 
 Every dollar amount is a `Decimal` end to end (no floats); every business
 number the league can tune (salary cap, movement caps, contract term
@@ -176,8 +178,9 @@ lands with the /market surfaces in a future phase.
 
 Every board auto-refreshes after `/market-admin valuation publish` for
 its tier (plus every cross-tier dashboard) and again every 15 minutes
-via the safety poll — same pattern the roster embeds use. `cap`,
-`surplus`, and `underwater` board kinds land with contracts in Phase 4.
+via the safety poll — same pattern the roster embeds use. Board kinds
+in Phase 3 + 4: `market`, `movers`, `dashboard`, `surplus`,
+`underwater`.
 
 ### `/market` (open to everyone, ephemeral replies)
 
@@ -186,11 +189,32 @@ via the safety poll — same pattern the roster embeds use. `cap`,
 | `/market view <tier> [page]` | Paginated tier market with Prev/Next buttons |
 | `/market movers <tier>` | Top risers and fallers from the last published run |
 | `/market driver <@member>` | Driver card: current value, week's movement, trend of last N runs |
+| `/market team <name>` | Cap sheet: payroll, cap space, per-driver P/L |
+| `/market surplus <tier>` | Drivers with the biggest positive P/L (market − contract) |
+| `/market underwater <tier>` | Drivers with the biggest negative P/L |
 | `/market dashboard` | Cross-tier top-of-tier summary (display only) |
 
-`/market team`, `/market surplus`, and `/market underwater` are
-deliberately absent — they read from the `contracts` table and land in
-Phase 4.
+### `/contract` (open to everyone; TP / driver / commissioner scopes)
+
+| Command | Who | Description |
+|---|---|---|
+| `/contract offer <team> <tier> <driver> <kind> <ttl>` | TP for team | Two-stage flow (slash args → modal → review → submit); ephemeral review shows cap arithmetic + validation checks |
+| `/contract offers` | TP | My team's open offers |
+| `/contract withdraw <offer_id>` | TP | Cancel an offer I own |
+| `/contract accept <offer_id>` | Driver | Move to commissioner queue |
+| `/contract decline <offer_id> [note]` | Driver | End negotiation |
+| `/contract counter <offer_id>` | Driver | Open a counter modal |
+| `/contract status <@driver>` | Anyone | Active contract + open offers + history |
+
+### `/market-admin` contract commands (Manage Server)
+
+| Command | Description |
+|---|---|
+| `/market-admin approve <offer_id>` | Convert an accepted offer into an active contract (creates ledger + assigns team role via the shared `/roster sign` path, posts to transactions channel) |
+| `/market-admin reject <offer_id> [note]` | Reject an offer in `pending_approval` |
+| `/market-admin void <contract_id> [note]` | End an active contract |
+| `/market-admin set-status <@driver> <status>` | Change a driver's status (writes a `status_change` ledger entry) |
+| `/market-admin adjust-cap <team> <delta_m> <note>` | Log a cap adjustment in the ledger (audit trail only in Phase 4 — enforcement lands with trades in Phase 5) |
 
 ### Quick start for a new league
 

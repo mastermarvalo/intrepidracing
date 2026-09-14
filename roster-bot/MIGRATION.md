@@ -1,5 +1,40 @@
 # Upgrade & migration notes
 
+## Phase 4 (Contracts, offers, ledger)
+
+Ships migration `008_contracts_and_offers.sql`. Applied automatically
+after Phase 3 is recorded.
+
+Numbering note: CLAUDE.md §4 called this file `005_*`, but migrations
+apply in sorted filename order and the contracts tables reference
+lookup tables that live in `006_*` (contract_types, contract_states,
+offer_states, transaction_kinds). Keeping the numeric ordering
+truthful — contracts come after their FK targets — is why this file
+is `008_*` rather than `005_*`.
+
+**What changes for the live database:**
+
+- New tables: `contracts`, `contract_offers`, `contract_ledger`.
+- All three reference existing tables (seasons/tiers/drivers/teams
+  plus the Phase 1 lookup tables); nothing changes on existing
+  tables.
+- Two partial unique indexes enforce the core business invariants at
+  DB level:
+  - `uq_contracts_one_active_per_driver` — at most one row where
+    `state = 'active'` per driver.
+  - `uq_offers_one_open_per_team_driver` — at most one row in the
+    open-state set per (team, driver). `countered` is intentionally
+    NOT in the open set — the parent offer becomes `countered` and
+    the child carries the negotiation forward, so parent+child can
+    legitimately share a (team, driver).
+- No data migration required.
+
+**Rollback:** the tables are additive and self-contained. Dropping
+them (plus the two partial indexes) reverts Phase 4 without touching
+Phase 1–3 state.
+
+---
+
 ## Phase 3 (Market surfaces)
 
 Ships migration `007_market_boards.sql`. Applied automatically on

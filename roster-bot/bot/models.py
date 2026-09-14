@@ -95,6 +95,69 @@ class Driver:
 
 
 @dataclass
+class Contract:
+    id: int
+    season_id: int
+    tier_id: int
+    driver_id: int
+    team_id: int
+    contract_value: Decimal
+    term_seasons: int
+    contract_type: str
+    state: str
+    signing_bonus: Decimal = Decimal("0")
+    max_incentives: Decimal = Decimal("0")
+    value_at_signing: Decimal | None = None
+    signed_at: datetime | None = None
+    expires_after: int | None = None
+    voided_at: datetime | None = None
+    approved_by: int | None = None
+    external_ref: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
+class ContractOffer:
+    id: int
+    season_id: int
+    tier_id: int
+    driver_id: int
+    team_id: int
+    offered_by: int
+    offer_kind: str
+    salary: Decimal
+    term_seasons: int
+    contract_type: str
+    state: str
+    expires_at: datetime
+    validation: dict
+    signing_bonus: Decimal = Decimal("0")
+    incentives: str | None = None
+    message: str | None = None
+    parent_offer_id: int | None = None
+    thread_id: int | None = None
+    resolved_at: datetime | None = None
+    resolved_by: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
+class LedgerEntry:
+    id: int
+    season_id: int
+    tier_id: int
+    kind: str
+    detail: dict
+    driver_id: int | None = None
+    team_id: int | None = None
+    contract_id: int | None = None
+    offer_id: int | None = None
+    amount: Decimal | None = None
+    actor_id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
 class MarketBoard:
     id: int
     season_id: int

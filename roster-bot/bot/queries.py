@@ -13,9 +13,12 @@ from typing import Any, Sequence
 import asyncpg
 
 from bot.models import (
+    Contract,
+    ContractOffer,
     Driver,
     GuildConfig,
     LeagueConfig,
+    LedgerEntry,
     MarketBoard,
     Season,
     StatBoard,
@@ -1116,3 +1119,468 @@ async def fetch_market_boards_for_tier(
 
 async def delete_market_board(conn: asyncpg.Connection, board_id: int) -> None:
     await conn.execute("DELETE FROM market_boards WHERE id = $1", board_id)
+
+
+# ── contracts (Phase 4) ──────────────────────────────────────────────────────
+
+
+def _row_to_contract(row: asyncpg.Record) -> Contract:
+    return Contract(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        driver_id=row["driver_id"],
+        team_id=row["team_id"],
+        contract_value=row["contract_value"],
+        signing_bonus=row["signing_bonus"],
+        max_incentives=row["max_incentives"],
+        term_seasons=row["term_seasons"],
+        contract_type=row["contract_type"],
+        state=row["state"],
+        value_at_signing=row["value_at_signing"],
+        signed_at=row["signed_at"],
+        expires_after=row["expires_after"],
+        voided_at=row["voided_at"],
+        approved_by=row["approved_by"],
+        external_ref=row["external_ref"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_contract(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    driver_id: int,
+    team_id: int,
+    contract_value: Decimal,
+    signing_bonus: Decimal,
+    max_incentives: Decimal,
+    term_seasons: int,
+    contract_type: str,
+    state: str,
+    value_at_signing: Decimal | None,
+    approved_by: int | None,
+    external_ref: str | None = None,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO contracts
+            (season_id, tier_id, driver_id, team_id, contract_value,
+             signing_bonus, max_incentives, term_seasons, contract_type,
+             state, value_at_signing, signed_at, approved_by, external_ref)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                CASE WHEN $10 = 'active' THEN NOW() ELSE NULL END,
+                $12, $13)
+        RETURNING id
+        """,
+        season_id, tier_id, driver_id, team_id, contract_value,
+        signing_bonus, max_incentives, term_seasons, contract_type,
+        state, value_at_signing, approved_by, external_ref,
+    )
+
+
+async def fetch_contract_by_id(
+    conn: asyncpg.Connection, contract_id: int
+) -> Contract | None:
+    row = await conn.fetchrow("SELECT * FROM contracts WHERE id = $1", contract_id)
+    return _row_to_contract(row) if row else None
+
+
+async def fetch_active_contract_for_driver(
+    conn: asyncpg.Connection, driver_id: int
+) -> Contract | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM contracts WHERE driver_id = $1 AND state = 'active'",
+        driver_id,
+    )
+    return _row_to_contract(row) if row else None
+
+
+async def fetch_active_contracts_for_team(
+    conn: asyncpg.Connection, team_id: int
+) -> list[Contract]:
+    rows = await conn.fetch(
+        "SELECT * FROM contracts WHERE team_id = $1 AND state = 'active' "
+        "ORDER BY contract_value DESC",
+        team_id,
+    )
+    return [_row_to_contract(r) for r in rows]
+
+
+async def fetch_contract_history_for_driver(
+    conn: asyncpg.Connection, driver_id: int
+) -> list[Contract]:
+    rows = await conn.fetch(
+        "SELECT * FROM contracts WHERE driver_id = $1 ORDER BY created_at DESC",
+        driver_id,
+    )
+    return [_row_to_contract(r) for r in rows]
+
+
+async def void_contract(
+    conn: asyncpg.Connection, contract_id: int, actor_id: int | None
+) -> None:
+    await conn.execute(
+        """
+        UPDATE contracts
+        SET state = 'voided', voided_at = NOW()
+        WHERE id = $1 AND state = 'active'
+        """,
+        contract_id,
+    )
+    # actor_id is captured on the paired ledger entry by the caller.
+    _ = actor_id
+
+
+async def fetch_team_payroll(conn: asyncpg.Connection, team_id: int) -> Decimal:
+    """
+    Sum of contract_value across active contracts. Cap compliance is
+    measured against this per CLAUDE.md §2 — the market value never
+    enters this number.
+    """
+    value = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(contract_value), 0)
+        FROM contracts WHERE team_id = $1 AND state = 'active'
+        """,
+        team_id,
+    )
+    return value if isinstance(value, Decimal) else Decimal(value)
+
+
+async def fetch_team_active_slot_count(
+    conn: asyncpg.Connection, team_id: int
+) -> int:
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM contracts WHERE team_id = $1 AND state = 'active'",
+        team_id,
+    )
+
+
+async def fetch_team_cap_sheet_rows(
+    conn: asyncpg.Connection, team_id: int
+) -> list[asyncpg.Record]:
+    """
+    Every active contract for the team joined with the driver's latest
+    published market value. `market_value` is NULL if the driver has
+    never been valued — the render layer surfaces that as "—".
+    """
+    return await conn.fetch(
+        """
+        SELECT c.id AS contract_id, c.driver_id, c.contract_value,
+               c.signing_bonus, c.max_incentives, c.term_seasons,
+               c.contract_type, c.signed_at, c.value_at_signing,
+               d.display_name,
+               (
+                   SELECT dv.market_value
+                   FROM driver_valuations dv
+                   JOIN valuation_runs vr ON vr.id = dv.run_id
+                   WHERE dv.driver_id = c.driver_id AND vr.published
+                   ORDER BY vr.published_at DESC NULLS LAST, vr.created_at DESC
+                   LIMIT 1
+               ) AS market_value
+        FROM contracts c
+        JOIN drivers d ON d.id = c.driver_id
+        WHERE c.team_id = $1 AND c.state = 'active'
+        ORDER BY c.contract_value DESC
+        """,
+        team_id,
+    )
+
+
+async def fetch_tier_contracts_with_market(
+    conn: asyncpg.Connection, tier_id: int
+) -> list[asyncpg.Record]:
+    """
+    Every active contract for drivers in a tier, joined with team +
+    market value. Used by /market surplus and /market underwater to
+    compute P/L (market_value − contract_value) and rank drivers by it.
+    """
+    return await conn.fetch(
+        """
+        SELECT c.id AS contract_id, c.driver_id, c.team_id,
+               c.contract_value, d.display_name, t.name AS team_name,
+               t.color AS team_color,
+               (
+                   SELECT dv.market_value
+                   FROM driver_valuations dv
+                   JOIN valuation_runs vr ON vr.id = dv.run_id
+                   WHERE dv.driver_id = c.driver_id AND vr.published
+                   ORDER BY vr.published_at DESC NULLS LAST, vr.created_at DESC
+                   LIMIT 1
+               ) AS market_value
+        FROM contracts c
+        JOIN drivers d ON d.id = c.driver_id
+        JOIN teams t ON t.id = c.team_id
+        WHERE c.tier_id = $1 AND c.state = 'active'
+        """,
+        tier_id,
+    )
+
+
+# ── contract offers ──────────────────────────────────────────────────────────
+
+
+def _row_to_offer(row: asyncpg.Record) -> ContractOffer:
+    raw_validation = row["validation"]
+    validation = (
+        json.loads(raw_validation) if isinstance(raw_validation, str) else raw_validation
+    )
+    return ContractOffer(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        driver_id=row["driver_id"],
+        team_id=row["team_id"],
+        offered_by=row["offered_by"],
+        offer_kind=row["offer_kind"],
+        salary=row["salary"],
+        term_seasons=row["term_seasons"],
+        contract_type=row["contract_type"],
+        signing_bonus=row["signing_bonus"],
+        incentives=row["incentives"],
+        message=row["message"],
+        state=row["state"],
+        parent_offer_id=row["parent_offer_id"],
+        expires_at=row["expires_at"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+        resolved_by=row["resolved_by"],
+        thread_id=row["thread_id"],
+        validation=validation,
+    )
+
+
+# Aligned with the partial unique index in migration 008: `countered`
+# is terminal for the parent (the child carries the negotiation
+# forward), so it does not count as "open" for duplicate-check or
+# "my open offers" purposes.
+OPEN_OFFER_STATES = (
+    "draft", "pending_driver", "pending_team",
+    "accepted", "pending_approval",
+)
+
+
+async def insert_offer(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    driver_id: int,
+    team_id: int,
+    offered_by: int,
+    offer_kind: str,
+    salary: Decimal,
+    term_seasons: int,
+    contract_type: str,
+    state: str,
+    expires_at,
+    signing_bonus: Decimal = Decimal("0"),
+    incentives: str | None = None,
+    message: str | None = None,
+    parent_offer_id: int | None = None,
+    validation: dict | None = None,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO contract_offers
+            (season_id, tier_id, driver_id, team_id, offered_by,
+             offer_kind, salary, term_seasons, contract_type,
+             signing_bonus, incentives, message, state,
+             parent_offer_id, expires_at, validation)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16::jsonb)
+        RETURNING id
+        """,
+        season_id, tier_id, driver_id, team_id, offered_by,
+        offer_kind, salary, term_seasons, contract_type,
+        signing_bonus, incentives, message, state,
+        parent_offer_id, expires_at, json.dumps(validation or {}),
+    )
+
+
+async def fetch_offer_by_id(
+    conn: asyncpg.Connection, offer_id: int
+) -> ContractOffer | None:
+    row = await conn.fetchrow(
+        "SELECT * FROM contract_offers WHERE id = $1", offer_id
+    )
+    return _row_to_offer(row) if row else None
+
+
+async def update_offer_state(
+    conn: asyncpg.Connection,
+    offer_id: int,
+    *,
+    new_state: str,
+    resolved_by: int | None,
+    resolved_at,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE contract_offers
+        SET state = $1, resolved_by = $2, resolved_at = $3
+        WHERE id = $4
+        """,
+        new_state, resolved_by, resolved_at, offer_id,
+    )
+
+
+async def set_offer_thread_id(
+    conn: asyncpg.Connection, offer_id: int, thread_id: int | None
+) -> None:
+    await conn.execute(
+        "UPDATE contract_offers SET thread_id = $1 WHERE id = $2",
+        thread_id, offer_id,
+    )
+
+
+async def fetch_open_offer_for_team_driver(
+    conn: asyncpg.Connection, team_id: int, driver_id: int
+) -> ContractOffer | None:
+    row = await conn.fetchrow(
+        f"""
+        SELECT * FROM contract_offers
+        WHERE team_id = $1 AND driver_id = $2
+          AND state IN ({','.join('$' + str(i + 3) for i in range(len(OPEN_OFFER_STATES)))})
+        LIMIT 1
+        """,
+        team_id, driver_id, *OPEN_OFFER_STATES,
+    )
+    return _row_to_offer(row) if row else None
+
+
+async def fetch_open_offers_for_team(
+    conn: asyncpg.Connection, team_id: int
+) -> list[ContractOffer]:
+    rows = await conn.fetch(
+        f"""
+        SELECT * FROM contract_offers
+        WHERE team_id = $1
+          AND state IN ({','.join('$' + str(i + 2) for i in range(len(OPEN_OFFER_STATES)))})
+        ORDER BY created_at DESC
+        """,
+        team_id, *OPEN_OFFER_STATES,
+    )
+    return [_row_to_offer(r) for r in rows]
+
+
+async def fetch_open_offers_for_driver(
+    conn: asyncpg.Connection, driver_id: int
+) -> list[ContractOffer]:
+    rows = await conn.fetch(
+        f"""
+        SELECT * FROM contract_offers
+        WHERE driver_id = $1
+          AND state IN ({','.join('$' + str(i + 2) for i in range(len(OPEN_OFFER_STATES)))})
+        ORDER BY created_at DESC
+        """,
+        driver_id, *OPEN_OFFER_STATES,
+    )
+    return [_row_to_offer(r) for r in rows]
+
+
+async def fetch_expired_open_offers(
+    conn: asyncpg.Connection, now
+) -> list[ContractOffer]:
+    rows = await conn.fetch(
+        f"""
+        SELECT * FROM contract_offers
+        WHERE expires_at <= $1
+          AND state IN ({','.join('$' + str(i + 2) for i in range(len(OPEN_OFFER_STATES)))})
+        """,
+        now, *OPEN_OFFER_STATES,
+    )
+    return [_row_to_offer(r) for r in rows]
+
+
+# ── contract ledger (append-only) ────────────────────────────────────────────
+
+
+def _row_to_ledger(row: asyncpg.Record) -> LedgerEntry:
+    raw_detail = row["detail"]
+    detail = (
+        json.loads(raw_detail) if isinstance(raw_detail, str) else raw_detail
+    )
+    return LedgerEntry(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        driver_id=row["driver_id"],
+        team_id=row["team_id"],
+        contract_id=row["contract_id"],
+        offer_id=row["offer_id"],
+        kind=row["kind"],
+        amount=row["amount"],
+        detail=detail,
+        actor_id=row["actor_id"],
+        created_at=row["created_at"],
+    )
+
+
+async def append_ledger(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    kind: str,
+    detail: dict,
+    driver_id: int | None = None,
+    team_id: int | None = None,
+    contract_id: int | None = None,
+    offer_id: int | None = None,
+    amount: Decimal | None = None,
+    actor_id: int | None = None,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO contract_ledger
+            (season_id, tier_id, driver_id, team_id, contract_id,
+             offer_id, kind, amount, detail, actor_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+        RETURNING id
+        """,
+        season_id, tier_id, driver_id, team_id, contract_id, offer_id,
+        kind, amount, json.dumps(detail), actor_id,
+    )
+
+
+async def fetch_ledger_for_driver(
+    conn: asyncpg.Connection, driver_id: int, limit: int
+) -> list[LedgerEntry]:
+    rows = await conn.fetch(
+        """
+        SELECT * FROM contract_ledger WHERE driver_id = $1
+        ORDER BY created_at DESC LIMIT $2
+        """,
+        driver_id, limit,
+    )
+    return [_row_to_ledger(r) for r in rows]
+
+
+async def fetch_ledger_for_team(
+    conn: asyncpg.Connection, team_id: int, limit: int
+) -> list[LedgerEntry]:
+    rows = await conn.fetch(
+        """
+        SELECT * FROM contract_ledger WHERE team_id = $1
+        ORDER BY created_at DESC LIMIT $2
+        """,
+        team_id, limit,
+    )
+    return [_row_to_ledger(r) for r in rows]
+
+
+async def fetch_ledger_for_contract(
+    conn: asyncpg.Connection, contract_id: int
+) -> list[LedgerEntry]:
+    rows = await conn.fetch(
+        """
+        SELECT * FROM contract_ledger WHERE contract_id = $1
+        ORDER BY created_at ASC
+        """,
+        contract_id,
+    )
+    return [_row_to_ledger(r) for r in rows]

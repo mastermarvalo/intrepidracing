@@ -30,6 +30,7 @@ import discord
 from discord.ext import commands
 
 from bot import db, limits, queries
+from bot.contracts import render as contract_render
 from bot.market import render as market_render
 from bot.models import MarketBoard
 
@@ -132,6 +133,10 @@ async def build_board_embed(board: MarketBoard) -> discord.Embed | None:
             return await _build_movers_embed(conn, board)
         if board.kind == "dashboard":
             return await _build_dashboard_embed(conn, board, season.name)
+        if board.kind == "surplus":
+            return await _build_pl_embed(conn, board, top_first=True)
+        if board.kind == "underwater":
+            return await _build_pl_embed(conn, board, top_first=False)
     return None
 
 
@@ -199,4 +204,35 @@ async def _build_dashboard_embed(
     )
     return market_render.render_dashboard(
         season_name=season_name, tier_rows=rows
+    )
+
+
+async def _build_pl_embed(
+    conn, board: MarketBoard, *, top_first: bool
+) -> discord.Embed | None:
+    if board.tier_id is None:
+        return None
+    tier = await queries.fetch_tier_by_id(conn, board.tier_id)
+    if tier is None:
+        return None
+    rows = await queries.fetch_tier_contracts_with_market(conn, tier.id)
+    round_label = await conn.fetchval(
+        """
+        SELECT round_label FROM valuation_runs
+        WHERE tier_id = $1 AND published
+        ORDER BY published_at DESC NULLS LAST, created_at DESC
+        LIMIT 1
+        """,
+        tier.id,
+    )
+    title = (
+        f"Surplus — {tier.label}" if top_first
+        else f"Underwater — {tier.label}"
+    )
+    return contract_render.render_pl_table(
+        title=title,
+        color=tier.accent_color,
+        rows=rows,
+        top_first=top_first,
+        round_label=round_label,
     )
