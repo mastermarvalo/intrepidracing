@@ -129,6 +129,10 @@ phases.
   existing active contract per CLAUDE.md §2 rule 6), and
   promotion/relegation (moves driver + active contract across tiers).
 
+**For a league-member walkthrough of the whole thing (setup,
+offering, trading, releasing, buyouts, promotion/relegation), see
+[`docs/MARKET_GUIDE.md`](../docs/MARKET_GUIDE.md).**
+
 Every dollar amount is a `Decimal` end to end (no floats); every business
 number the league can tune (salary cap, movement caps, contract term
 limits, valuation weights) lives in DB config rows seeded by the F1
