@@ -13,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import db, flow, queries
+from bot import db, flow, queries, roster_ops
 from bot.events import _rerender, _rerender_fa
 from bot.render import (
     build_avatar_card,
@@ -199,7 +199,6 @@ class RosterCog(commands.Cog):
 
         async with db.connect() as conn:
             team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
-            config = await queries.fetch_guild_config(conn, interaction.guild_id)
 
         if team is None:
             await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
@@ -214,33 +213,15 @@ class RosterCog(commands.Cog):
             )
             return
 
-        team_role = interaction.guild.get_role(team.team_role_id)
-        if team_role is None:
-            await interaction.response.send_message(
-                "Team role not found — the role may have been deleted.", ephemeral=True
-            )
-            return
-
-        to_add = [team_role]
-        to_remove: list[discord.Role] = []
-
-        if config.free_agent_role_id:
-            fa_role = interaction.guild.get_role(config.free_agent_role_id)
-            if fa_role and fa_role in member.roles:
-                to_remove.append(fa_role)
-
         try:
-            await member.add_roles(*to_add, reason=f"Signed to {team.name} by {interaction.user}")
-            if to_remove:
-                await member.remove_roles(
-                    *to_remove, reason=f"Signed to {team.name} by {interaction.user}"
-                )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "I don't have permission to manage roles. "
-                "Make sure my role is above the team roles in Server Settings → Roles.",
-                ephemeral=True,
+            await roster_ops.sign_to_team(
+                guild=interaction.guild,
+                member=member,
+                team=team,
+                actor=interaction.user,
             )
+        except roster_ops.RoleAssignmentError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
         await interaction.response.send_message(
@@ -258,7 +239,6 @@ class RosterCog(commands.Cog):
 
         async with db.connect() as conn:
             team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
-            config = await queries.fetch_guild_config(conn, interaction.guild_id)
 
         if team is None:
             await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
@@ -273,30 +253,15 @@ class RosterCog(commands.Cog):
             )
             return
 
-        team_role = interaction.guild.get_role(team.team_role_id)
-        to_remove = [r for r in [team_role] if r and r in member.roles]
-        to_add: list[discord.Role] = []
-
-        if config.free_agent_role_id:
-            fa_role = interaction.guild.get_role(config.free_agent_role_id)
-            if fa_role and fa_role not in member.roles:
-                to_add.append(fa_role)
-
         try:
-            if to_remove:
-                await member.remove_roles(
-                    *to_remove, reason=f"Dropped from {team.name} by {interaction.user}"
-                )
-            if to_add:
-                await member.add_roles(
-                    *to_add, reason=f"Dropped from {team.name} by {interaction.user}"
-                )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "I don't have permission to manage roles. "
-                "Make sure my role is above the team roles in Server Settings → Roles.",
-                ephemeral=True,
+            await roster_ops.drop_from_team(
+                guild=interaction.guild,
+                member=member,
+                team=team,
+                actor=interaction.user,
             )
+        except roster_ops.RoleAssignmentError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
         await interaction.response.send_message(
@@ -367,7 +332,6 @@ class RosterCog(commands.Cog):
 
         async with db.connect() as conn:
             team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
-            config = await queries.fetch_guild_config(conn, interaction.guild_id)
 
         if team is None:
             await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
@@ -382,7 +346,7 @@ class RosterCog(commands.Cog):
             )
             return
 
-        view = _BulkSignDropView(team, config, drop=False)
+        view = _BulkSignDropView(team, drop=False)
         await interaction.response.send_message(
             f"**Bulk sign → {team.name}**\nSelect up to 25 players, then click **Sign**.",
             view=view,
@@ -396,7 +360,6 @@ class RosterCog(commands.Cog):
 
         async with db.connect() as conn:
             team = await queries.fetch_team(conn, interaction.guild_id, name.lower())
-            config = await queries.fetch_guild_config(conn, interaction.guild_id)
 
         if team is None:
             await interaction.response.send_message(f"No team named `{name}`.", ephemeral=True)
@@ -411,7 +374,7 @@ class RosterCog(commands.Cog):
             )
             return
 
-        view = _BulkSignDropView(team, config, drop=True)
+        view = _BulkSignDropView(team, drop=True)
         await interaction.response.send_message(
             f"**Bulk drop ← {team.name}**\nSelect up to 25 players, then click **Drop**.",
             view=view,
@@ -720,10 +683,9 @@ class _ConfirmDMView(discord.ui.View):
 
 
 class _BulkSignDropView(discord.ui.View):
-    def __init__(self, team, config, *, drop: bool) -> None:
+    def __init__(self, team, *, drop: bool) -> None:
         super().__init__(timeout=120)
         self._team = team
-        self._config = config
         self._drop = drop
         self._selected: list[discord.Member] = []
 
@@ -758,40 +720,22 @@ class _BulkSignDropView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         assert interaction.guild is not None
 
-        team_role = interaction.guild.get_role(self._team.team_role_id)
-        fa_role = (
-            interaction.guild.get_role(self._config.free_agent_role_id)
-            if self._config.free_agent_role_id else None
-        )
+        op = roster_ops.drop_from_team if self._drop else roster_ops.sign_to_team
+        verb = "Bulk drop" if self._drop else "Bulk sign"
         done: list[str] = []
         failed: list[str] = []
 
         for member in self._selected:
             try:
-                if self._drop:
-                    to_remove = [r for r in [team_role] if r and r in member.roles]
-                    to_add = [fa_role] if fa_role and fa_role not in member.roles else []
-                    if to_remove:
-                        await member.remove_roles(
-                            *to_remove, reason=f"Bulk drop by {interaction.user}"
-                        )
-                    if to_add:
-                        await member.add_roles(
-                            *to_add, reason=f"Bulk drop by {interaction.user}"
-                        )
-                else:
-                    to_add = [team_role] if team_role else []
-                    to_remove = [fa_role] if fa_role and fa_role in member.roles else []
-                    if to_add:
-                        await member.add_roles(
-                            *to_add, reason=f"Bulk sign by {interaction.user}"
-                        )
-                    if to_remove:
-                        await member.remove_roles(
-                            *to_remove, reason=f"Bulk sign by {interaction.user}"
-                        )
+                await op(
+                    guild=interaction.guild,
+                    member=member,
+                    team=self._team,
+                    actor=interaction.user,
+                    reason=f"{verb} by {interaction.user}",
+                )
                 done.append(member.display_name)
-            except discord.Forbidden:
+            except roster_ops.RoleAssignmentError:
                 failed.append(member.display_name)
 
         verb_past = "dropped from" if self._drop else "signed to"
