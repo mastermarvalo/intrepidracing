@@ -21,6 +21,7 @@ import discord
 from discord.ext import commands, tasks
 
 from bot import db, queries
+from bot.market import boards as market_boards
 from bot.models import GuildConfig, Team
 from bot.render import (
     build_fa_embed,
@@ -114,6 +115,15 @@ class EventsCog(commands.Cog):
                 await _rerender(self.bot, guild, team)
 
             await _rerender_fa(self.bot, guild, config)
+
+        # Safety net: refresh market boards in case a publish-time
+        # refresh was missed (bot restart, transient Discord failure,
+        # message deleted then reposted). Same 15-min cadence as roster
+        # rerenders.
+        try:
+            await market_boards.refresh_all_boards(self.bot)
+        except Exception:
+            log.exception("Poll: market board refresh failed")
 
         _snapshots_initialized = True
         log.debug("Poll: done")

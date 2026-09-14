@@ -15,9 +15,15 @@ Phase 2 surface:
   /market-admin valuation publish run:<id>
   /market-admin valuation list [tier:<code>]
 
-Later phases add board, approval, void, adjust-cap, and free-agency
-window subcommands. This module is `/market-admin` only; public /market
-and /contract cogs land in Phase 3 and 4.
+Phase 3 surface:
+  /market-admin board add kind:<kind> channel:<#chan> [tier:<code>]
+  /market-admin board remove board_id:<id>
+  /market-admin board refresh [board_id:<id>]
+  /market-admin board list
+
+Later phases add approval, void, adjust-cap, and free-agency window
+subcommands. This module is `/market-admin` only; public /market is
+Phase 3, /contract is Phase 4.
 
 Authority: Manage Server (mirrors `_is_admin` in cogs/roster.py). A
 commissioner role assigned via `/market-admin config role commissioner`
@@ -26,6 +32,7 @@ Phase 1 stays with Manage Server so we do not diverge from the existing
 permission model until the contract flow needs the split.
 """
 
+import logging
 from decimal import Decimal, InvalidOperation
 
 import discord
@@ -33,9 +40,12 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import db, queries
+from bot.market import boards as market_boards
 from bot.market import valuation as valuation_engine
 from bot.market.money import format_money, format_pl
 from bot.presets import f1 as f1_preset
+
+log = logging.getLogger(__name__)
 
 
 def _is_admin(interaction: discord.Interaction) -> bool:
@@ -80,6 +90,9 @@ class AdminMarketCog(commands.Cog):
     )
     valuation = app_commands.Group(
         name="valuation", description="Run and publish market valuations", parent=admin
+    )
+    board = app_commands.Group(
+        name="board", description="Self-updating market boards", parent=admin
     )
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -740,6 +753,24 @@ class AdminMarketCog(commands.Cog):
                 )
                 return
             await queries.publish_valuation_run(conn, run_id)
+            season_id = run["season_id"]
+            tier_id = run["tier_id"]
+
+        # Refresh every market/movers board scoped to this tier plus
+        # every cross-tier dashboard so a publish is visible to
+        # everyone without waiting for the 15-minute safety poll.
+        try:
+            await market_boards.refresh_boards_for_tier(
+                self.bot,
+                guild_id=interaction.guild_id,
+                season_id=season_id,
+                tier_id=tier_id,
+            )
+        except Exception:
+            log.exception(
+                "Post-publish board refresh failed for run %s (values are "
+                "published; boards will heal on the next poll)", run_id,
+            )
 
         await interaction.response.send_message(
             f"✅ Published run `{run_id}` — market values are now live.",
@@ -807,6 +838,173 @@ class AdminMarketCog(commands.Cog):
             lines.append(
                 f"`{r['id']}` · `{r['tier_code']}` · **{r['round_label']}** "
                 f"· {status} · {ts}"
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ── /market-admin board ──────────────────────────────────────────────
+
+    @board.command(name="add", description="Post a self-updating market board in a channel")
+    @app_commands.describe(
+        kind="Which board type (market / movers / dashboard)",
+        channel="Channel to post the board in",
+        tier="Tier code (required for market/movers; leave empty for dashboard)",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="Market table", value="market"),
+            app_commands.Choice(name="Movers (risers & fallers)", value="movers"),
+            app_commands.Choice(name="Cross-tier dashboard", value="dashboard"),
+        ]
+    )
+    async def board_add(
+        self,
+        interaction: discord.Interaction,
+        kind: app_commands.Choice[str],
+        channel: discord.TextChannel,
+        tier: str | None = None,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        needs_tier = kind.value in ("market", "movers")
+        if needs_tier and tier is None:
+            await interaction.response.send_message(
+                f"`{kind.value}` boards require a `tier:` argument.",
+                ephemeral=True,
+            )
+            return
+        if not needs_tier and tier is not None:
+            await interaction.response.send_message(
+                "`dashboard` boards are cross-tier; do not pass `tier:`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send(
+                    "No active season.", ephemeral=True
+                )
+                return
+            tier_id: int | None = None
+            if needs_tier:
+                tier_row = await queries.fetch_tier(conn, season.id, tier)  # type: ignore[arg-type]
+                if tier_row is None:
+                    await interaction.followup.send(
+                        f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                    )
+                    return
+                tier_id = tier_row.id
+            board_id = await queries.insert_market_board(
+                conn,
+                season_id=season.id,
+                tier_id=tier_id,
+                kind=kind.value,
+                channel_id=channel.id,
+            )
+            board_row = await queries.fetch_market_board_by_id(conn, board_id)
+
+        assert board_row is not None
+        await market_boards.refresh_board(self.bot, board_row)
+        await interaction.followup.send(
+            f"✅ Posted **{kind.name}** board (`{board_id}`) in {channel.mention}. "
+            "It updates automatically after each `/market-admin valuation publish` "
+            "and every 15 minutes via the safety poll.",
+            ephemeral=True,
+        )
+
+    @board.command(name="remove", description="Delete a market board")
+    @app_commands.describe(board_id="Board id (see /market-admin board list)")
+    async def board_remove(
+        self, interaction: discord.Interaction, board_id: int
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            board_row = await queries.fetch_market_board_by_id(conn, board_id)
+            if board_row is None:
+                await interaction.response.send_message(
+                    f"No board with id `{board_id}`.", ephemeral=True
+                )
+                return
+            await queries.delete_market_board(conn, board_id)
+
+        if board_row.message_id is not None:
+            channel = self.bot.get_channel(board_row.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(board_row.message_id)
+                    await msg.delete()
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+        await interaction.response.send_message(
+            f"✅ Removed board `{board_id}`.", ephemeral=True
+        )
+
+    @board.command(name="refresh", description="Re-render market boards")
+    @app_commands.describe(
+        board_id="Refresh only this board (leave blank to refresh all)"
+    )
+    async def board_refresh(
+        self, interaction: discord.Interaction, board_id: int | None = None
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        if board_id is None:
+            await market_boards.refresh_all_boards(self.bot)
+            await interaction.followup.send(
+                "✅ Refreshed all market boards.", ephemeral=True
+            )
+            return
+        async with db.connect() as conn:
+            board_row = await queries.fetch_market_board_by_id(conn, board_id)
+        if board_row is None:
+            await interaction.followup.send(
+                f"No board with id `{board_id}`.", ephemeral=True
+            )
+            return
+        await market_boards.refresh_board(self.bot, board_row)
+        await interaction.followup.send(
+            f"✅ Refreshed board `{board_id}`.", ephemeral=True
+        )
+
+    @board.command(name="list", description="List market boards for the active season")
+    async def board_list(self, interaction: discord.Interaction) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.response.send_message(
+                    "No active season.", ephemeral=True
+                )
+                return
+            boards = await queries.fetch_market_boards_in_season(conn, season.id)
+            tier_by_id = {
+                t.id: t for t in await queries.fetch_all_tiers(conn, season.id)
+            }
+
+        if not boards:
+            await interaction.response.send_message(
+                "No boards configured yet.", ephemeral=True
+            )
+            return
+        lines = ["**Market boards — active season**"]
+        for b in boards:
+            tier_label = tier_by_id[b.tier_id].code if b.tier_id else "cross"
+            status = "✅" if b.message_id else "⚠️ broken (message deleted)"
+            lines.append(
+                f"`{b.id}` · **{b.kind}** · tier `{tier_label}` · "
+                f"<#{b.channel_id}> · {status}"
             )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 

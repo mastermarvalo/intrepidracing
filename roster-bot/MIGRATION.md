@@ -1,5 +1,23 @@
 # Upgrade & migration notes
 
+## Phase 3 (Market surfaces)
+
+Ships migration `007_market_boards.sql`. Applied automatically on
+next bot start after Phase 2 is already recorded.
+
+**What changes for the live database:**
+
+- New table: `market_boards`. References existing `seasons`, `tiers`,
+  and `board_kinds` (all present from Phase 1/2).
+- No column changes on any existing table.
+- No data migration required.
+
+**Rollback:** dropping `market_boards` reverts Phase 3 cleanly. The
+`/market` cog is a read-only surface — removing the cog while the
+table exists is also safe.
+
+---
+
 ## Phase 2 (Valuation engine)
 
 Ships migration `004_valuations.sql`. On next bot start,

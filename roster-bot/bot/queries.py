@@ -16,6 +16,7 @@ from bot.models import (
     Driver,
     GuildConfig,
     LeagueConfig,
+    MarketBoard,
     Season,
     StatBoard,
     Team,
@@ -846,3 +847,272 @@ async def fetch_latest_published_valuation(
         """,
         driver_id,
     )
+
+
+# ── market surfaces (Phase 3) ────────────────────────────────────────────────
+#
+# "Latest published run" per tier is the anchor for every market
+# surface. Rather than repeat the CTE at every call site, this helper
+# returns the id (or None if the tier has never had a published run).
+
+
+async def fetch_latest_published_run_id(
+    conn: asyncpg.Connection, tier_id: int
+) -> int | None:
+    return await conn.fetchval(
+        """
+        SELECT id FROM valuation_runs
+        WHERE tier_id = $1 AND published
+        ORDER BY published_at DESC NULLS LAST, created_at DESC
+        LIMIT 1
+        """,
+        tier_id,
+    )
+
+
+async def fetch_market_table_for_tier(
+    conn: asyncpg.Connection, tier_id: int
+) -> list[asyncpg.Record]:
+    """
+    All drivers in the tier from the most recent published run,
+    including their previous_value and delta so the render layer can
+    show week-over-week movement without a second query.
+
+    Returns rows sorted by rank_in_tier (ascending — 1 first).
+    """
+    run_id = await fetch_latest_published_run_id(conn, tier_id)
+    if run_id is None:
+        return []
+    return await conn.fetch(
+        """
+        SELECT dv.driver_id,
+               d.display_name,
+               dv.market_value,
+               dv.previous_value,
+               dv.delta,
+               dv.rank_in_tier,
+               dv.capped
+        FROM driver_valuations dv
+        JOIN drivers d ON d.id = dv.driver_id
+        WHERE dv.run_id = $1
+        ORDER BY dv.rank_in_tier
+        """,
+        run_id,
+    )
+
+
+async def fetch_movers_for_tier(
+    conn: asyncpg.Connection, tier_id: int, limit: int
+) -> tuple[list[asyncpg.Record], list[asyncpg.Record]]:
+    """
+    Top `limit` risers and top `limit` fallers from the most recent
+    published run. Returns (risers, fallers) — risers sorted by delta
+    DESC, fallers by delta ASC. Empty lists if the tier has no
+    published run yet or no non-zero deltas.
+    """
+    run_id = await fetch_latest_published_run_id(conn, tier_id)
+    if run_id is None:
+        return ([], [])
+    risers = await conn.fetch(
+        """
+        SELECT dv.driver_id, d.display_name, dv.market_value,
+               dv.previous_value, dv.delta, dv.capped
+        FROM driver_valuations dv
+        JOIN drivers d ON d.id = dv.driver_id
+        WHERE dv.run_id = $1 AND dv.delta > 0
+        ORDER BY dv.delta DESC, d.display_name
+        LIMIT $2
+        """,
+        run_id, limit,
+    )
+    fallers = await conn.fetch(
+        """
+        SELECT dv.driver_id, d.display_name, dv.market_value,
+               dv.previous_value, dv.delta, dv.capped
+        FROM driver_valuations dv
+        JOIN drivers d ON d.id = dv.driver_id
+        WHERE dv.run_id = $1 AND dv.delta < 0
+        ORDER BY dv.delta ASC, d.display_name
+        LIMIT $2
+        """,
+        run_id, limit,
+    )
+    return (risers, fallers)
+
+
+async def fetch_cross_tier_top(
+    conn: asyncpg.Connection, season_id: int, per_tier: int
+) -> list[asyncpg.Record]:
+    """
+    Top `per_tier` drivers from each tier in the season, from each
+    tier's most recent published run. One row per driver, joined with
+    tier metadata so the dashboard can group by tier without a second
+    trip.
+    """
+    return await conn.fetch(
+        """
+        WITH latest AS (
+            SELECT DISTINCT ON (tier_id) id AS run_id, tier_id
+            FROM valuation_runs
+            WHERE season_id = $1 AND published
+            ORDER BY tier_id,
+                     published_at DESC NULLS LAST,
+                     created_at DESC
+        ),
+        ranked AS (
+            SELECT dv.driver_id, d.display_name, dv.market_value,
+                   dv.previous_value, dv.delta, dv.rank_in_tier,
+                   dv.capped, l.tier_id
+            FROM latest l
+            JOIN driver_valuations dv ON dv.run_id = l.run_id
+            JOIN drivers d ON d.id = dv.driver_id
+            WHERE dv.rank_in_tier <= $2
+        )
+        SELECT r.*, t.code AS tier_code, t.label AS tier_label,
+               t.rank_order AS tier_rank_order, t.accent_color
+        FROM ranked r
+        JOIN tiers t ON t.id = r.tier_id
+        ORDER BY t.rank_order, r.rank_in_tier
+        """,
+        season_id, per_tier,
+    )
+
+
+async def fetch_driver_valuation_history(
+    conn: asyncpg.Connection, driver_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """
+    Last `limit` PUBLISHED valuations for a driver, newest first.
+    Useful for the driver-card trend line and the movers rationale.
+    """
+    return await conn.fetch(
+        """
+        SELECT vr.round_label, vr.published_at, vr.created_at,
+               dv.market_value, dv.previous_value, dv.delta, dv.capped
+        FROM driver_valuations dv
+        JOIN valuation_runs vr ON vr.id = dv.run_id
+        WHERE dv.driver_id = $1 AND vr.published
+        ORDER BY vr.published_at DESC NULLS LAST, vr.created_at DESC
+        LIMIT $2
+        """,
+        driver_id, limit,
+    )
+
+
+async def fetch_driver_by_member(
+    conn: asyncpg.Connection, season_id: int, member_id: int
+) -> Driver | None:
+    """
+    A member may have one drivers row per tier (see migration 003 note).
+    This returns the first one found — used by `/market driver` when the
+    caller passes a Discord mention rather than a tier-scoped identifier.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM drivers
+        WHERE season_id = $1 AND member_id = $2
+        ORDER BY id
+        LIMIT 1
+        """,
+        season_id, member_id,
+    )
+    return _row_to_driver(row) if row else None
+
+
+async def fetch_driver_by_display_name(
+    conn: asyncpg.Connection, season_id: int, display_name: str
+) -> Driver | None:
+    row = await conn.fetchrow(
+        """
+        SELECT * FROM drivers
+        WHERE season_id = $1 AND lower(display_name) = lower($2)
+        ORDER BY id
+        LIMIT 1
+        """,
+        season_id, display_name,
+    )
+    return _row_to_driver(row) if row else None
+
+
+# ── market boards ────────────────────────────────────────────────────────────
+
+
+def _row_to_market_board(row: asyncpg.Record) -> MarketBoard:
+    return MarketBoard(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        kind=row["kind"],
+        channel_id=row["channel_id"],
+        message_id=row["message_id"],
+        page=row["page"],
+        forum_thread_id=row["forum_thread_id"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_market_board(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int | None,
+    kind: str,
+    channel_id: int,
+    page: int = 0,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO market_boards (season_id, tier_id, kind, channel_id, page)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        season_id, tier_id, kind, channel_id, page,
+    )
+
+
+async def set_market_board_message_id(
+    conn: asyncpg.Connection, board_id: int, message_id: int | None
+) -> None:
+    await conn.execute(
+        "UPDATE market_boards SET message_id = $1 WHERE id = $2",
+        message_id, board_id,
+    )
+
+
+async def fetch_market_board_by_id(
+    conn: asyncpg.Connection, board_id: int
+) -> MarketBoard | None:
+    row = await conn.fetchrow("SELECT * FROM market_boards WHERE id = $1", board_id)
+    return _row_to_market_board(row) if row else None
+
+
+async def fetch_market_boards_in_season(
+    conn: asyncpg.Connection, season_id: int
+) -> list[MarketBoard]:
+    rows = await conn.fetch(
+        "SELECT * FROM market_boards WHERE season_id = $1 ORDER BY created_at",
+        season_id,
+    )
+    return [_row_to_market_board(r) for r in rows]
+
+
+async def fetch_market_boards_for_tier(
+    conn: asyncpg.Connection, season_id: int, tier_id: int | None
+) -> list[MarketBoard]:
+    """
+    Boards scoped to a specific tier (or the cross-tier `NULL` bucket
+    for dashboards). Used by the auto-refresh path after a publish.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT * FROM market_boards
+        WHERE season_id = $1 AND tier_id IS NOT DISTINCT FROM $2
+        ORDER BY created_at
+        """,
+        season_id, tier_id,
+    )
+    return [_row_to_market_board(r) for r in rows]
+
+
+async def delete_market_board(conn: asyncpg.Connection, board_id: int) -> None:
+    await conn.execute("DELETE FROM market_boards WHERE id = $1", board_id)

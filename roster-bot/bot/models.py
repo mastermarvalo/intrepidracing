@@ -95,6 +95,19 @@ class Driver:
 
 
 @dataclass
+class MarketBoard:
+    id: int
+    season_id: int
+    kind: str
+    channel_id: int
+    tier_id: int | None = None
+    message_id: int | None = None
+    page: int = 0
+    forum_thread_id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
 class LeagueConfig:
     """
     Resolved config for a (season, tier). If a tier-scoped row exists it is

@@ -117,7 +117,10 @@ phases.
   config).
 - **Phase 2** — valuation engine (`bot/market/valuation.py`), money
   boundary (`bot/market/money.py`), dry-run→publish flow.
-- Later phases — public `/market` and `/contract` surfaces, trades,
+- **Phase 3** — public `/market` surfaces + self-updating market boards
+  that mirror the `stat_boards` refresh pattern (`bot/market/render.py`,
+  `bot/market/boards.py`).
+- Later phases — `/contract` offer/negotiate/approve flow, trades,
   releases, rollover.
 
 Every dollar amount is a `Decimal` end to end (no floats); every business
@@ -160,8 +163,34 @@ driver mathematically cannot influence a Tier-1 value.
 
 Phase 2 runs use empty factor observations (all zeros) — the plumbing
 and audit trail are in place; ingest of real per-race performance data
-into `driver_valuations.breakdown` lands with the /market surfaces in
-Phase 3.
+lands with the /market surfaces in a future phase.
+
+**Boards (Phase 3)**
+
+| Command | Description |
+|---|---|
+| `/market-admin board add <kind> <#channel> [tier]` | Post a self-updating board (`market`, `movers`, `dashboard`) |
+| `/market-admin board remove <board_id>` | Delete a board (also deletes its Discord message) |
+| `/market-admin board refresh [board_id]` | Re-render a specific board or all boards |
+| `/market-admin board list` | List boards in the active season with health status |
+
+Every board auto-refreshes after `/market-admin valuation publish` for
+its tier (plus every cross-tier dashboard) and again every 15 minutes
+via the safety poll — same pattern the roster embeds use. `cap`,
+`surplus`, and `underwater` board kinds land with contracts in Phase 4.
+
+### `/market` (open to everyone, ephemeral replies)
+
+| Command | Description |
+|---|---|
+| `/market view <tier> [page]` | Paginated tier market with Prev/Next buttons |
+| `/market movers <tier>` | Top risers and fallers from the last published run |
+| `/market driver <@member>` | Driver card: current value, week's movement, trend of last N runs |
+| `/market dashboard` | Cross-tier top-of-tier summary (display only) |
+
+`/market team`, `/market surplus`, and `/market underwater` are
+deliberately absent — they read from the `contracts` table and land in
+Phase 4.
 
 ### Quick start for a new league
 
@@ -177,6 +206,11 @@ Phase 3.
 # First valuation snapshot per tier (baselines every driver at min_salary)
 /market-admin valuation run tier: t1 round_label: "Pre-season baseline"
 /market-admin valuation publish run_id: <printed above>
+
+# Live market boards in a public channel
+/market-admin board add kind: Market table channel: #market tier: t1
+/market-admin board add kind: Movers channel: #market tier: t1
+/market-admin board add kind: Cross-tier dashboard channel: #market
 ```
 
 ## Team setup flow
