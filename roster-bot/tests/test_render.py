@@ -3,7 +3,6 @@
 from bot.render import build_embed
 from tests.conftest import FakeMember, FakeRole, make_slot, make_team
 
-
 TEAM_ROLE = 100
 DRIVER_ROLE_1 = 201
 DRIVER_ROLE_2 = 202

@@ -3,7 +3,6 @@
 from bot.render import build_embed
 from tests.conftest import FakeMember, FakeRole, make_slot, make_team
 
-
 TEAM_ROLE = 100
 DRIVER_ROLE = 201
 
@@ -46,7 +45,7 @@ def test_overflow_members_flagged():
     value = driver_value(build_embed(team, members))
     # First line after the label is member 10 (within quota)
     lines = value.splitlines()
-    label_idx = next(i for i, l in enumerate(lines) if "Slot" in l)
+    label_idx = next(i for i, line in enumerate(lines) if "Slot" in line)
     assert lines[label_idx + 1] == "<@10>"
     assert "overflow" in lines[label_idx + 2]
     assert "<@11>" in lines[label_idx + 2]
@@ -79,7 +78,7 @@ def test_single_overflow():
     ]
     value = driver_value(build_embed(team, members))
     lines = value.splitlines()
-    label_idx = next(i for i, l in enumerate(lines) if "Slot" in l)
+    label_idx = next(i for i, line in enumerate(lines) if "Slot" in line)
     assert lines[label_idx + 1] == "<@10>"
     assert lines[label_idx + 2] == "<@11>"
     assert "overflow" in lines[label_idx + 3]

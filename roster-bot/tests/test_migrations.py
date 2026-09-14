@@ -8,6 +8,8 @@ These tests use the pg_conn fixture (temp schema, auto-dropped), so
 running the suite never touches the developer's real dev DB.
 """
 
+from decimal import Decimal
+
 from tests.conftest import apply_migrations
 
 
@@ -16,6 +18,7 @@ async def test_fresh_db_all_migrations_apply(pg_conn):
     assert "001_init.sql" in applied
     assert "002_seasons_tiers.sql" in applied
     assert "003_drivers_and_tier_membership.sql" in applied
+    assert "004_valuations.sql" in applied
     assert "006_league_config_and_presets.sql" in applied
 
     tables = {
@@ -34,6 +37,71 @@ async def test_fresh_db_all_migrations_apply(pg_conn):
         "transaction_kinds", "board_kinds", "valuation_factors",
         "league_config",
     } <= tables
+    # Phase 2 additions
+    assert {"valuation_runs", "driver_valuations"} <= tables
+
+
+async def test_phase2_migration_upgrades_a_phase1_db(pg_conn):
+    """
+    Simulate a live database that already ran Phase 1 (through 006)
+    and now receives migration 004. This is the real upgrade path for
+    an already-deployed league.
+    """
+    for name in (
+        "001_init.sql",
+        "002_seasons_tiers.sql",
+        "003_drivers_and_tier_membership.sql",
+        "006_league_config_and_presets.sql",
+    ):
+        path = next(p for p in _list_migrations() if p.name == name)
+        await pg_conn.execute(path.read_text())
+
+    # Seed a season, tier, driver so 004's FK targets exist.
+    season_id = await pg_conn.fetchval(
+        "INSERT INTO seasons (guild_id, name) VALUES (1, 'S1') RETURNING id"
+    )
+    tier_id = await pg_conn.fetchval(
+        "INSERT INTO tiers (season_id, code, label, rank_order) "
+        "VALUES ($1, 't1', 'Tier 1', 1) RETURNING id",
+        season_id,
+    )
+    await pg_conn.execute(
+        "INSERT INTO driver_statuses (code, label) VALUES ('active', 'Active') "
+        "ON CONFLICT DO NOTHING"
+    )
+    driver_id = await pg_conn.fetchval(
+        "INSERT INTO drivers (season_id, tier_id, member_id, display_name, status) "
+        "VALUES ($1, $2, 111, 'Test', 'active') RETURNING id",
+        season_id, tier_id,
+    )
+
+    # Now apply migration 004.
+    path = next(p for p in _list_migrations() if p.name == "004_valuations.sql")
+    await pg_conn.execute(path.read_text())
+
+    # Prove the new tables function: create a run + a driver_valuation.
+    run_id = await pg_conn.fetchval(
+        "INSERT INTO valuation_runs (season_id, tier_id, round_label) "
+        "VALUES ($1, $2, 'Test') RETURNING id",
+        season_id, tier_id,
+    )
+    await pg_conn.execute(
+        """
+        INSERT INTO driver_valuations
+            (run_id, driver_id, market_value, previous_value, delta,
+             rank_in_tier, capped, breakdown)
+        VALUES ($1, $2, 20.75, 20.00, 0.75, 1, FALSE, '[]'::jsonb)
+        """,
+        run_id, driver_id,
+    )
+    row = await pg_conn.fetchrow(
+        "SELECT market_value, breakdown FROM driver_valuations WHERE run_id = $1",
+        run_id,
+    )
+    assert row["market_value"] == Decimal("20.75")
+    # asyncpg returns JSONB as a text string by default (no codec
+    # registered). The application layer parses when it needs a list.
+    assert row["breakdown"] == "[]"
 
 
 async def test_upgrade_from_001_only_preserves_existing_teams(pg_conn):

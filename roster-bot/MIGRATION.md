@@ -1,5 +1,24 @@
 # Upgrade & migration notes
 
+## Phase 2 (Valuation engine)
+
+Ships migration `004_valuations.sql`. On next bot start,
+`db._run_migrations` applies it in sorted order after the Phase 1
+migrations already recorded in `schema_migrations`.
+
+**What changes for the live database:**
+
+- New tables: `valuation_runs`, `driver_valuations`. Both are additive
+  and reference existing Phase 1 tables (`seasons`, `tiers`,
+  `drivers`).
+- No column changes on any existing table.
+- No data migration required.
+
+**Rollback:** dropping the two new tables reverses Phase 2 cleanly.
+Nothing in `bot/cogs/roster.py` reads them.
+
+---
+
 ## Phase 1 (Market & Contracts foundations)
 
 Phase 1 ships migrations `002_seasons_tiers.sql`,

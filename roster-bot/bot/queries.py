@@ -6,8 +6,9 @@ boundaries. Use inside `async with db.connect() as conn:` (which already wraps
 the work in a transaction).
 """
 
+import json
 from decimal import Decimal
-from typing import Sequence
+from typing import Any, Sequence
 
 import asyncpg
 
@@ -713,3 +714,135 @@ async def set_league_config_channels(
         f"AND tier_id IS NOT DISTINCT FROM ${len(args)}"
     )
     await conn.execute(sql, *args)
+
+
+# ── valuations (Phase 2) ──────────────────────────────────────────────────────
+#
+# Returns raw asyncpg.Records rather than typed dataclasses so that
+# bot/queries.py stays free of bot/market/ imports. Callers in the cog
+# layer adapt these rows into the engine's FactorWeight / DriverInput
+# types.
+
+
+async def fetch_valuation_factors(
+    conn: asyncpg.Connection, season_id: int
+) -> list[asyncpg.Record]:
+    return await conn.fetch(
+        """
+        SELECT code, label, weight, max_contribution, sort_order
+        FROM valuation_factors WHERE season_id = $1
+        ORDER BY sort_order, code
+        """,
+        season_id,
+    )
+
+
+async def insert_valuation_run(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    round_label: str,
+    created_by: int | None,
+    published: bool = False,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO valuation_runs
+            (season_id, tier_id, round_label, created_by, published, published_at)
+        VALUES ($1, $2, $3, $4, $5, CASE WHEN $5 THEN NOW() ELSE NULL END)
+        RETURNING id
+        """,
+        season_id, tier_id, round_label, created_by, published,
+    )
+
+
+async def insert_driver_valuations(
+    conn: asyncpg.Connection,
+    run_id: int,
+    rows: Sequence[dict[str, Any]],
+) -> None:
+    """
+    Bulk-insert per-driver valuations for a run. Each row is a dict with:
+      driver_id, market_value (Decimal), previous_value (Decimal|None),
+      delta (Decimal), rank_in_tier (int), capped (bool),
+      breakdown (list[dict] — JSON-serialisable).
+
+    The `breakdown` list is serialised to a JSON string and cast to
+    jsonb in the INSERT so we do not have to register a custom asyncpg
+    codec.
+    """
+    if not rows:
+        return
+    await conn.executemany(
+        """
+        INSERT INTO driver_valuations
+            (run_id, driver_id, market_value, previous_value, delta,
+             rank_in_tier, capped, breakdown)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+        """,
+        [
+            (
+                run_id,
+                r["driver_id"],
+                r["market_value"],
+                r["previous_value"],
+                r["delta"],
+                r["rank_in_tier"],
+                r["capped"],
+                json.dumps(r["breakdown"]),
+            )
+            for r in rows
+        ],
+    )
+
+
+async def fetch_valuation_run(
+    conn: asyncpg.Connection, run_id: int
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        "SELECT * FROM valuation_runs WHERE id = $1", run_id
+    )
+
+
+async def fetch_driver_valuations_for_run(
+    conn: asyncpg.Connection, run_id: int
+) -> list[asyncpg.Record]:
+    return await conn.fetch(
+        """
+        SELECT dv.*, d.display_name
+        FROM driver_valuations dv
+        JOIN drivers d ON d.id = dv.driver_id
+        WHERE dv.run_id = $1
+        ORDER BY dv.rank_in_tier
+        """,
+        run_id,
+    )
+
+
+async def publish_valuation_run(conn: asyncpg.Connection, run_id: int) -> None:
+    await conn.execute(
+        """
+        UPDATE valuation_runs
+        SET published = TRUE, published_at = NOW()
+        WHERE id = $1 AND NOT published
+        """,
+        run_id,
+    )
+
+
+async def fetch_latest_published_valuation(
+    conn: asyncpg.Connection, driver_id: int
+) -> Decimal | None:
+    """Most recent published market_value for a driver, or None."""
+    return await conn.fetchval(
+        """
+        SELECT dv.market_value
+        FROM driver_valuations dv
+        JOIN valuation_runs vr ON vr.id = dv.run_id
+        WHERE dv.driver_id = $1 AND vr.published
+        ORDER BY vr.published_at DESC NULLS LAST, vr.created_at DESC
+        LIMIT 1
+        """,
+        driver_id,
+    )

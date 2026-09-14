@@ -108,11 +108,17 @@ uv run ruff check bot/
 | `/roster view <name>` | Show a team's current roster embed |
 | `/roster freeagents` | List members who have the Free Agent role and at least one Tier role |
 
-## Market & Contracts (Phase 1)
+## Market & Contracts
 
 The market/contract system lives alongside `/roster` and is being built in
-phases. Phase 1 lays down the schema, the F1 preset, and the commissioner
-setup surface — `/market` and `/contract` (Phase 3–4) are not shipped yet.
+phases.
+
+- **Phase 1** — schema, F1 preset, and commissioner setup (season, tier,
+  config).
+- **Phase 2** — valuation engine (`bot/market/valuation.py`), money
+  boundary (`bot/market/money.py`), dry-run→publish flow.
+- Later phases — public `/market` and `/contract` surfaces, trades,
+  releases, rollover.
 
 Every dollar amount is a `Decimal` end to end (no floats); every business
 number the league can tune (salary cap, movement caps, contract term
@@ -121,7 +127,13 @@ preset — never as a Python literal in market/contract code. See
 `docs/ADR-001-f1-with-generic-future.md` for the rules and
 `scripts/check_magic_numbers.py` for the CI guard that enforces them.
 
+Valuations are **tier-isolated by construction**: the engine takes one
+tier's inputs at a time and has no notion of tier structure, so a Tier-2
+driver mathematically cannot influence a Tier-1 value.
+
 ### `/market-admin` (require Manage Server)
+
+**Setup (Phase 1)**
 
 | Command | Description |
 |---|---|
@@ -137,6 +149,20 @@ preset — never as a Python literal in market/contract code. See
 | `/market-admin config role <@role> [tier]` | Set the commissioner role |
 | `/market-admin config free-agency <open\|closed> [tier]` | Open or close the free-agency window |
 
+**Valuations (Phase 2)**
+
+| Command | Description |
+|---|---|
+| `/market-admin valuation run <tier> <round_label>` | Create an *unpublished* dry-run for a tier; shows the preview |
+| `/market-admin valuation preview <run_id>` | Re-show a run's preview |
+| `/market-admin valuation publish <run_id>` | Flip a dry-run to published — makes it the live market value |
+| `/market-admin valuation list [tier]` | 20 most recent runs |
+
+Phase 2 runs use empty factor observations (all zeros) — the plumbing
+and audit trail are in place; ingest of real per-race performance data
+into `driver_valuations.breakdown` lands with the /market surfaces in
+Phase 3.
+
 ### Quick start for a new league
 
 ```text
@@ -147,6 +173,10 @@ preset — never as a Python literal in market/contract code. See
 /market-admin tier edit code: t3 label: "Tier 3" rank_order: 3 role: @Tier-3
 /market-admin config show
 /market-admin config edit               # tune the numeric defaults
+
+# First valuation snapshot per tier (baselines every driver at min_salary)
+/market-admin valuation run tier: t1 round_label: "Pre-season baseline"
+/market-admin valuation publish run_id: <printed above>
 ```
 
 ## Team setup flow

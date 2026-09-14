@@ -9,9 +9,15 @@ Phase 1 surface:
   /market-admin tier add|edit|list
   /market-admin config show|edit|channel|role|free-agency
 
-Later phases add valuation, board, approval, void, adjust-cap, and
-free-agency window subcommands. This module is `/market-admin` only;
-public /market and /contract cogs land in Phase 3 and 4.
+Phase 2 surface:
+  /market-admin valuation run tier:<code> round:<label>   (dry-run)
+  /market-admin valuation preview run:<id>                (re-show)
+  /market-admin valuation publish run:<id>
+  /market-admin valuation list [tier:<code>]
+
+Later phases add board, approval, void, adjust-cap, and free-agency
+window subcommands. This module is `/market-admin` only; public /market
+and /contract cogs land in Phase 3 and 4.
 
 Authority: Manage Server (mirrors `_is_admin` in cogs/roster.py). A
 commissioner role assigned via `/market-admin config role commissioner`
@@ -27,6 +33,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot import db, queries
+from bot.market import valuation as valuation_engine
+from bot.market.money import format_money, format_pl
 from bot.presets import f1 as f1_preset
 
 
@@ -69,6 +77,9 @@ class AdminMarketCog(commands.Cog):
     )
     config = app_commands.Group(
         name="config", description="League config", parent=admin
+    )
+    valuation = app_commands.Group(
+        name="valuation", description="Run and publish market valuations", parent=admin
     )
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -560,6 +571,245 @@ class AdminMarketCog(commands.Cog):
             f"{icon} Free agency is now **{state.name.lower()}**.", ephemeral=True
         )
 
+    # ── /market-admin valuation ──────────────────────────────────────────
+
+    @valuation.command(
+        name="run",
+        description="Create a dry-run valuation for a tier (nothing is published)",
+    )
+    @app_commands.describe(
+        tier="Tier code (e.g. t1)",
+        round_label="Human label for this run (e.g. 'Post-Abu Dhabi')",
+    )
+    async def valuation_run(
+        self,
+        interaction: discord.Interaction,
+        tier: str,
+        round_label: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send(
+                    "No active season.", ephemeral=True
+                )
+                return
+            tier_row = await queries.fetch_tier(conn, season.id, tier)
+            if tier_row is None:
+                await interaction.followup.send(
+                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                )
+                return
+            cfg = await queries.fetch_league_config_row(conn, season.id, tier_row.id)
+            if cfg is None:
+                cfg = await queries.fetch_league_config_row(conn, season.id, None)
+            if cfg is None:
+                await interaction.followup.send(
+                    "No league_config for that scope. Seed one with the F1 preset first.",
+                    ephemeral=True,
+                )
+                return
+
+            factor_rows = await queries.fetch_valuation_factors(conn, season.id)
+            drivers = await queries.fetch_drivers_in_tier(conn, tier_row.id)
+            if not drivers:
+                await interaction.followup.send(
+                    f"No drivers in tier `{tier}` yet. Add drivers before running a valuation.",
+                    ephemeral=True,
+                )
+                return
+
+            # Build previous-value map from the latest published run per driver.
+            prev_values: dict[int, Decimal] = {}
+            for d in drivers:
+                latest = await queries.fetch_latest_published_valuation(conn, d.id)
+                if latest is not None:
+                    prev_values[d.id] = latest
+
+            factors = [
+                valuation_engine.FactorWeight(
+                    code=row["code"],
+                    weight=row["weight"],
+                    max_contribution=row["max_contribution"],
+                )
+                for row in factor_rows
+            ]
+            engine_inputs = [
+                valuation_engine.DriverInput(
+                    driver_id=d.id,
+                    display_name=d.display_name,
+                    previous_value=prev_values.get(d.id, cfg.min_salary),
+                    factor_values={},
+                )
+                for d in drivers
+            ]
+            caps = valuation_engine.MovementCaps(
+                weekly=cfg.weekly_move_cap,
+                exceptional=cfg.exceptional_move_cap,
+            )
+
+            outcomes = valuation_engine.compute_run(factors, engine_inputs, caps)
+            run_id = await queries.insert_valuation_run(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                round_label=round_label,
+                created_by=interaction.user.id,
+                published=False,
+            )
+            rows = [
+                {
+                    "driver_id": v.driver_id,
+                    "market_value": v.market_value,
+                    "previous_value": v.previous_value,
+                    "delta": v.delta,
+                    "rank_in_tier": v.rank_in_tier,
+                    "capped": v.capped,
+                    "breakdown": valuation_engine.breakdown_to_json(v.breakdown),
+                }
+                for v in outcomes
+            ]
+            await queries.insert_driver_valuations(conn, run_id, rows)
+
+        await interaction.followup.send(
+            _render_valuation_preview(
+                run_id=run_id,
+                tier_code=tier,
+                round_label=round_label,
+                published=False,
+                outcomes=outcomes,
+            ),
+            ephemeral=True,
+        )
+
+    @valuation.command(name="preview", description="Re-show an existing valuation run")
+    @app_commands.describe(run_id="Numeric id of the run to preview")
+    async def valuation_preview(
+        self, interaction: discord.Interaction, run_id: int
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            run = await queries.fetch_valuation_run(conn, run_id)
+            if run is None:
+                await interaction.followup.send(
+                    f"No valuation run with id `{run_id}`.", ephemeral=True
+                )
+                return
+            tier_row = await queries.fetch_tier_by_id(conn, run["tier_id"])
+            valuation_rows = await queries.fetch_driver_valuations_for_run(conn, run_id)
+
+        await interaction.followup.send(
+            _render_valuation_preview_from_rows(
+                run_id=run_id,
+                tier_code=tier_row.code if tier_row else "?",
+                round_label=run["round_label"],
+                published=run["published"],
+                rows=valuation_rows,
+            ),
+            ephemeral=True,
+        )
+
+    @valuation.command(name="publish", description="Publish a dry-run valuation")
+    @app_commands.describe(run_id="Numeric id of the run to publish")
+    async def valuation_publish(
+        self, interaction: discord.Interaction, run_id: int
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            run = await queries.fetch_valuation_run(conn, run_id)
+            if run is None:
+                await interaction.response.send_message(
+                    f"No valuation run with id `{run_id}`.", ephemeral=True
+                )
+                return
+            if run["published"]:
+                await interaction.response.send_message(
+                    f"Run `{run_id}` was already published.", ephemeral=True
+                )
+                return
+            await queries.publish_valuation_run(conn, run_id)
+
+        await interaction.response.send_message(
+            f"✅ Published run `{run_id}` — market values are now live.",
+            ephemeral=True,
+        )
+
+    @valuation.command(name="list", description="List recent valuation runs")
+    @app_commands.describe(tier="Filter to a single tier (leave unset for all tiers)")
+    async def valuation_list(
+        self, interaction: discord.Interaction, tier: str | None = None
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.response.send_message(
+                    "No active season.", ephemeral=True
+                )
+                return
+            tier_id = await _resolve_tier_id(conn, season.id, tier)
+            if tier is not None and tier_id is None:
+                await interaction.response.send_message(
+                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                )
+                return
+            if tier_id is None:
+                rows = await conn.fetch(
+                    """
+                    SELECT vr.id, vr.round_label, vr.published, vr.created_at,
+                           t.code AS tier_code
+                    FROM valuation_runs vr
+                    JOIN tiers t ON t.id = vr.tier_id
+                    WHERE vr.season_id = $1
+                    ORDER BY vr.created_at DESC
+                    LIMIT 20
+                    """,
+                    season.id,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT vr.id, vr.round_label, vr.published, vr.created_at,
+                           t.code AS tier_code
+                    FROM valuation_runs vr
+                    JOIN tiers t ON t.id = vr.tier_id
+                    WHERE vr.season_id = $1 AND vr.tier_id = $2
+                    ORDER BY vr.created_at DESC
+                    LIMIT 20
+                    """,
+                    season.id, tier_id,
+                )
+
+        if not rows:
+            await interaction.response.send_message(
+                "No valuation runs yet.", ephemeral=True
+            )
+            return
+        lines = ["**Recent valuation runs**"]
+        for r in rows:
+            status = "🟢 published" if r["published"] else "⚪ dry-run"
+            ts = f"<t:{int(r['created_at'].timestamp())}:d>"
+            lines.append(
+                f"`{r['id']}` · `{r['tier_code']}` · **{r['round_label']}** "
+                f"· {status} · {ts}"
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -581,6 +831,107 @@ async def _resolve_tier_id(conn, season_id: int, code: str | None) -> int | None
         return None
     tier = await queries.fetch_tier(conn, season_id, code)
     return tier.id if tier else None
+
+
+def _delta_arrow(delta: Decimal) -> str:
+    if delta > Decimal("0"):
+        return "▲"
+    if delta < Decimal("0"):
+        return "▼"
+    return "•"
+
+
+def _render_valuation_preview(
+    *,
+    run_id: int,
+    tier_code: str,
+    round_label: str,
+    published: bool,
+    outcomes,
+) -> str:
+    """
+    Two-line-per-driver Discord-safe layout (see CLAUDE.md §5). Mirrors
+    what the public `/market view` will render in Phase 3.
+    """
+    header = _preview_header(run_id, tier_code, round_label, published)
+    body_lines: list[str] = []
+    for v in outcomes:
+        body_lines.extend(_preview_body_lines(
+            rank=v.rank_in_tier,
+            name=v.display_name,
+            market_value=v.market_value,
+            delta=v.delta,
+            capped=v.capped,
+        ))
+    return _join_preview(header, body_lines, run_id, published, len(outcomes))
+
+
+def _render_valuation_preview_from_rows(
+    *,
+    run_id: int,
+    tier_code: str,
+    round_label: str,
+    published: bool,
+    rows,
+) -> str:
+    header = _preview_header(run_id, tier_code, round_label, published)
+    body_lines: list[str] = []
+    for row in rows:
+        body_lines.extend(_preview_body_lines(
+            rank=row["rank_in_tier"],
+            name=row["display_name"],
+            market_value=row["market_value"],
+            delta=row["delta"],
+            capped=row["capped"],
+        ))
+    return _join_preview(header, body_lines, run_id, published, len(rows))
+
+
+def _preview_header(run_id: int, tier_code: str, round_label: str, published: bool) -> str:
+    status = "🟢 PUBLISHED" if published else "⚪ DRY-RUN"
+    return (
+        f"**Valuation run `{run_id}` — {tier_code} · {round_label}**  {status}"
+    )
+
+
+def _preview_body_lines(
+    *,
+    rank: int,
+    name: str,
+    market_value: Decimal,
+    delta: Decimal,
+    capped: bool,
+) -> list[str]:
+    cap_flag = "  ⚠ capped" if capped else ""
+    return [
+        f"{rank}. {name}",
+        f"   Market: {format_money(market_value)}  |  "
+        f"Week: {_delta_arrow(delta)} {format_pl(delta)}{cap_flag}",
+    ]
+
+
+def _join_preview(
+    header: str,
+    body_lines: list[str],
+    run_id: int,
+    published: bool,
+    total_drivers: int,
+) -> str:
+    # Discord content limit is 2000 chars; leave headroom for the tail.
+    max_body_lines = 40  # ~20 drivers at 2 lines each
+    truncated = False
+    if len(body_lines) > max_body_lines:
+        body_lines = body_lines[:max_body_lines]
+        truncated = True
+    tail_bits: list[str] = []
+    if truncated:
+        tail_bits.append(f"…truncated. {total_drivers} drivers total.")
+    if not published:
+        tail_bits.append(
+            f"Preview only. To lock in: `/market-admin valuation publish run_id: {run_id}`."
+        )
+    tail = ("\n" + "\n".join(tail_bits)) if tail_bits else ""
+    return header + "\n" + "\n".join(body_lines) + tail
 
 
 class _ConfigModal(discord.ui.Modal):
