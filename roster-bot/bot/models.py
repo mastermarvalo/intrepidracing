@@ -158,6 +158,43 @@ class LedgerEntry:
 
 
 @dataclass
+class Trade:
+    id: int
+    season_id: int
+    proposing_team_id: int
+    other_team_id: int
+    proposed_by: int
+    state: str
+    expires_at: datetime
+    message: str | None = None
+    resolved_at: datetime | None = None
+    resolved_by: int | None = None
+    thread_id: int | None = None
+    approved_ref: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
+class TradeItem:
+    trade_id: int
+    from_team_id: int
+    contract_id: int
+
+
+@dataclass
+class DeadMoneyEntry:
+    id: int
+    season_id: int
+    tier_id: int
+    team_id: int
+    amount: Decimal
+    source_contract_id: int | None = None
+    note: str | None = None
+    actor_id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
 class MarketBoard:
     id: int
     season_id: int

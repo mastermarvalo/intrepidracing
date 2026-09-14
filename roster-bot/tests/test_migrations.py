@@ -45,6 +45,9 @@ async def test_fresh_db_all_migrations_apply(pg_conn):
     # Phase 4 additions
     assert {"contracts", "contract_offers", "contract_ledger"} <= tables
     assert "008_contracts_and_offers.sql" in applied
+    # Phase 5 additions
+    assert {"trades", "trade_items", "dead_money", "trade_states"} <= tables
+    assert "009_trades_and_dead_money.sql" in applied
 
 
 async def test_phase2_migration_upgrades_a_phase1_db(pg_conn):

@@ -378,13 +378,31 @@ async def commissioner_approve(
     value_at_signing: Decimal | None,
 ) -> ApprovalResult:
     """
-    Convert an accepted offer into an ACTIVE contract row and mark
-    the offer approved. `value_at_signing` should be the driver's
-    latest published market value (or None) — the caller fetches it.
+    Convert an accepted offer into an active contract. Dispatches on
+    offer_kind:
+      * `new` and `trade_and_sign` → create a fresh contracts row.
+      * `extension` → find the existing active contract for
+        (driver, team) and update its terms in place, per CLAUDE.md
+        §2 rule 6 ("Contract Value resets only on
+        extension/renegotiation"). If no active contract exists to
+        extend, raises TransitionError — extension is not a signing
+        path.
     """
     offer = await _load_open_offer(conn, offer_id)
     _require_state(offer, {"pending_approval"})
 
+    if offer.offer_kind == "extension":
+        return await _approve_extension(
+            conn, offer, actor_id=actor_id, value_at_signing=value_at_signing,
+        )
+    return await _approve_new_signing(
+        conn, offer, actor_id=actor_id, value_at_signing=value_at_signing,
+    )
+
+
+async def _approve_new_signing(
+    conn, offer, *, actor_id: int, value_at_signing: Decimal | None,
+) -> ApprovalResult:
     # Snapshot contract terms from the offer. Terms are immutable
     # once accepted — see CLAUDE.md §8 invariant.
     external_ref = _external_ref(offer)
@@ -405,7 +423,7 @@ async def commissioner_approve(
         external_ref=external_ref,
     )
     await queries.update_offer_state(
-        conn, offer_id,
+        conn, offer.id,
         new_state="approved",
         resolved_by=actor_id, resolved_at=_now(),
     )
@@ -413,17 +431,17 @@ async def commissioner_approve(
         conn,
         season_id=offer.season_id, tier_id=offer.tier_id,
         driver_id=offer.driver_id, team_id=offer.team_id,
-        offer_id=offer_id, contract_id=contract_id,
+        offer_id=offer.id, contract_id=contract_id,
         kind="offer_approved",
         amount=offer.salary,
-        detail={"external_ref": external_ref},
+        detail={"external_ref": external_ref, "path": "new_signing"},
         actor_id=actor_id,
     )
     await queries.append_ledger(
         conn,
         season_id=offer.season_id, tier_id=offer.tier_id,
         driver_id=offer.driver_id, team_id=offer.team_id,
-        offer_id=offer_id, contract_id=contract_id,
+        offer_id=offer.id, contract_id=contract_id,
         kind="contract_signed",
         amount=offer.salary,
         detail={
@@ -438,6 +456,64 @@ async def commissioner_approve(
         actor_id=actor_id,
     )
     return ApprovalResult(contract_id=contract_id, external_ref=external_ref)
+
+
+async def _approve_extension(
+    conn, offer, *, actor_id: int, value_at_signing: Decimal | None,
+) -> ApprovalResult:
+    existing = await queries.fetch_active_contract_for_driver(
+        conn, offer.driver_id
+    )
+    if existing is None or existing.team_id != offer.team_id:
+        raise TransitionError(
+            f"Cannot extend offer {offer.id}: driver has no active "
+            "contract with this team. Use a new-signing offer instead."
+        )
+    old_value = existing.contract_value
+    old_term = existing.term_seasons
+    await queries.update_contract_terms(
+        conn, existing.id,
+        contract_value=offer.salary,
+        term_seasons=offer.term_seasons,
+        signing_bonus=offer.signing_bonus,
+    )
+    await queries.update_offer_state(
+        conn, offer.id,
+        new_state="approved",
+        resolved_by=actor_id, resolved_at=_now(),
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=offer.season_id, tier_id=offer.tier_id,
+        driver_id=offer.driver_id, team_id=offer.team_id,
+        offer_id=offer.id, contract_id=existing.id,
+        kind="offer_approved",
+        amount=offer.salary,
+        detail={"external_ref": existing.external_ref, "path": "extension"},
+        actor_id=actor_id,
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=offer.season_id, tier_id=offer.tier_id,
+        driver_id=offer.driver_id, team_id=offer.team_id,
+        offer_id=offer.id, contract_id=existing.id,
+        kind="contract_extended",
+        amount=offer.salary,
+        detail={
+            "old_contract_value": str(old_value),
+            "old_term_seasons": old_term,
+            "new_contract_value": str(offer.salary),
+            "new_term_seasons": offer.term_seasons,
+            "value_at_signing": (
+                str(value_at_signing) if value_at_signing is not None else None
+            ),
+        },
+        actor_id=actor_id,
+    )
+    return ApprovalResult(
+        contract_id=existing.id,
+        external_ref=existing.external_ref or _external_ref(offer),
+    )
 
 
 async def commissioner_reject(
@@ -491,6 +567,484 @@ async def void_contract(
         detail={"note": note},
         actor_id=actor_id,
     )
+
+
+# ── Phase 5: release / buyout / trades / promotion ──────────────────
+
+
+async def release_contract(
+    conn: asyncpg.Connection,
+    contract_id: int,
+    *,
+    actor_id: int,
+    market_value_at_release: Decimal | None,
+    note: str | None = None,
+) -> None:
+    """
+    End an active contract. `market_value_at_release` is captured in
+    the ledger detail so the driver's frozen P/L (market − contract)
+    is preserved even after future market moves.
+    """
+    contract = await queries.fetch_contract_by_id(conn, contract_id)
+    if contract is None:
+        raise TransitionError(f"No contract with id {contract_id}")
+    if contract.state != "active":
+        raise TransitionError(
+            f"Contract {contract_id} is `{contract.state}`, not `active`."
+        )
+    # Refuse if the contract is caught up in an open trade — that
+    # trade would silently break if the underlying contract vanished.
+    in_trade = await queries.fetch_trade_involves_contract(conn, contract_id)
+    if in_trade is not None:
+        raise TransitionError(
+            f"Contract {contract_id} is part of open trade {in_trade.id}. "
+            "Withdraw or resolve the trade first."
+        )
+    await queries.terminate_contract(conn, contract_id, state="terminated")
+    pl_at_release = (
+        (market_value_at_release - contract.contract_value)
+        if market_value_at_release is not None else None
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=contract.season_id, tier_id=contract.tier_id,
+        driver_id=contract.driver_id, team_id=contract.team_id,
+        contract_id=contract_id,
+        kind="release",
+        amount=contract.contract_value,
+        detail={
+            "note": note,
+            "market_value_at_release": (
+                str(market_value_at_release)
+                if market_value_at_release is not None else None
+            ),
+            "contract_value": str(contract.contract_value),
+            "pl_at_release": (
+                str(pl_at_release) if pl_at_release is not None else None
+            ),
+        },
+        actor_id=actor_id,
+    )
+
+
+async def buyout_contract(
+    conn: asyncpg.Connection,
+    contract_id: int,
+    *,
+    actor_id: int,
+    buyout_amount: Decimal,
+    market_value_at_release: Decimal | None,
+    note: str | None = None,
+) -> None:
+    """
+    Buy out a contract: release it AND leave a dead-money row on the
+    team's books for the season. Cap enforcement counts dead_money
+    via `queries.fetch_team_effective_payroll`.
+    """
+    contract = await queries.fetch_contract_by_id(conn, contract_id)
+    if contract is None:
+        raise TransitionError(f"No contract with id {contract_id}")
+    if contract.state != "active":
+        raise TransitionError(
+            f"Contract {contract_id} is `{contract.state}`, not `active`."
+        )
+    if buyout_amount < _ZERO:
+        raise TransitionError("Buyout amount cannot be negative.")
+    in_trade = await queries.fetch_trade_involves_contract(conn, contract_id)
+    if in_trade is not None:
+        raise TransitionError(
+            f"Contract {contract_id} is part of open trade {in_trade.id}. "
+            "Withdraw or resolve the trade first."
+        )
+
+    await queries.terminate_contract(conn, contract_id, state="terminated")
+    dead_id = await queries.insert_dead_money(
+        conn,
+        season_id=contract.season_id,
+        tier_id=contract.tier_id,
+        team_id=contract.team_id,
+        amount=buyout_amount,
+        source_contract_id=contract_id,
+        note=note,
+        actor_id=actor_id,
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=contract.season_id, tier_id=contract.tier_id,
+        driver_id=contract.driver_id, team_id=contract.team_id,
+        contract_id=contract_id,
+        kind="buyout",
+        amount=buyout_amount,
+        detail={
+            "note": note,
+            "buyout_amount": str(buyout_amount),
+            "contract_value": str(contract.contract_value),
+            "dead_money_id": dead_id,
+            "market_value_at_release": (
+                str(market_value_at_release)
+                if market_value_at_release is not None else None
+            ),
+        },
+        actor_id=actor_id,
+    )
+
+
+async def propose_trade(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    proposing_team_id: int,
+    other_team_id: int,
+    proposed_by: int,
+    items: list[tuple[int, int]],   # (from_team_id, contract_id) pairs
+    message: str | None,
+    ttl_hours: int,
+) -> int:
+    """
+    Create a trade in `pending_other` state. `items` is the list of
+    contracts moving — at least one from each side to be a valid
+    swap. Phase 5 MVP does 1-for-1, but the schema accepts any
+    number of items.
+    """
+    if proposing_team_id == other_team_id:
+        raise TransitionError("A team cannot trade with itself.")
+    if not items:
+        raise TransitionError("A trade must move at least one contract.")
+
+    valid_teams = {proposing_team_id, other_team_id}
+    for from_team_id, contract_id in items:
+        if from_team_id not in valid_teams:
+            raise TransitionError(
+                f"Trade item contract {contract_id}: from_team_id "
+                f"{from_team_id} is not one of the two trading teams."
+            )
+        contract = await queries.fetch_contract_by_id(conn, contract_id)
+        if contract is None:
+            raise TransitionError(f"No contract with id {contract_id}.")
+        if contract.state != "active":
+            raise TransitionError(
+                f"Contract {contract_id} is `{contract.state}`, not `active`."
+            )
+        if contract.team_id != from_team_id:
+            raise TransitionError(
+                f"Contract {contract_id} is owned by team {contract.team_id}, "
+                f"not {from_team_id}."
+            )
+
+    expires_at = _now() + timedelta(hours=ttl_hours)
+    trade_id = await queries.insert_trade(
+        conn,
+        season_id=season_id,
+        proposing_team_id=proposing_team_id,
+        other_team_id=other_team_id,
+        proposed_by=proposed_by,
+        state="pending_other",
+        message=message,
+        expires_at=expires_at,
+    )
+    for from_team_id, contract_id in items:
+        await queries.insert_trade_item(
+            conn, trade_id, from_team_id=from_team_id, contract_id=contract_id,
+        )
+    # Ledger entry per trading team so the audit rows show up on
+    # both cap sheets.
+    for team_id in (proposing_team_id, other_team_id):
+        await queries.append_ledger(
+            conn,
+            season_id=season_id,
+            tier_id=(await queries.fetch_contract_by_id(conn, items[0][1])).tier_id,
+            team_id=team_id,
+            kind="trade",
+            detail={
+                "trade_id": trade_id,
+                "event": "proposed",
+                "proposing_team_id": proposing_team_id,
+                "other_team_id": other_team_id,
+                "items": [
+                    {"from_team_id": ft, "contract_id": cid}
+                    for ft, cid in items
+                ],
+            },
+            actor_id=proposed_by,
+        )
+    return trade_id
+
+
+async def accept_trade(
+    conn: asyncpg.Connection, trade_id: int, *, actor_id: int
+) -> None:
+    trade = await _load_open_trade(conn, trade_id)
+    _require_trade_state(trade, {"pending_other"})
+    await queries.update_trade_state(
+        conn, trade_id,
+        new_state="pending_approval",
+        resolved_by=actor_id, resolved_at=_now(),
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=trade.season_id,
+        tier_id=(await _first_item_tier(conn, trade_id)),
+        team_id=trade.other_team_id,
+        kind="trade",
+        detail={"trade_id": trade_id, "event": "accepted"},
+        actor_id=actor_id,
+    )
+
+
+async def decline_trade(
+    conn: asyncpg.Connection, trade_id: int, *, actor_id: int, note: str | None = None
+) -> None:
+    trade = await _load_open_trade(conn, trade_id)
+    _require_trade_state(trade, {"pending_other"})
+    await queries.update_trade_state(
+        conn, trade_id,
+        new_state="declined",
+        resolved_by=actor_id, resolved_at=_now(),
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=trade.season_id,
+        tier_id=(await _first_item_tier(conn, trade_id)),
+        team_id=trade.other_team_id,
+        kind="trade",
+        detail={"trade_id": trade_id, "event": "declined", "note": note},
+        actor_id=actor_id,
+    )
+
+
+async def withdraw_trade(
+    conn: asyncpg.Connection, trade_id: int, *, actor_id: int
+) -> None:
+    trade = await _load_open_trade(conn, trade_id)
+    _require_trade_state(trade, {"draft", "pending_other", "accepted"})
+    await queries.update_trade_state(
+        conn, trade_id,
+        new_state="withdrawn",
+        resolved_by=actor_id, resolved_at=_now(),
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=trade.season_id,
+        tier_id=(await _first_item_tier(conn, trade_id)),
+        team_id=trade.proposing_team_id,
+        kind="trade",
+        detail={"trade_id": trade_id, "event": "withdrawn"},
+        actor_id=actor_id,
+    )
+
+
+async def expire_trade(conn: asyncpg.Connection, trade_id: int) -> bool:
+    trade = await queries.fetch_trade_by_id(conn, trade_id)
+    if trade is None or trade.state not in queries.OPEN_TRADE_STATES:
+        return False
+    await queries.update_trade_state(
+        conn, trade_id,
+        new_state="expired",
+        resolved_by=None, resolved_at=_now(),
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=trade.season_id,
+        tier_id=(await _first_item_tier(conn, trade_id)),
+        team_id=trade.proposing_team_id,
+        kind="trade",
+        detail={
+            "trade_id": trade_id, "event": "expired",
+            "expires_at": trade.expires_at.isoformat(),
+        },
+        actor_id=None,
+    )
+    return True
+
+
+async def expire_all_past_ttl_trades(conn: asyncpg.Connection) -> int:
+    expired = await queries.fetch_expired_open_trades(conn, _now())
+    count = 0
+    for trade in expired:
+        if await expire_trade(conn, trade.id):
+            count += 1
+    return count
+
+
+async def commissioner_approve_trade(
+    conn: asyncpg.Connection, trade_id: int, *, actor_id: int
+) -> None:
+    """
+    Execute a trade: for each item, move the contract's team_id to
+    the opposite team. contract_value is untouched (CLAUDE.md §2
+    rule 6). Contract's tier_id follows its new team's tier only if
+    the new team's driver's tier differs — Phase 5 MVP holds trades
+    within a single tier, so tier_id is not rewritten here; use
+    /market-admin promote/relegate for cross-tier moves before
+    proposing a trade.
+    """
+    trade = await _load_open_trade(conn, trade_id)
+    _require_trade_state(trade, {"pending_approval"})
+    items = await queries.fetch_trade_items(conn, trade_id)
+
+    approved_ref = f"TR-S{trade.season_id}-{trade.id:04d}"
+    for item in items:
+        new_team_id = (
+            trade.other_team_id if item.from_team_id == trade.proposing_team_id
+            else trade.proposing_team_id
+        )
+        contract = await queries.fetch_contract_by_id(conn, item.contract_id)
+        if contract is None or contract.state != "active":
+            raise TransitionError(
+                f"Contract {item.contract_id} is no longer active — trade "
+                "cannot be approved."
+            )
+        await queries.transfer_contract(
+            conn, item.contract_id, new_team_id=new_team_id,
+        )
+        await queries.append_ledger(
+            conn,
+            season_id=trade.season_id, tier_id=contract.tier_id,
+            driver_id=contract.driver_id,
+            team_id=new_team_id,
+            contract_id=item.contract_id,
+            kind="trade",
+            amount=contract.contract_value,
+            detail={
+                "trade_id": trade_id,
+                "event": "contract_transferred",
+                "from_team_id": item.from_team_id,
+                "to_team_id": new_team_id,
+                "contract_value": str(contract.contract_value),
+                "approved_ref": approved_ref,
+            },
+            actor_id=actor_id,
+        )
+
+    await queries.update_trade_state(
+        conn, trade_id,
+        new_state="approved",
+        resolved_by=actor_id, resolved_at=_now(),
+        approved_ref=approved_ref,
+    )
+
+
+async def commissioner_reject_trade(
+    conn: asyncpg.Connection, trade_id: int, *,
+    actor_id: int, note: str | None = None,
+) -> None:
+    trade = await _load_open_trade(conn, trade_id)
+    _require_trade_state(trade, {"pending_approval"})
+    await queries.update_trade_state(
+        conn, trade_id,
+        new_state="rejected",
+        resolved_by=actor_id, resolved_at=_now(),
+    )
+    await queries.append_ledger(
+        conn,
+        season_id=trade.season_id,
+        tier_id=(await _first_item_tier(conn, trade_id)),
+        team_id=trade.proposing_team_id,
+        kind="trade",
+        detail={"trade_id": trade_id, "event": "rejected", "note": note},
+        actor_id=actor_id,
+    )
+
+
+async def move_driver_between_tiers(
+    conn: asyncpg.Connection,
+    driver_id: int,
+    *,
+    new_tier_id: int,
+    actor_id: int,
+    note: str | None = None,
+) -> None:
+    """
+    Promotion/relegation. Moves the driver to `new_tier_id` and moves
+    the driver's active contract (if any) to the same tier. Writes a
+    ledger entry with old→new tier ids.
+    """
+    driver_row = await conn.fetchrow(
+        "SELECT id, season_id, tier_id, display_name FROM drivers WHERE id = $1",
+        driver_id,
+    )
+    if driver_row is None:
+        raise TransitionError(f"No driver with id {driver_id}")
+    old_tier_id = driver_row["tier_id"]
+    if old_tier_id == new_tier_id:
+        raise TransitionError(
+            f"Driver {driver_id} is already in tier {new_tier_id}."
+        )
+
+    await queries.set_driver_tier(conn, driver_id, new_tier_id)
+    active = await queries.fetch_active_contract_for_driver(conn, driver_id)
+    if active is not None:
+        await queries.transfer_contract(
+            conn, active.id,
+            new_team_id=active.team_id, new_tier_id=new_tier_id,
+        )
+
+    await queries.append_ledger(
+        conn,
+        season_id=driver_row["season_id"],
+        tier_id=new_tier_id,
+        driver_id=driver_id,
+        team_id=active.team_id if active is not None else None,
+        contract_id=active.id if active is not None else None,
+        kind="status_change",
+        detail={
+            "event": "tier_change",
+            "from_tier_id": old_tier_id,
+            "to_tier_id": new_tier_id,
+            "note": note,
+            "moved_contract_id": active.id if active is not None else None,
+        },
+        actor_id=actor_id,
+    )
+
+
+# ── trade helpers ───────────────────────────────────────────────────
+
+
+_TERMINAL_TRADE_STATES = {"approved", "rejected", "declined", "withdrawn", "expired"}
+
+
+async def _load_open_trade(conn, trade_id: int):
+    trade = await queries.fetch_trade_by_id(conn, trade_id)
+    if trade is None:
+        raise TransitionError(f"No trade with id {trade_id}")
+    if trade.state not in _TERMINAL_TRADE_STATES and trade.expires_at <= _now():
+        await expire_trade(conn, trade_id)
+        raise TransitionError(
+            f"Trade {trade_id} has expired (past TTL)."
+        )
+    return trade
+
+
+def _require_trade_state(trade, allowed: set[str]) -> None:
+    if trade.state not in allowed:
+        raise TransitionError(
+            f"Trade {trade.id} is in state `{trade.state}`; "
+            f"allowed here: {sorted(allowed)}."
+        )
+
+
+async def _first_item_tier(conn, trade_id: int) -> int:
+    """
+    Trades don't carry their own tier_id — pick one from any item so
+    the ledger row has something sensible for tier-scoped views.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT c.tier_id
+        FROM trade_items ti
+        JOIN contracts c ON c.id = ti.contract_id
+        WHERE ti.trade_id = $1
+        LIMIT 1
+        """,
+        trade_id,
+    )
+    if row is None:
+        # Trade with no items (shouldn't happen but keep the ledger
+        # write from crashing) — 0 is not a valid tier_id anywhere,
+        # but the FK will reject and the caller will see the error.
+        return 0
+    return row["tier_id"]
 
 
 # ── internals ─────────────────────────────────────────────────────────

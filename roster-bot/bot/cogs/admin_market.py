@@ -28,8 +28,14 @@ Phase 4 surface:
   /market-admin set-status driver:<@member> status:<code>
   /market-admin adjust-cap team:<key> delta:<amount> [note]
 
-Later phases add trade/release/rollover surfaces. This module is
-`/market-admin` only; public /market is Phase 3, /contract is Phase 4.
+Phase 5 surface:
+  /market-admin promote driver:<@member> new_tier:<code> [note]
+  /market-admin relegate driver:<@member> new_tier:<code> [note]
+  /market-admin approve-trade trade_id:<id>
+  /market-admin reject-trade trade_id:<id> [note]
+
+This module is `/market-admin` only; public /market is Phase 3,
+/contract is Phase 4, /trade is Phase 5.
 
 Authority: Manage Server (mirrors `_is_admin` in cogs/roster.py). A
 commissioner role assigned via `/market-admin config role commissioner`
@@ -1273,6 +1279,204 @@ class AdminMarketCog(commands.Cog):
             f"Note: {note}\n"
             "*(Phase 4 records this in the ledger only; enforcement lands in Phase 5.)*",
             ephemeral=True,
+        )
+
+    # ── /market-admin promote | relegate | trade approval ────────────────
+
+    @admin.command(name="promote", description="Move a driver to a higher tier")
+    @app_commands.describe(
+        driver="Driver's Discord account",
+        new_tier="Tier code the driver moves to",
+        note="Optional note for the audit ledger",
+    )
+    async def admin_promote(
+        self,
+        interaction: discord.Interaction,
+        driver: discord.Member,
+        new_tier: str,
+        note: str | None = None,
+    ) -> None:
+        await self._move_between_tiers(interaction, driver, new_tier, note)
+
+    @admin.command(name="relegate", description="Move a driver to a lower tier")
+    @app_commands.describe(
+        driver="Driver's Discord account",
+        new_tier="Tier code the driver moves to",
+        note="Optional note for the audit ledger",
+    )
+    async def admin_relegate(
+        self,
+        interaction: discord.Interaction,
+        driver: discord.Member,
+        new_tier: str,
+        note: str | None = None,
+    ) -> None:
+        await self._move_between_tiers(interaction, driver, new_tier, note)
+
+    async def _move_between_tiers(
+        self,
+        interaction: discord.Interaction,
+        driver: discord.Member,
+        new_tier: str,
+        note: str | None,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.response.send_message(
+                    "No active season.", ephemeral=True
+                )
+                return
+            new_tier_row = await queries.fetch_tier(conn, season.id, new_tier)
+            if new_tier_row is None:
+                await interaction.response.send_message(
+                    f"No tier `{new_tier}` in **{season.name}**.",
+                    ephemeral=True,
+                )
+                return
+            driver_row = await queries.fetch_driver_by_member(
+                conn, season.id, driver.id
+            )
+            if driver_row is None:
+                await interaction.response.send_message(
+                    f"{driver.display_name} isn't registered as a driver.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                await contracts_service.move_driver_between_tiers(
+                    conn, driver_row.id,
+                    new_tier_id=new_tier_row.id,
+                    actor_id=interaction.user.id,
+                    note=note,
+                )
+            except contracts_service.TransitionError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"✅ Moved {driver.display_name} to tier `{new_tier}`. "
+            "The driver's active contract (if any) moved with them; "
+            "the next valuation run will re-rank in the new tier.",
+            ephemeral=True,
+        )
+
+    @admin.command(
+        name="approve-trade",
+        description="Approve an accepted trade → execute contract transfers",
+    )
+    @app_commands.describe(trade_id="Trade id (state must be pending_approval)")
+    async def admin_approve_trade(
+        self, interaction: discord.Interaction, trade_id: int
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild is not None and interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            trade = await queries.fetch_trade_by_id(conn, trade_id)
+            if trade is None:
+                await interaction.followup.send(
+                    f"No trade `{trade_id}`.", ephemeral=True
+                )
+                return
+            try:
+                await contracts_service.commissioner_approve_trade(
+                    conn, trade_id, actor_id=interaction.user.id
+                )
+            except contracts_service.TransitionError as exc:
+                await interaction.followup.send(str(exc), ephemeral=True)
+                return
+            items = await queries.fetch_trade_items(conn, trade_id)
+            # Fetch team + driver info for role swaps.
+            role_ops: list[tuple[int, int, int]] = []  # (member_id, old_team_id, new_team_id)
+            for item in items:
+                contract = await queries.fetch_contract_by_id(conn, item.contract_id)
+                if contract is None:
+                    continue
+                driver_row = await conn.fetchrow(
+                    "SELECT member_id FROM drivers WHERE id = $1",
+                    contract.driver_id,
+                )
+                if driver_row is None:
+                    continue
+                new_team_id = contract.team_id  # already updated by approve
+                role_ops.append(
+                    (driver_row["member_id"], item.from_team_id, new_team_id)
+                )
+            teams_by_id: dict[int, object] = {}
+            for _, old_id, new_id in role_ops:
+                for tid in (old_id, new_id):
+                    if tid not in teams_by_id:
+                        teams_by_id[tid] = await queries.fetch_team_by_id(conn, tid)
+
+        # Role swaps outside the DB transaction; failures are logged
+        # and reported but do not undo the trade — the money side is
+        # authoritative.
+        role_warnings: list[str] = []
+        for member_id, old_team_id, new_team_id in role_ops:
+            member = interaction.guild.get_member(member_id)
+            if member is None:
+                role_warnings.append(
+                    f"member {member_id} not in guild — role not swapped"
+                )
+                continue
+            old_team = teams_by_id.get(old_team_id)
+            new_team = teams_by_id.get(new_team_id)
+            try:
+                if old_team is not None:
+                    await roster_ops.drop_from_team(
+                        guild=interaction.guild, member=member, team=old_team,
+                        actor=interaction.user,
+                        reason=f"Trade {trade_id} — leaving {old_team.name}",
+                    )
+                if new_team is not None:
+                    await roster_ops.sign_to_team(
+                        guild=interaction.guild, member=member, team=new_team,
+                        actor=interaction.user,
+                        reason=f"Trade {trade_id} — joining {new_team.name}",
+                    )
+            except roster_ops.RoleAssignmentError as exc:
+                role_warnings.append(str(exc))
+
+        tail = ""
+        if role_warnings:
+            tail = "\n⚠ Role swaps had issues:\n" + "\n".join(
+                f"• {w}" for w in role_warnings
+            )
+        await interaction.followup.send(
+            f"✅ Approved trade `{trade_id}`. Contracts transferred; "
+            f"cap sheets refresh next `/market team` or board update.{tail}",
+            ephemeral=True,
+        )
+
+    @admin.command(name="reject-trade", description="Reject an accepted trade")
+    @app_commands.describe(
+        trade_id="Trade id (state must be pending_approval)",
+        note="Optional note for the audit log",
+    )
+    async def admin_reject_trade(
+        self,
+        interaction: discord.Interaction,
+        trade_id: int,
+        note: str | None = None,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        async with db.connect() as conn:
+            try:
+                await contracts_service.commissioner_reject_trade(
+                    conn, trade_id,
+                    actor_id=interaction.user.id, note=note,
+                )
+            except contracts_service.TransitionError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"✅ Rejected trade `{trade_id}`.", ephemeral=True
         )
 
 

@@ -132,11 +132,14 @@ class EventsCog(commands.Cog):
         # sitting past their expiry.
         try:
             async with db.connect() as conn:
-                expired_count = await contracts_service.expire_all_past_ttl(conn)
-            if expired_count:
-                log.info("Poll: expired %d offer(s)", expired_count)
+                expired_offers = await contracts_service.expire_all_past_ttl(conn)
+                expired_trades = await contracts_service.expire_all_past_ttl_trades(conn)
+            if expired_offers:
+                log.info("Poll: expired %d offer(s)", expired_offers)
+            if expired_trades:
+                log.info("Poll: expired %d trade(s)", expired_trades)
         except Exception:
-            log.exception("Poll: offer expiry sweep failed")
+            log.exception("Poll: expiry sweep failed")
 
         _snapshots_initialized = True
         log.debug("Poll: done")

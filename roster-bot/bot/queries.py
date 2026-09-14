@@ -15,6 +15,7 @@ import asyncpg
 from bot.models import (
     Contract,
     ContractOffer,
+    DeadMoneyEntry,
     Driver,
     GuildConfig,
     LeagueConfig,
@@ -25,6 +26,8 @@ from bot.models import (
     Team,
     TeamSlot,
     Tier,
+    Trade,
+    TradeItem,
 )
 
 
@@ -1584,3 +1587,330 @@ async def fetch_ledger_for_contract(
         contract_id,
     )
     return [_row_to_ledger(r) for r in rows]
+
+
+# ── contract lifecycle helpers (Phase 5) ─────────────────────────────────────
+
+
+async def update_contract_terms(
+    conn: asyncpg.Connection,
+    contract_id: int,
+    *,
+    contract_value: Decimal,
+    term_seasons: int,
+    signing_bonus: Decimal,
+) -> None:
+    """
+    Extension path: overwrite the money terms on an ACTIVE contract in
+    place. The contracts table has no dedicated "history of terms"
+    column, but every change is captured in the ledger (kind =
+    'contract_extended'), so the audit trail is intact even without
+    versioning the row.
+    """
+    await conn.execute(
+        """
+        UPDATE contracts
+        SET contract_value = $1, term_seasons = $2, signing_bonus = $3
+        WHERE id = $4 AND state = 'active'
+        """,
+        contract_value, term_seasons, signing_bonus, contract_id,
+    )
+
+
+async def terminate_contract(
+    conn: asyncpg.Connection, contract_id: int, *, state: str = "terminated"
+) -> None:
+    """
+    Release path: flip an ACTIVE contract's state to `terminated`
+    (or `expired`) and stamp voided_at. The caller writes the ledger
+    entry that captures why.
+    """
+    await conn.execute(
+        """
+        UPDATE contracts
+        SET state = $1, voided_at = NOW()
+        WHERE id = $2 AND state = 'active'
+        """,
+        state, contract_id,
+    )
+
+
+async def transfer_contract(
+    conn: asyncpg.Connection,
+    contract_id: int,
+    *,
+    new_team_id: int,
+    new_tier_id: int | None = None,
+) -> None:
+    """
+    Trade path: move the contract to a different team without
+    touching contract_value (CLAUDE.md §2 rule 6). Optionally moves
+    tier as well (promote/relegate uses this same helper).
+    """
+    if new_tier_id is None:
+        await conn.execute(
+            "UPDATE contracts SET team_id = $1 WHERE id = $2 AND state = 'active'",
+            new_team_id, contract_id,
+        )
+    else:
+        await conn.execute(
+            """
+            UPDATE contracts SET team_id = $1, tier_id = $2
+            WHERE id = $3 AND state = 'active'
+            """,
+            new_team_id, new_tier_id, contract_id,
+        )
+
+
+async def set_driver_tier(
+    conn: asyncpg.Connection, driver_id: int, tier_id: int
+) -> None:
+    await conn.execute(
+        "UPDATE drivers SET tier_id = $1 WHERE id = $2", tier_id, driver_id
+    )
+
+
+# ── trades (Phase 5) ─────────────────────────────────────────────────────────
+
+
+OPEN_TRADE_STATES = ("draft", "pending_other", "accepted", "pending_approval")
+
+
+def _row_to_trade(row: asyncpg.Record) -> Trade:
+    return Trade(
+        id=row["id"],
+        season_id=row["season_id"],
+        proposing_team_id=row["proposing_team_id"],
+        other_team_id=row["other_team_id"],
+        proposed_by=row["proposed_by"],
+        state=row["state"],
+        message=row["message"],
+        expires_at=row["expires_at"],
+        resolved_at=row["resolved_at"],
+        resolved_by=row["resolved_by"],
+        thread_id=row["thread_id"],
+        approved_ref=row["approved_ref"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_trade(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    proposing_team_id: int,
+    other_team_id: int,
+    proposed_by: int,
+    state: str,
+    message: str | None,
+    expires_at,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO trades
+            (season_id, proposing_team_id, other_team_id, proposed_by,
+             state, message, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
+        """,
+        season_id, proposing_team_id, other_team_id, proposed_by,
+        state, message, expires_at,
+    )
+
+
+async def insert_trade_item(
+    conn: asyncpg.Connection,
+    trade_id: int,
+    *,
+    from_team_id: int,
+    contract_id: int,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO trade_items (trade_id, from_team_id, contract_id)
+        VALUES ($1, $2, $3)
+        """,
+        trade_id, from_team_id, contract_id,
+    )
+
+
+async def fetch_trade_by_id(
+    conn: asyncpg.Connection, trade_id: int
+) -> Trade | None:
+    row = await conn.fetchrow("SELECT * FROM trades WHERE id = $1", trade_id)
+    return _row_to_trade(row) if row else None
+
+
+async def fetch_trade_items(
+    conn: asyncpg.Connection, trade_id: int
+) -> list[TradeItem]:
+    rows = await conn.fetch(
+        "SELECT * FROM trade_items WHERE trade_id = $1 ORDER BY from_team_id",
+        trade_id,
+    )
+    return [
+        TradeItem(
+            trade_id=r["trade_id"],
+            from_team_id=r["from_team_id"],
+            contract_id=r["contract_id"],
+        )
+        for r in rows
+    ]
+
+
+async def update_trade_state(
+    conn: asyncpg.Connection,
+    trade_id: int,
+    *,
+    new_state: str,
+    resolved_by: int | None,
+    resolved_at,
+    approved_ref: str | None = None,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE trades
+        SET state = $1, resolved_by = $2, resolved_at = $3,
+            approved_ref = COALESCE($4, approved_ref)
+        WHERE id = $5
+        """,
+        new_state, resolved_by, resolved_at, approved_ref, trade_id,
+    )
+
+
+async def set_trade_thread_id(
+    conn: asyncpg.Connection, trade_id: int, thread_id: int | None
+) -> None:
+    await conn.execute(
+        "UPDATE trades SET thread_id = $1 WHERE id = $2",
+        thread_id, trade_id,
+    )
+
+
+async def fetch_open_trades_for_team(
+    conn: asyncpg.Connection, team_id: int
+) -> list[Trade]:
+    rows = await conn.fetch(
+        f"""
+        SELECT * FROM trades
+        WHERE (proposing_team_id = $1 OR other_team_id = $1)
+          AND state IN ({','.join('$' + str(i + 2) for i in range(len(OPEN_TRADE_STATES)))})
+        ORDER BY created_at DESC
+        """,
+        team_id, *OPEN_TRADE_STATES,
+    )
+    return [_row_to_trade(r) for r in rows]
+
+
+async def fetch_expired_open_trades(
+    conn: asyncpg.Connection, now
+) -> list[Trade]:
+    rows = await conn.fetch(
+        f"""
+        SELECT * FROM trades
+        WHERE expires_at <= $1
+          AND state IN ({','.join('$' + str(i + 2) for i in range(len(OPEN_TRADE_STATES)))})
+        """,
+        now, *OPEN_TRADE_STATES,
+    )
+    return [_row_to_trade(r) for r in rows]
+
+
+async def fetch_trade_involves_contract(
+    conn: asyncpg.Connection, contract_id: int
+) -> Trade | None:
+    """
+    Any open trade that references this contract. Used before allowing
+    a release/buyout/extend to avoid clobbering an in-flight trade.
+    """
+    row = await conn.fetchrow(
+        f"""
+        SELECT t.* FROM trades t
+        JOIN trade_items ti ON ti.trade_id = t.id
+        WHERE ti.contract_id = $1
+          AND t.state IN ({','.join('$' + str(i + 2) for i in range(len(OPEN_TRADE_STATES)))})
+        LIMIT 1
+        """,
+        contract_id, *OPEN_TRADE_STATES,
+    )
+    return _row_to_trade(row) if row else None
+
+
+# ── dead money (Phase 5) ─────────────────────────────────────────────────────
+
+
+def _row_to_dead_money(row: asyncpg.Record) -> DeadMoneyEntry:
+    return DeadMoneyEntry(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        team_id=row["team_id"],
+        amount=row["amount"],
+        source_contract_id=row["source_contract_id"],
+        note=row["note"],
+        actor_id=row["actor_id"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_dead_money(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    team_id: int,
+    amount: Decimal,
+    source_contract_id: int | None,
+    note: str | None,
+    actor_id: int | None,
+) -> int:
+    return await conn.fetchval(
+        """
+        INSERT INTO dead_money
+            (season_id, tier_id, team_id, amount, source_contract_id, note, actor_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
+        """,
+        season_id, tier_id, team_id, amount, source_contract_id, note, actor_id,
+    )
+
+
+async def fetch_dead_money_for_team(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> list[DeadMoneyEntry]:
+    rows = await conn.fetch(
+        """
+        SELECT * FROM dead_money
+        WHERE team_id = $1 AND season_id = $2
+        ORDER BY created_at DESC
+        """,
+        team_id, season_id,
+    )
+    return [_row_to_dead_money(r) for r in rows]
+
+
+async def fetch_dead_money_total(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> Decimal:
+    value = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+        FROM dead_money WHERE team_id = $1 AND season_id = $2
+        """,
+        team_id, season_id,
+    )
+    return value if isinstance(value, Decimal) else Decimal(value)
+
+
+async def fetch_team_effective_payroll(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> Decimal:
+    """
+    Payroll (sum of active contract_value) + dead_money for the given
+    season. THIS is the number cap enforcement measures against — the
+    cap-headroom rule in bot/contracts/rules.py takes this as
+    `team_payroll_before`.
+    """
+    payroll = await fetch_team_payroll(conn, team_id)
+    dead = await fetch_dead_money_total(conn, team_id, season_id)
+    return payroll + dead

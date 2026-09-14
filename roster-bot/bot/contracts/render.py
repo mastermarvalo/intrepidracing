@@ -217,25 +217,36 @@ def render_cap_sheet(
     salary_cap: Decimal,
     active_slots_used: int,
     active_slots_max: int,
+    dead_money: Decimal = Decimal("0"),
+    dead_money_rows: Sequence[Mapping] = (),
 ) -> discord.Embed:
     """
     /market team output. Two-line-per-driver layout with contract vs
     market value and per-driver P/L. Empty state renders as a clear
     "no active contracts" message.
+
+    `dead_money` (Phase 5) surfaces buyout residuals separately from
+    payroll so a commissioner can see why cap space is smaller than
+    the payroll line alone would explain.
     """
     embed = discord.Embed(
         title=f"Cap sheet — {team_name}",
         colour=discord.Colour(color) if color else discord.Colour.blurple(),
     )
-    cap_space = salary_cap - payroll
+    effective_payroll = payroll + dead_money
+    cap_space = salary_cap - effective_payroll
+    cap_lines = [
+        f"Cap: {format_money(salary_cap)}",
+        f"Payroll: {format_money(payroll)}",
+    ]
+    if dead_money > Decimal("0"):
+        cap_lines.append(f"Dead money: {format_money(dead_money)}")
+        cap_lines.append(f"Effective payroll: {format_money(effective_payroll)}")
+    cap_lines.append(f"Cap space: {format_money(cap_space)}")
+    cap_lines.append(f"Seats: {active_slots_used}/{active_slots_max}")
     embed.add_field(
         name="Salary cap",
-        value=_bound_lines([
-            f"Cap: {format_money(salary_cap)}",
-            f"Payroll: {format_money(payroll)}",
-            f"Cap space: {format_money(cap_space)}",
-            f"Seats: {active_slots_used}/{active_slots_max}",
-        ]),
+        value=_bound_lines(cap_lines),
         inline=False,
     )
     if not contracts_with_market:
@@ -269,8 +280,95 @@ def render_cap_sheet(
         value=_clip_field("\n".join(lines)),
         inline=False,
     )
+    if dead_money_rows:
+        dm_lines: list[str] = []
+        for row in dead_money_rows:
+            dm_lines.append(_bound(
+                f"• {format_money(row['amount'])}"
+                f"{'  · ' + row['note'] if row.get('note') else ''}"
+            ))
+        embed.add_field(
+            name="Dead money entries",
+            value=_clip_field("\n".join(dm_lines)),
+            inline=False,
+        )
     _enforce_total(embed)
     return embed
+
+
+def render_trade_review(
+    *,
+    proposing_team_name: str,
+    other_team_name: str,
+    items: Sequence[Mapping],
+    message: str | None,
+    payroll_before_proposing: Decimal,
+    payroll_after_proposing: Decimal,
+    salary_cap_proposing: Decimal,
+    payroll_before_other: Decimal,
+    payroll_after_other: Decimal,
+    salary_cap_other: Decimal,
+) -> discord.Embed:
+    """
+    Trade proposal review shown to the proposing TP (before submit)
+    and to the other TP (in the negotiation thread). Explicitly shows
+    both cap sheets so nobody accepts a trade that would blow their
+    cap unnoticed.
+    """
+    embed = discord.Embed(
+        title=f"Trade — {proposing_team_name} ↔ {other_team_name}",
+        colour=discord.Colour.blurple(),
+    )
+    to_proposing = [
+        row for row in items if row["direction"] == "to_proposing"
+    ]
+    to_other = [
+        row for row in items if row["direction"] == "to_other"
+    ]
+    embed.add_field(
+        name=f"{proposing_team_name} sends",
+        value=_clip_field(_trade_items_block(to_other) or "*nothing*"),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{other_team_name} sends",
+        value=_clip_field(_trade_items_block(to_proposing) or "*nothing*"),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{proposing_team_name} cap impact",
+        value=_bound_lines([
+            f"Payroll before: {format_money(payroll_before_proposing)}",
+            f"Payroll after:  {format_money(payroll_after_proposing)}",
+            f"Cap space after: "
+            f"{format_money(salary_cap_proposing - payroll_after_proposing)}",
+        ]),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{other_team_name} cap impact",
+        value=_bound_lines([
+            f"Payroll before: {format_money(payroll_before_other)}",
+            f"Payroll after:  {format_money(payroll_after_other)}",
+            f"Cap space after: "
+            f"{format_money(salary_cap_other - payroll_after_other)}",
+        ]),
+        inline=False,
+    )
+    if message:
+        embed.add_field(name="Note", value=_clip_field(message), inline=False)
+    _enforce_total(embed)
+    return embed
+
+
+def _trade_items_block(rows: Sequence[Mapping]) -> str:
+    lines: list[str] = []
+    for row in rows:
+        lines.append(_bound(
+            f"• {row['display_name']} — {format_money(row['contract_value'])}"
+            f" ({row['term_seasons']} yr, {row['contract_type']})"
+        ))
+    return "\n".join(lines)
 
 
 def render_pl_table(

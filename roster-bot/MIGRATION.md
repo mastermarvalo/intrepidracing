@@ -1,5 +1,24 @@
 # Upgrade & migration notes
 
+## Phase 5 (Trades, releases, buyouts)
+
+Ships migration `009_trades_and_dead_money.sql`.
+
+**What changes for the live database:**
+
+- New tables: `trade_states` (seeded inline with 9 rows), `trades`,
+  `trade_items`, `dead_money`.
+- All new tables reference existing Phase 1–4 tables; no columns
+  change on any existing table.
+- Partial unique index on `trades.expires_at` restricted to
+  non-terminal states — same pattern the Phase 4 offer index uses.
+- No data migration required.
+
+**Rollback:** dropping the four new tables reverts Phase 5 without
+touching Phase 1–4 state.
+
+---
+
 ## Phase 4 (Contracts, offers, ledger)
 
 Ships migration `008_contracts_and_offers.sql`. Applied automatically

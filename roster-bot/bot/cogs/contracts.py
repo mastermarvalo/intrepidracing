@@ -2,13 +2,17 @@
 /contract command group — TP-side offer lifecycle.
 
 Commands:
-  /contract offer     multi-stage flow (args → modal → review → submit)
-  /contract offers    my team(s)' outstanding offers
-  /contract withdraw  cancel an open offer I own
-  /contract counter   driver responds with new terms
-  /contract accept    driver accepts an offer
-  /contract decline   driver declines an offer
-  /contract status    driver's active contract + open offers + history
+  Phase 4:
+    /contract offer     multi-stage flow (args → modal → review → submit)
+    /contract offers    my team(s)' outstanding offers
+    /contract withdraw  cancel an open offer I own
+    /contract counter   driver responds with new terms
+    /contract accept    driver accepts an offer
+    /contract decline   driver declines an offer
+    /contract status    driver's active contract + open offers + history
+  Phase 5:
+    /contract release   end an active contract (frozen P/L in ledger)
+    /contract buyout    release + dead-money row against team cap
 
 Design notes:
   * CLAUDE.md §6 prescribes select-view → modal → review. Discord's
@@ -458,6 +462,149 @@ class ContractsCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── /contract release ───────────────────────────────────────────────
+
+    @contract.command(name="release", description="End an active contract")
+    @app_commands.describe(
+        contract_id="Contract id to release",
+        note="Reason (recorded in the audit ledger)",
+    )
+    async def contract_release(
+        self, interaction: discord.Interaction, contract_id: int, note: str
+    ) -> None:
+        assert interaction.guild is not None
+        async with db.connect() as conn:
+            contract = await queries.fetch_contract_by_id(conn, contract_id)
+            if contract is None:
+                await interaction.response.send_message(
+                    f"No contract `{contract_id}`.", ephemeral=True
+                )
+                return
+            team = await queries.fetch_team_by_id(conn, contract.team_id)
+            if team is None or not _authorised_for_team(interaction, team):
+                await interaction.response.send_message(
+                    "You aren't authorised to release for this team.",
+                    ephemeral=True,
+                )
+                return
+            market_value = await queries.fetch_latest_published_valuation(
+                conn, contract.driver_id
+            )
+            try:
+                await service.release_contract(
+                    conn, contract_id,
+                    actor_id=interaction.user.id,
+                    market_value_at_release=market_value,
+                    note=note,
+                )
+            except service.TransitionError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+
+            # Best-effort role drop via the shared helper. Failure is
+            # logged but does not undo the release — the money side is
+            # the authoritative record.
+            driver_row = await conn.fetchrow(
+                "SELECT member_id, display_name FROM drivers WHERE id = $1",
+                contract.driver_id,
+            )
+
+        role_note: str | None = None
+        member = interaction.guild.get_member(driver_row["member_id"])
+        if member is not None and team is not None:
+            try:
+                from bot import roster_ops
+                await roster_ops.drop_from_team(
+                    guild=interaction.guild, member=member, team=team,
+                    actor=interaction.user,
+                    reason=f"Contract {contract_id} released",
+                )
+            except Exception as exc:  # noqa: BLE001
+                role_note = f"\n⚠ Role not dropped: {exc}"
+
+        await interaction.response.send_message(
+            f"✅ Released contract `{contract_id}` "
+            f"({driver_row['display_name']}).{role_note or ''}",
+            ephemeral=True,
+        )
+
+    # ── /contract buyout ────────────────────────────────────────────────
+
+    @contract.command(name="buyout", description="Buy out an active contract")
+    @app_commands.describe(
+        contract_id="Contract id to buy out",
+        buyout_m="Buyout amount in $M (dead money against team cap this season)",
+        note="Reason (recorded in the audit ledger)",
+    )
+    async def contract_buyout(
+        self,
+        interaction: discord.Interaction,
+        contract_id: int,
+        buyout_m: str,
+        note: str,
+    ) -> None:
+        assert interaction.guild is not None
+        try:
+            buyout = Decimal(buyout_m.strip().lstrip("$").rstrip("Mm"))
+        except InvalidOperation as exc:
+            await interaction.response.send_message(
+                f"Could not parse buyout amount: {exc}", ephemeral=True
+            )
+            return
+        async with db.connect() as conn:
+            contract = await queries.fetch_contract_by_id(conn, contract_id)
+            if contract is None:
+                await interaction.response.send_message(
+                    f"No contract `{contract_id}`.", ephemeral=True
+                )
+                return
+            team = await queries.fetch_team_by_id(conn, contract.team_id)
+            if team is None or not _authorised_for_team(interaction, team):
+                await interaction.response.send_message(
+                    "You aren't authorised to buy out for this team.",
+                    ephemeral=True,
+                )
+                return
+            market_value = await queries.fetch_latest_published_valuation(
+                conn, contract.driver_id
+            )
+            try:
+                await service.buyout_contract(
+                    conn, contract_id,
+                    actor_id=interaction.user.id,
+                    buyout_amount=buyout,
+                    market_value_at_release=market_value,
+                    note=note,
+                )
+            except service.TransitionError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            driver_row = await conn.fetchrow(
+                "SELECT member_id, display_name FROM drivers WHERE id = $1",
+                contract.driver_id,
+            )
+
+        role_note: str | None = None
+        member = interaction.guild.get_member(driver_row["member_id"])
+        if member is not None and team is not None:
+            try:
+                from bot import roster_ops
+                await roster_ops.drop_from_team(
+                    guild=interaction.guild, member=member, team=team,
+                    actor=interaction.user,
+                    reason=f"Contract {contract_id} bought out",
+                )
+            except Exception as exc:  # noqa: BLE001
+                role_note = f"\n⚠ Role not dropped: {exc}"
+
+        await interaction.response.send_message(
+            f"✅ Bought out contract `{contract_id}` "
+            f"({driver_row['display_name']}) — dead money "
+            f"${buyout}M against the team cap this season."
+            f"{role_note or ''}",
+            ephemeral=True,
+        )
+
 
 # ── modals + views ─────────────────────────────────────────────────────
 
@@ -532,7 +679,9 @@ class _OfferModal(discord.ui.Modal):
                     ephemeral=True,
                 )
                 return
-            payroll_before = await queries.fetch_team_payroll(conn, self._team.id)
+            payroll_before = await queries.fetch_team_effective_payroll(
+                conn, self._team.id, self._season_id,
+            )
             slots_used = await queries.fetch_team_active_slot_count(conn, self._team.id)
             existing_contract = await queries.fetch_active_contract_for_driver(
                 conn, self._driver_row.id
@@ -765,8 +914,8 @@ class _CounterModal(discord.ui.Modal):
                     "No league_config for this scope.", ephemeral=True
                 )
                 return
-            payroll_before = await queries.fetch_team_payroll(
-                conn, self._parent.team_id
+            payroll_before = await queries.fetch_team_effective_payroll(
+                conn, self._parent.team_id, self._parent.season_id,
             )
             slots_used = await queries.fetch_team_active_slot_count(
                 conn, self._parent.team_id

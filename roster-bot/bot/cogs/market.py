@@ -183,6 +183,12 @@ class MarketCog(commands.Cog):
             payroll = await queries.fetch_team_payroll(conn, team_row.id)
             slots_used = await queries.fetch_team_active_slot_count(conn, team_row.id)
             cap_rows = await queries.fetch_team_cap_sheet_rows(conn, team_row.id)
+            dead_money_total = await queries.fetch_dead_money_total(
+                conn, team_row.id, season.id
+            )
+            dead_money_rows = await queries.fetch_dead_money_for_team(
+                conn, team_row.id, season.id
+            )
 
         embed = contract_render.render_cap_sheet(
             team_name=team_row.name,
@@ -192,6 +198,11 @@ class MarketCog(commands.Cog):
             salary_cap=cfg.salary_cap,
             active_slots_used=slots_used,
             active_slots_max=cfg.active_driver_slots,
+            dead_money=dead_money_total,
+            dead_money_rows=[
+                {"amount": r.amount, "note": r.note}
+                for r in dead_money_rows
+            ],
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 

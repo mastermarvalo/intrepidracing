@@ -123,7 +123,11 @@ phases.
 - **Phase 4** — contracts: offer → negotiate → approve cycle with cap
   enforcement, per-driver P/L, offer expiry, and an append-only ledger
   (`bot/contracts/{rules,service,render}.py`).
-- Later phases — trades, releases, buyouts, rollover.
+- **Phase 5** — trades (1-for-1 contract swaps with two-party
+  approval), release (frozen P/L in ledger), buyout (dead-money row
+  that counts against the effective cap), extension (updates the
+  existing active contract per CLAUDE.md §2 rule 6), and
+  promotion/relegation (moves driver + active contract across tiers).
 
 Every dollar amount is a `Decimal` end to end (no floats); every business
 number the league can tune (salary cap, movement caps, contract term
@@ -210,11 +214,35 @@ in Phase 3 + 4: `market`, `movers`, `dashboard`, `surplus`,
 
 | Command | Description |
 |---|---|
-| `/market-admin approve <offer_id>` | Convert an accepted offer into an active contract (creates ledger + assigns team role via the shared `/roster sign` path, posts to transactions channel) |
+| `/market-admin approve <offer_id>` | Convert an accepted offer into an active contract (extension offers update the existing contract in place; new-signing offers insert a new row). Creates ledger + assigns team role via the shared `/roster sign` path, posts to transactions channel |
 | `/market-admin reject <offer_id> [note]` | Reject an offer in `pending_approval` |
 | `/market-admin void <contract_id> [note]` | End an active contract |
 | `/market-admin set-status <@driver> <status>` | Change a driver's status (writes a `status_change` ledger entry) |
-| `/market-admin adjust-cap <team> <delta_m> <note>` | Log a cap adjustment in the ledger (audit trail only in Phase 4 — enforcement lands with trades in Phase 5) |
+| `/market-admin adjust-cap <team> <delta_m> <note>` | Log a cap adjustment in the ledger (audit trail only — enforcement is deferred) |
+| `/market-admin approve-trade <trade_id>` | Execute an accepted trade — transfers each item's contract to the receiving team, drops/re-adds Discord roles via the shared helper, writes ledger rows for both sides |
+| `/market-admin reject-trade <trade_id> [note]` | Reject an accepted trade |
+| `/market-admin promote <@driver> <new_tier> [note]` | Move a driver + their active contract to a higher tier |
+| `/market-admin relegate <@driver> <new_tier> [note]` | Move a driver + their active contract to a lower tier |
+
+### `/contract` release / buyout (Phase 5)
+
+| Command | Description |
+|---|---|
+| `/contract release <contract_id> <note>` | End an active contract; ledger captures P/L (market − contract) at release. Blocked if the contract is caught up in an open trade |
+| `/contract buyout <contract_id> <buyout_m> <note>` | Release + record a `dead_money` row for the season. Dead money counts against the team's effective cap on the next `/market team` (and in the cap headroom check on new offers) |
+
+### `/trade` (Phase 5)
+
+Team-to-team contract swaps. Phase 5 ships 1-for-1 (one contract from
+each side); the schema is multi-item ready.
+
+| Command | Who | Description |
+|---|---|---|
+| `/trade propose <my_team> <other_team> <my_contract_id> <their_contract_id> <ttl>` | Proposing TP | Creates the trade in `pending_other` state, posts to the approvals channel as a private thread with both TPs added |
+| `/trade accept <trade_id>` | Other-team TP | Move to `pending_approval` |
+| `/trade decline <trade_id> [note]` | Other-team TP | End the negotiation |
+| `/trade withdraw <trade_id>` | Proposing TP | Cancel the trade |
+| `/trade status <trade_id>` | Anyone | Full trade embed: items on each side + cap impact for both teams |
 
 ### Quick start for a new league
 
