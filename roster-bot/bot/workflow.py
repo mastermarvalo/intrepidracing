@@ -1960,8 +1960,14 @@ async def set_budget_config(
     dnf_penalty: Decimal,
     dns_penalty: Decimal,
     penalty_per_incident_pt: Decimal,
+    escrow_enabled: bool | None = None,
 ):
-    """Create or update the budget config row for the active season / tier."""
+    """
+    Create or update the budget config row for the active season / tier.
+
+    `escrow_enabled` None leaves the stored setting untouched, so a caller
+    editing rates or enforcement cannot move escrow by accident.
+    """
     for label, value in (
         ("opening_budget", opening_budget),
         ("earnings_per_point", earnings_per_point),
@@ -1994,6 +2000,7 @@ async def set_budget_config(
             dnf_penalty=dnf_penalty,
             dns_penalty=dns_penalty,
             penalty_per_incident_pt=penalty_per_incident_pt,
+            escrow_enabled=escrow_enabled,
         )
 
 
