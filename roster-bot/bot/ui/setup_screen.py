@@ -135,7 +135,7 @@ class _SeasonModal(discord.ui.Modal, title="Create a season"):
 
     def __init__(self, parent: SetupView) -> None:
         super().__init__()
-        self._parent = parent
+        self._owner = parent
         self._name = discord.ui.TextInput(
             label="Season name",
             placeholder="Season 7",
@@ -180,7 +180,7 @@ class _SeasonModal(discord.ui.Modal, title="Create a season"):
                 "\nSeeded the F1 preset: tiers `t1`/`t2`/`t3`, scoring table, "
                 "valuation factors, and the default $145.00M salary cap."
             )
-        await self._parent.reload(interaction, note=note)
+        await self._owner.reload(interaction, note=note)
 
 
 # ── tiers ────────────────────────────────────────────────────────────
@@ -189,7 +189,7 @@ class _SeasonModal(discord.ui.Modal, title="Create a season"):
 class _TierModal(discord.ui.Modal, title="Add a tier"):
     def __init__(self, parent: SetupView, *, suggested_rank: int) -> None:
         super().__init__()
-        self._parent = parent
+        self._owner = parent
         self._code = discord.ui.TextInput(
             label="Code — short, used in commands",
             placeholder="t1",
@@ -250,7 +250,7 @@ class _TierModal(discord.ui.Modal, title="Add a tier"):
             await report_error(interaction, str(exc))
             return
 
-        await self._parent.reload(
+        await self._owner.reload(
             interaction,
             note=(
                 f"✅ Tier `{code}` added. To link a Discord role to it, press "
@@ -1030,7 +1030,7 @@ class _FreeAgencyToggle(discord.ui.Button):
                 else discord.ButtonStyle.success
             ),
         )
-        self._parent = view
+        self._owner = view
         self._current = is_open
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -1042,7 +1042,7 @@ class _FreeAgencyToggle(discord.ui.Button):
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
-        await self._parent.render(interaction)
+        await self._owner.render(interaction)
         await interaction.followup.send(
             "✅ Free agency " + ("opened." if not self._current else "closed."),
             ephemeral=True,
@@ -1134,12 +1134,12 @@ class _AdjustCapSelect(discord.ui.Select):
                 for t in teams[:SELECT_MAX_OPTIONS]
             ],
         )
-        self._parent = parent
+        self._owner = parent
         self._by_key = {t.key: t for t in teams}
 
     async def callback(self, interaction: discord.Interaction) -> None:
         team = self._by_key[self.values[0]]
-        await interaction.response.send_modal(_CapAdjustModal(self._parent, team))
+        await interaction.response.send_modal(_CapAdjustModal(self._owner, team))
 
 
 class _CapAdjustModal(discord.ui.Modal, title="Adjust team cap"):
@@ -1152,7 +1152,7 @@ class _CapAdjustModal(discord.ui.Modal, title="Adjust team cap"):
 
     def __init__(self, parent: _TeamsView, team) -> None:
         super().__init__()
-        self._parent = parent
+        self._owner = parent
         self._team = team
         self._delta = discord.ui.TextInput(
             label="Delta in $M (positive = more space)",
@@ -1190,7 +1190,7 @@ class _CapAdjustModal(discord.ui.Modal, title="Adjust team cap"):
             await report_error(interaction, str(exc))
             return
         sign = "+" if recorded >= Decimal("0") else ""
-        await self._parent.render(interaction)
+        await self._owner.render(interaction)
         await interaction.followup.send(
             f"✅ Cap adjustment for **{self._team.name}**: {sign}${recorded}M. "
             f"(Ledger only — enforcement lands in Phase 5.)",

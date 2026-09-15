@@ -14,10 +14,11 @@ is marked BINDING, violating it is grounds for rejecting the change.
 
 ## 1. Status
 
-Phases 1–7 are shipped. Git history:
+Phases 1–8 are shipped. Git history:
 
 ```
-(feature/team-budgets)  Phase 7: team budgets separate from the spending cap
+(feature/contract-carryover)  Phase 8: contract carry-over across seasons
+6a4e41c  Phase 7: team budgets separate from the spending cap (PR #2)
 64cfcf0  main after PR #1 (driver sync, migration 012)
 fda8506  Make contract length bounds commissioner-editable
 95a41fb  Interactive Setup, Approvals and Boards screens
@@ -27,9 +28,9 @@ ab25adc  Phase 6: race-results ingestion and normalization
 d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
-- **561 tests passing**, 28 test modules.
-- **82 slash commands** across 7 groups.
-- **12 migrations** (005 is deliberately absent — see §5).
+- **582 tests passing**, 30 test modules.
+- **83 slash commands** across 7 groups.
+- **13 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
 
 > **Unverified:** at the time of writing, these commits were **local only
@@ -106,6 +107,7 @@ roster-bot/
     contracts/
       rules.py        425   validation predicates; pure functions over plain data
       service.py     1100   offer/contract state machine
+      carryover.py    340   conn-level: season-end carry / expire of active contracts
       render.py       618   review panel, driver offer card, counteroffer, signed post
 
     presets/
@@ -128,16 +130,17 @@ roster-bot/
       market.py       385   /market (7)
       contracts.py   1082   /contract (9)
       trades.py       393   /trade (5)
-      admin_market.py 1769  /market-admin (34)
+      admin_market.py 1900  /market-admin (40)
       panel.py        783   /league + /help (2)
 
-  migrations/               001–013, forward-only
+  migrations/               001–014, forward-only
   scripts/check_magic_numbers.py  125  the ADR-001 CI guard
   docs/results_template.csv       race-results import template
-  tests/                          28 modules, 561 tests
+  tests/                          30 modules, 582 tests
 docs/
   ADR-001-f1-with-generic-future.md   BINDING architecture decision
   MARKET_GUIDE.md                     league-member walkthrough
+  RUNNING_YOUR_LEAGUE.md              owner runbook: install → first race → offseason
 ```
 
 ---
@@ -219,10 +222,31 @@ docs/
     exactly as they did before Phase 7. The F1 preset seeds a row with
     `opening_budget = salary_cap`, so a fresh season is unchanged on day
     one and diverges only as results come in.
+12. **A contract is one row per season served.** `term_seasons = N`
+    means N `contracts` rows over N seasons, chained by
+    `carried_from_contract_id` → `origin_contract_id` and numbered by
+    `season_index`. `bot/contracts/carryover.py` creates the next row
+    with `contract_value`, `contract_type`, `term_seasons`, and
+    `max_incentives` copied **verbatim** (`signing_bonus = 0`: it was
+    paid once, on the origin row) and moves the old row to `carried`; a
+    row at its final `season_index` moves to `expired` instead. Carried
+    payroll is an existing obligation: it is **reported** against the
+    cap, never blocked. Every transition writes `contract_carried` (both
+    seasons) or `contract_expired` ledger rows. Only `active` rows are
+    processed, so re-runs are no-ops; skipped rows stay `active` and are
+    reported again. An extension resets `season_index` to 1.
 
 ---
 
 ## 4. Discord platform constraints
+
+- **Never assign `self._parent`, `self._view`, `self._row`, `self._id`
+  (or any other name in `tests/test_ui_reserved_attrs.py::RESERVED`) on
+  a `discord.ui.Item`/`View`/`Modal` subclass.** discord.py ≥ 2.6 owns
+  those and reads them in its dispatch path; shadowing one made every
+  panel click fail with `'…View' object has no attribute '_run_checks'`.
+  The owning-view back-reference is `self._owner`. The guard test fails
+  the build on any new offender.
 
 These have each caused a bug or a redesign. Treat them as hard facts.
 
@@ -275,6 +299,7 @@ runner already wraps each file in a transaction.
 | `011_min_contract_term.sql` | adds `league_config.min_term_seasons` + CHECK constraints |
 | `012_driver_registered_kind.sql` | seeds the `driver_registered` transaction kind for `/market-admin driver` enrolment |
 | `013_team_budgets.sql` | `budget_entry_kinds`, `team_budget_ledger` (+ sign trigger, one `opening_balance` and one `rollover` per team-season), `budget_config` (season default + per-tier override) |
+| `014_contract_carryover.sql` | alters `contracts`: `season_index` (CHECK ≥ 1), `carried_from_contract_id`, `origin_contract_id`; partial unique `uq_contracts_carried_once`; seeds `contract_states.carried`, `transaction_kinds.contract_carried` / `contract_expired` |
 
 ### The `drivers` exception
 
@@ -291,6 +316,8 @@ independent market value, keyed `UNIQUE (season_id, tier_id, member_id)`.
 ### DB-level enforcement
 
 - Partial unique index: each driver has at most one `active` contract.
+- Partial unique index: a contract row is carried forward at most once
+  (`uq_contracts_carried_once`).
 - At most one pending offer per `(team, driver)`.
 - `league_config`: `min_term_seasons >= 1` and
   `min_term_seasons <= max_term_seasons`.
@@ -306,6 +333,7 @@ meaningful.
 |---|---|---|
 | `bot/market/valuation.py`, `bot/market/money.py`, `bot/market/budget.py`, `bot/contracts/rules.py` | stdlib, `Decimal` | `discord`, DB, `bot/presets/` |
 | `bot/market/budget_ops.py` | DB, queries, `bot/market/budget.py` | `discord`, `bot/presets/` |
+| `bot/contracts/carryover.py` | DB, queries, `bot/market/driver_ops.py` | `discord`, `bot/presets/` |
 | `bot/results_ingest.py`, `bot/workflow.py` | DB, queries | `discord` |
 | `bot/contracts/service.py` | DB, queries, rules | `discord` where avoidable |
 | `bot/approvals.py`, `bot/ui/*`, `bot/cogs/*` | everything | raw SQL strings |
@@ -318,7 +346,7 @@ implement it twice.
 
 ---
 
-## 7. Command surface — 82 commands
+## 7. Command surface — 83 commands
 
 **Nothing here may be removed or renamed.** The panel (§8) is an additive
 layer on top; every command remains available for power users.
@@ -363,10 +391,10 @@ layer on top; every command remains available for power users.
 /trade propose | accept | decline | withdraw | status
 ```
 
-### `/market-admin` (39, commissioner)
+### `/market-admin` (40, commissioner)
 
 ```
-season create | activate | list
+season create | activate | list | carry-over
 tier add | edit | list
 config edit | show | channel | role | free-agency
 valuation run | preview | publish | list
@@ -380,6 +408,16 @@ budget show | award | adjust | rollover | config
 
 `adjust-cap` is unchanged: it writes a `cap_adjustment` ledger note and
 moves no money. `budget adjust` is the command that changes a balance.
+
+`season carry-over <from_season>` runs `approvals.carry_over_season`:
+the Discord-free `workflow.carry_over_contracts` → `carryover.carry_over`
+in one transaction, then `roster_ops.drop_from_team` for every expired
+driver (failures are warnings in the receipt, never a rollback). Season-
+end order is `season activate` → `season carry-over` → `budget
+rollover` → `budget award`; carry-over and budget rollover are
+order-independent because `budget_ops.rollover` reads
+`queries.fetch_team_season_payroll` (rows that served the source season)
+rather than live active rows.
 
 ### `/roster` (16) and `/sheets` (4)
 
@@ -395,7 +433,7 @@ sheets: add list refresh remove
 
 ## 8. The control panel
 
-`/league` is the intended entry point for admins. It exists because 74
+`/league` is the intended entry point for admins. It exists because 83
 slash commands is an unusable discovery surface. The panel wraps them in
 a guided flow; it **adds** a layer and removes nothing.
 
@@ -579,6 +617,22 @@ DRAFT → PENDING_DRIVER → (DECLINED | WITHDRAWN | EXPIRED)
 - **All state transitions go through `bot/contracts/service.py`.** No cog
   mutates offer or contract state directly.
 
+### Contracts across seasons (Phase 8)
+
+```
+ACTIVE (season_index k of N) ──season end──▶ CARRIED  + new ACTIVE row (k+1) in next season   [k < N]
+                              ──season end──▶ EXPIRED  (driver is a free agent, team role dropped) [k = N]
+ACTIVE ──void / release / buyout──▶ VOIDED | TERMINATED (unchanged)
+```
+
+`contract_states`: `active`, `expired`, `voided`, `terminated`, `carried`
+— all but `active` are terminal. `queries.fetch_contract_chain(id)`
+returns the whole deal, origin first. `fetch_team_payroll` (the signing
+rule's input) sums `active` rows only, so after carry-over a past
+season's rows stop counting; `fetch_team_season_payroll(team, season)`
+is the pinned per-season figure (`active | carried | expired` + that
+season's dead money).
+
 ### Background loops
 
 | Loop | Interval | Location |
@@ -681,6 +735,13 @@ Required coverage per area:
   by budget and by cap independently.
 - **`test_contract_lifecycle.py`** — every legal transition succeeds,
   every illegal one raises; accepted terms cannot be mutated; expiry.
+- **`test_contract_carryover.py`** — carry creates the next row with
+  money copied and links set; final-season rows expire; ledger rows in
+  both seasons; second run writes nothing; three-season chain then
+  expiry; existing (re-tiered) target driver row preferred; skip on
+  fresh target contract and on missing tier code; DB blocks a double
+  carry; over-cap reported not blocked; season payroll pinned; budget
+  rollover order-independent; extension resets `season_index`.
 - **`test_market_render.py` / `test_overflow.py`** — line-width bounds,
   embed limits, pagination boundaries, empty-tier and single-driver cases.
 - **`test_migrations.py`** — migrations apply cleanly onto a fresh DB
@@ -752,8 +813,20 @@ Required coverage per area:
 - **Phase 5 scope partially open.** Trades, releases, buyouts, and
   promotion/relegation exist (`009`, `test_trades.py`,
   `test_release_and_buyout.py`, `test_extension_and_promotion.py`).
-  **Budget** rollover is built (Phase 7); **contract** carry-over across
-  seasons (multi-season deals surviving a season change) is not.
+  **Budget** rollover (Phase 7) and **contract** carry-over (Phase 8)
+  are both built; Phase 5 scope is closed.
+- **Carry-over is manual and season-ordered.** Nothing runs at
+  `season activate`; a commissioner runs `season carry-over` per past
+  season, oldest first. A league that already crossed a season boundary
+  before Phase 8 has old `active` rows inflating live payroll until it
+  does.
+- **Dead money does not carry over.** `dead_money` rows are keyed to the
+  season of the buyout; a multi-season buyout schedule is not modelled.
+- **`fetch_team_payroll` is still not season-scoped** by design — it is
+  "everything currently active", which is correct once carry-over has
+  run. Left unchanged rather than risk the signing rule.
+- **Void/release still do not drop the Discord team role** (pre-existing;
+  only expiry via carry-over and trade approval touch roles).
 - **Budget preset rates are untuned.** `earnings_per_point 0.05`,
   `dnf_penalty 0.50`, `dns_penalty 1.00`, `penalty_per_incident_pt 0.25`
   are placeholders sized so a season moves a budget by single-digit

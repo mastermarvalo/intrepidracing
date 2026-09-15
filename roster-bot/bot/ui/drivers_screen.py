@@ -243,7 +243,7 @@ class _SyncTierSelect(discord.ui.Select):
             disabled=not eligible,
             row=row,
         )
-        self._parent = parent
+        self._owner = parent
         self._by_code = {s.code: s for s in eligible}
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -271,7 +271,7 @@ class _SyncTierSelect(discord.ui.Select):
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
-        await self._parent.reload(
+        await self._owner.reload(
             interaction,
             note=(
                 f"✅ Tier `{report.tier_code}`: enrolled **{report.created}**, "
@@ -525,7 +525,7 @@ class _DriverPickerSelect(discord.ui.Select):
             disabled=not shown,
             row=row,
         )
-        self._parent = parent
+        self._owner = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -539,8 +539,8 @@ class _DriverPickerSelect(discord.ui.Select):
             return
         view = _DriverDetailView(
             detail=detail,
-            opener_id=self._parent.opener_id,
-            parent=self._parent,
+            opener_id=self._owner.opener_id,
+            parent=self._owner,
         )
         await interaction.edit_original_response(
             embed=build_driver_detail_embed(detail), view=view
@@ -679,7 +679,7 @@ class _StatusSelect(discord.ui.Select):
                 for code, label in workflow.DRIVER_STATUS_CHOICES
             ],
         )
-        self._parent = parent
+        self._owner = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -688,19 +688,19 @@ class _StatusSelect(discord.ui.Select):
             await workflow.set_driver_status(
                 guild_id=interaction.guild_id,
                 actor_id=interaction.user.id,
-                driver_id=self._parent.detail.driver_id,
+                driver_id=self._owner.detail.driver_id,
                 status=chosen,
             )
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
         note = (
-            f"✅ **{self._parent.detail.display_name}**: "
-            f"`{self._parent.detail.status}` → `{chosen}`."
-            if chosen != self._parent.detail.status
+            f"✅ **{self._owner.detail.display_name}**: "
+            f"`{self._owner.detail.status}` → `{chosen}`."
+            if chosen != self._owner.detail.status
             else f"ℹ️ Status was already `{chosen}` — no change."
         )
-        await self._parent.refresh(interaction, note=note)
+        await self._owner.refresh(interaction, note=note)
 
 
 class _MoveTierButton(discord.ui.Button):
@@ -765,7 +765,7 @@ class _MoveTierSelect(discord.ui.Select):
                 for code, label in tiers[:SELECT_MAX_OPTIONS]
             ],
         )
-        self._parent = parent
+        self._owner = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -774,17 +774,17 @@ class _MoveTierSelect(discord.ui.Select):
             await workflow.move_driver_to_tier(
                 guild_id=interaction.guild_id,
                 actor_id=interaction.user.id,
-                driver_id=self._parent.detail.driver_id,
+                driver_id=self._owner.detail.driver_id,
                 new_tier_code=target,
                 note=None,
             )
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
-        await self._parent.refresh(
+        await self._owner.refresh(
             interaction,
             note=(
-                f"✅ Moved **{self._parent.detail.display_name}** to tier "
+                f"✅ Moved **{self._owner.detail.display_name}** to tier "
                 f"`{target}`. Their active contract (if any) moved with them."
             ),
         )

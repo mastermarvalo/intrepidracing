@@ -30,7 +30,7 @@ from decimal import Decimal
 
 import discord
 
-from bot import db, queries, roster_ops
+from bot import db, queries, roster_ops, workflow
 from bot.contracts import render as contract_render
 from bot.contracts import service as contracts_service
 
@@ -339,3 +339,59 @@ async def reject_trade(
             )
         except contracts_service.TransitionError as exc:
             raise ApprovalError(str(exc)) from exc
+
+
+# ── Phase 8: season carry-over ───────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CarryOverResult:
+    report: workflow.CarryOverReport
+    role_warnings: list[str]
+
+
+async def carry_over_season(
+    *,
+    guild: discord.Guild,
+    actor: discord.abc.User,
+    from_season_name: str,
+) -> CarryOverResult:
+    """
+    Run the Discord-free carry-over, then strip team roles from every
+    driver whose contract expired. Carried drivers keep their role —
+    nothing changed for them. Role failures are warnings, never a
+    rollback: the ledger is already the source of truth.
+    """
+    try:
+        report = await workflow.carry_over_contracts(
+            guild_id=guild.id,
+            actor_id=actor.id,
+            from_season_name=from_season_name,
+        )
+    except workflow.WorkflowError as exc:
+        raise ApprovalError(str(exc)) from exc
+
+    teams_by_id: dict[int, object] = {}
+    async with db.connect() as conn:
+        for _, team_id in report.outcome.expired_members:
+            if team_id not in teams_by_id:
+                teams_by_id[team_id] = await queries.fetch_team_by_id(conn, team_id)
+
+    role_warnings: list[str] = []
+    for member_id, team_id in report.outcome.expired_members:
+        member = guild.get_member(member_id)
+        team = teams_by_id.get(team_id)
+        if member is None or team is None:
+            role_warnings.append(f"member {member_id} not in guild — role not removed")
+            continue
+        try:
+            await roster_ops.drop_from_team(
+                guild=guild,
+                member=member,
+                team=team,
+                actor=actor,
+                reason=f"Contract expired at end of {report.from_season_name}",
+            )
+        except roster_ops.RoleAssignmentError as exc:
+            role_warnings.append(str(exc))
+    return CarryOverResult(report=report, role_warnings=role_warnings)

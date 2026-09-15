@@ -185,7 +185,7 @@ class _ValuationRunSelect(discord.ui.Select):
                 for r in runs[:SELECT_MAX_OPTIONS]
             ],
         )
-        self._parent = parent
+        self._owner = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -199,7 +199,7 @@ class _ValuationRunSelect(discord.ui.Select):
             return
         embed = build_valuation_preview_embed(preview)
         view = _ValuationPreviewView(
-            opener_id=self._parent.opener_id, parent=self._parent
+            opener_id=self._owner.opener_id, parent=self._owner
         )
         await interaction.edit_original_response(embed=embed, view=view)
 
@@ -332,7 +332,7 @@ class _RoundSelect(discord.ui.Select):
                 for r in rounds[:SELECT_MAX_OPTIONS]
             ],
         )
-        self._parent = parent
+        self._owner = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -348,7 +348,7 @@ class _RoundSelect(discord.ui.Select):
             return
         embed = build_round_detail_embed(detail)
         view = _RoundDetailView(
-            opener_id=self._parent.opener_id, parent=self._parent
+            opener_id=self._owner.opener_id, parent=self._owner
         )
         await interaction.edit_original_response(embed=embed, view=view)
 
@@ -450,14 +450,14 @@ class _TierFilterSelect(discord.ui.Select):
             placeholder=f"Filter tier ({'all' if current is None else current})",
             options=options,
         )
-        self._parent = parent
+        self._owner = parent
         self._kind = kind
 
     async def callback(self, interaction: discord.Interaction) -> None:
         picked = self.values[0]
         new_filter = None if picked == "__all__" else picked
-        opener_id = self._parent.opener_id
-        history_parent = self._parent.parent
+        opener_id = self._owner.opener_id
+        history_parent = self._owner.parent
         if self._kind == "valuation":
             await _open_valuations(
                 interaction,

@@ -114,6 +114,17 @@ class Contract:
     approved_by: int | None = None
     external_ref: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # Phase 8: one row per season served. season_index is 1-based within
+    # term_seasons; carried_from links to the previous season's row and
+    # origin to the originally signed row (both None on a fresh signing).
+    season_index: int = 1
+    carried_from_contract_id: int | None = None
+    origin_contract_id: int | None = None
+
+    @property
+    def seasons_remaining_after_this(self) -> int:
+        """How many further seasons the deal runs after this row's season."""
+        return max(self.term_seasons - self.season_index, 0)
 
 
 @dataclass

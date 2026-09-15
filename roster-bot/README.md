@@ -1,6 +1,12 @@
 # Roster Bot
 
-Discord bot that maintains live, self-updating team roster embeds. Admins create teams via a guided `/roster create` flow; the bot keeps roster messages in sync by watching role changes and polling every 15 minutes.
+Discord bot that maintains live, self-updating team roster embeds. Admins create teams via a guided `/roster create` flow; the bot keeps roster messages in sync by watching role changes and polling every 15 minutes. On top of the roster layer it runs a per-tier driver market, team budgets, and a full multi-season contract system.
+
+**New here? Start with the owner's runbook:
+[`docs/RUNNING_YOUR_LEAGUE.md`](../docs/RUNNING_YOUR_LEAGUE.md)** — install
+to first race night to offseason, in the order you do them. This README is
+the reference manual behind it; hand your Team Principals and drivers
+[`docs/MARKET_GUIDE.md`](../docs/MARKET_GUIDE.md).
 
 ## Requirements
 
@@ -243,7 +249,7 @@ must not.
 
 Everything the panel does is also still a slash command, and the panel
 calls the same code as the commands — nothing was removed or renamed.
-All 74 commands are still there. Setup, Approvals and Boards route
+All 83 commands are still there. Setup, Approvals and Boards route
 through `bot/workflow.py` and `bot/approvals.py`, which the
 `/market-admin` commands now call too, so there is one code path per
 operation regardless of which route you take.
@@ -313,6 +319,10 @@ phases.
   no-shows, and incident points; commissioners award prize money;
   unspent budget rolls over between seasons
   (`bot/market/budget.py`, `bot/market/budget_ops.py`).
+- **Phase 8** — contract carry-over: a multi-season deal follows the
+  driver into the next season at the same money, a finished deal
+  expires and frees the driver, and payroll stops counting old
+  seasons' contracts (`bot/contracts/carryover.py`).
 
 **For a league-member walkthrough of the whole thing (setup,
 offering, trading, releasing, buyouts, promotion/relegation), see
@@ -338,6 +348,7 @@ driver mathematically cannot influence a Tier-1 value.
 | `/market-admin season create <name> [preset]` | Create a season; `preset: F1 25/26` seeds tiers, lookups, valuation factors, and default league config |
 | `/market-admin season activate <name>` | Make a season the active one for this guild |
 | `/market-admin season list` | List all seasons |
+| `/market-admin season carry-over <from_season>` | Carry every active contract from a finished season into the active one: multi-season deals get their next row, finished deals expire and lose the team role; idempotent |
 | `/market-admin tier add <code> <label> <rank> [role] [color]` | Add a tier to the active season |
 | `/market-admin tier edit <code> ...` | Edit an existing tier (labels, roles, colors) |
 | `/market-admin tier list` | List tiers for the active season |
@@ -582,6 +593,55 @@ row at all behaves exactly as before Phase 7.
 > The preset rates (`per_point_m` 0.05, `dnf_m` 0.50, `dns_m` 1.00,
 > `per_incident_pt_m` 0.25) are starting points, not tuned values. Check
 > them against a full season of your results before relying on them.
+
+### Contract carry-over between seasons (Phase 8)
+
+A contract's `term_seasons` is a real commitment: a 3-season deal signed
+in Season 7 is owed in Seasons 8 and 9 too. The schema stores **one
+`contracts` row per season served**, linked by `carried_from_contract_id`
+→ `origin_contract_id` and numbered by `season_index` (1-based). `/contract
+status` shows this as "Term: season 2 of 3".
+
+**Season-end procedure** (after `season activate` on the new season):
+
+```text
+/market-admin season carry-over from_season: "S7"
+/market-admin budget rollover    from_season: "S7"
+/market-admin budget award ...                       # prize money
+```
+
+The order of the first two does not matter — budget rollover reads the
+payroll the source season actually carried, not the live active rows.
+
+What `carry-over` does with each active contract in the source season:
+
+| Situation | Result |
+|---|---|
+| `season_index < term_seasons` | A new `active` row in the target season with the **same** value, type, term, and max incentives (`signing_bonus` 0 — it was a one-time payment on the origin row). Old row → `carried`. Ledger: `contract_carried` in both seasons. |
+| `season_index = term_seasons` | Old row → `expired`; the driver is a free agent and their team role is removed. Ledger: `contract_expired`. |
+| Driver already has a fresh active deal in the target season | **Skipped**, old row left `active`, listed under "Needs attention". |
+| Target season has no tier with the same code | **Skipped**, same treatment. |
+
+The driver's target-season row is reused if a commissioner already
+created it (even in a different tier — the contract follows the driver),
+otherwise it is created in the same tier code.
+
+**The cap is reported, not enforced, here.** Carried money is an existing
+obligation, so the run never blocks; any team whose target-season payroll
+lands over the spending cap is called out in the receipt for the
+commissioner to resolve through a release, buyout, or trade before that
+team signs anyone new.
+
+**Payroll now has a season boundary.** Before Phase 8 nothing ever moved
+a contract out of `active`, so Season 7 deals kept counting against
+Season 8 payroll forever. After the first carry-over, live payroll
+(`fetch_team_payroll`, the signing rule's input) reflects only current
+obligations. If you have already been running the bot across a season
+boundary without this feature, run `carry-over` once for each past
+season, oldest first.
+
+An **extension** starts a new term: `update_contract_terms` resets
+`season_index` to 1 alongside the new `term_seasons`.
 
 ### The weekly race-night loop
 

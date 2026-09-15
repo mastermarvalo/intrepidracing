@@ -511,7 +511,8 @@ def render_contract_status(
             value=_bound_lines([
                 f"Team: {active['team_name']}",
                 f"Value: {format_money(active['contract_value'])}",
-                f"Term: {active['term_seasons']} season(s)",
+                f"Term: season {active.get('season_index', 1)} of "
+                f"{active['term_seasons']}",
                 f"Type: {active['contract_type']}",
                 f"Signed: <t:{int(active['signed_at'].timestamp())}:d>"
                 if active.get("signed_at") else "Signed: —",
