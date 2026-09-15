@@ -806,7 +806,51 @@ Required coverage per area:
 
 ---
 
-## 16. Known open items
+## 16. Approved design decisions
+
+**Signed off by the league owner on 2026-09-15.** These are settled
+economic rules, not open questions. They are listed separately from §17
+so that a future contributor does not "fix" one as if it were an
+oversight. Each is reversible, but changing any of them changes the
+league's economy and needs the owner's agreement first — not just a
+passing test suite.
+
+1. **The cap is a commitment gate, not a solvency test.** Under escrow,
+   `available_to_spend` reserves nothing for the unescrowed remainder of
+   a term. A team can commit to a payroll it cannot fund later and only
+   find out when a race-night charge takes the balance negative.
+   Reserving the remaining term is the stricter rule and is deliberately
+   **not** implemented. Chosen because it preserves how the cap behaved
+   for seven seasons. **Revisit this first if teams start running dry**
+   — it is the decision most likely to cause an in-season mess.
+2. **A team can lose its escrow but never more than it.**
+   `amount_returned` is clamped at zero and `Settlement.clamped` records
+   when the clamp bit. The downside of a signing is capped at the
+   contract value; a collapsing driver cannot put a team into debt on
+   top of the salary already paid. Unlimited downside was rejected
+   because it makes long deals on volatile drivers nearly unsignable.
+3. **Early exits pro-rate the P/L** by `races_served / term_races`,
+   settled at the driver's value on the day of exit. A team is neither
+   rewarded nor punished for races it did not serve. Settling the full
+   P/L regardless of service was rejected: it would let a principal sign
+   a rising driver, hold him three races, and bank the whole gain.
+4. **Season carry-over moves no money.** `term_races` is unchanged,
+   `races_served_before` is inherited, and the live escrow holding is
+   repointed onto the new contract row. An unfinished term must not
+   settle at a season boundary. Settling and re-escrowing each season
+   was rejected because it turns every multi-season deal into a series
+   of one-season deals.
+5. **`season seed-preset` refuses a season that is already set up.** It
+   will not run once the season has tiers or a `league_config` row,
+   because re-seeding would reset the valuation factors and the cap
+   underneath contracts already signed against them. It is a recovery
+   path for an empty season, **not** a reset button. A command to
+   re-baseline a running season is a separate and considerably more
+   dangerous thing that does not exist.
+
+---
+
+## 17. Known open items
 
 - **Commits are local.** Verify with `git status -sb` before assuming the
   GitHub remote is current.
@@ -843,20 +887,6 @@ Required coverage per area:
   gates it and there is no backfill: contracts signed before it is
   switched on have no escrow holding and settle under the old rules.
   Season 8 finishes as it started.
-- **Under escrow, `available_to_spend` reserves nothing for the
-  unescrowed remainder of a term.** A team can commit to a payroll it
-  cannot fund later and only find out when a race-night charge takes
-  the balance negative. The cap is a commitment gate, not a solvency
-  test. Reserving the remaining term is the stricter rule and is
-  deliberately not implemented; revisit first if teams run dry.
-- **Early exits pro-rate the P/L** by `races_served / term_races`, and a
-  team can lose its escrow but never more than it — `amount_returned`
-  is clamped at zero and `Settlement.clamped` records when it bit.
-- **Season carry-over preserves the service chain** rather than
-  shortening the term to the remainder: `term_races` is unchanged and
-  `races_served_before` is inherited, and the live escrow holding is
-  repointed onto the new contract row with zero money movement. An
-  unfinished term must not settle at a season boundary.
 - **Budget preset rates are untuned.** `earnings_per_point 0.05`,
   `dnf_penalty 0.50`, `dns_penalty 1.00`, `penalty_per_incident_pt 0.25`
   are placeholders sized so a season moves a budget by single-digit
