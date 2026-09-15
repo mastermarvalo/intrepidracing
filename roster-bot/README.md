@@ -336,6 +336,12 @@ preset — never as a Python literal in market/contract code. See
 `docs/ADR-001-f1-with-generic-future.md` for the rules and
 `scripts/check_magic_numbers.py` for the CI guard that enforces them.
 
+The September 2026 workflow audit is in
+[`docs/audit/`](../docs/audit/README.md): 26 defects traced from click to
+database write to the message the user sees, each marked fixed, partial or
+open against current `main`. Worth reading before changing a panel screen or
+an admin command — it records why several of them are shaped the way they are.
+
 Valuations are **tier-isolated by construction**: the engine takes one
 tier's inputs at a time and has no notion of tier structure, so a Tier-2
 driver mathematically cannot influence a Tier-1 value.
