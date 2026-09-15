@@ -852,6 +852,16 @@ passing test suite.
 
 ## 17. Known open items
 
+**The September 2026 workflow audit is in `docs/audit/`** — 26 findings
+traced click → DB write → message, with a per-finding status verified
+against `main`. Read `docs/audit/README.md` first. As of `528fe0e`:
+19 fixed, 4 partial, 3 open. The three still open (`G4` driver in two
+tiers crashes on move, `G6` void leaves the Discord team role attached,
+`G7` void skips the open-trade guard that release has) all concern
+administrative erasure and driver movement, and all three start in
+`bot/contracts/service.py`. The four partial ones are correct from the
+panel and still wrong from the equivalent typed command.
+
 - **Commits are local.** Verify with `git status -sb` before assuming the
   GitHub remote is current.
 - **No single `league_config` resolver** (see §9). This is the most
