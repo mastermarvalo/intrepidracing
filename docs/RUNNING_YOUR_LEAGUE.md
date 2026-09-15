@@ -6,16 +6,21 @@ This is the operator guide. It takes you from an empty server to a
 running driver market, then through a race night, then through the end
 of a contract, in the order you actually do them.
 
-It assumes nothing about the code. If you want the reference manual
-instead, read [`roster-bot/README.md`](../roster-bot/README.md); for the
-driver- and Team-Principal-facing walkthrough, hand people
+It assumes nothing about the code. For a shorter start-to-finish
+version read [`README.md`](../README.md); for the full command
+reference read [`roster-bot/README.md`](../roster-bot/README.md); for
+the driver- and Team-Principal-facing walkthrough, hand people
 [`MARKET_GUIDE.md`](MARKET_GUIDE.md).
 
-> **How to read the status marks.** Sections and commands marked
-> **▸ new** arrive with the Phase 9 update and are not on your server
-> until you deploy it. Everything unmarked is live in the current build.
-> Where a **▸ new** rule replaces an old one, the old behaviour is
-> described too, because that is what your league is running today.
+> **Everything in this guide is live.** It previously carried "new"
+> marks against the race-term and escrow sections, which were then
+> unreleased. That update has shipped and merged, so the marks are gone
+> — if it is described here, it is in the build. Where a rule replaced
+> an older one the old behaviour is still described, because a league
+> mid-season may remember it.
+>
+> Shorter version of this guide, for first-time setup:
+> [`README.md`](../README.md) at the repository root.
 
 **The one thing to remember:** run `/league`. It is a checklist that
 fills itself in and tells you the single next step. Every slash command
@@ -61,7 +66,7 @@ hand is never invisible to it.
 
 Money is where owners get confused, so learn these three:
 
-| | **Spending cap** | **Cash** | **Escrow ▸ new** |
+| | **Spending cap** | **Cash** | **Escrow** |
 |---|---|---|---|
 | What it is | A league rule | The team's money | Money locked inside live contracts |
 | Same for every team? | Yes | No | No |
@@ -75,7 +80,7 @@ A team sitting on $300M with a $145M cap can still only commit $145M of
 payroll. A team with $40M of cash cannot escrow a contract it can't
 fund, whatever the cap says.
 
-### ▸ new: what changed, and why it matters
+###: what changed, and why it matters
 
 Before this update a signing moved no money at all. Payroll was
 *compared* against the budget balance and only subtracted at the season
@@ -130,13 +135,13 @@ paid out. Nothing about your cap arithmetic changes.
 | Rollover | `/market-admin budget rollover` at the season boundary |
 | Race earnings | Automatic on results import: rate × championship points |
 | Prize money | `/market-admin budget award` — commissioner only, credit only |
-| Escrow returned **▸ new** | Automatic when a term ends |
-| Positive P/L **▸ new** | Automatic at settlement, when a driver appreciated |
+| Escrow returned | Automatic when a term ends |
+| Positive P/L | Automatic at settlement, when a driver appreciated |
 
 | Money out | Trigger |
 |---|---|
-| Salary escrow **▸ new** | Automatic per imported race |
-| Negative P/L **▸ new** | Automatic at settlement, when a driver declined |
+| Salary escrow | Automatic per imported race |
+| Negative P/L | Automatic at settlement, when a driver declined |
 | Retirement, no-show, incident points | Automatic on results import |
 | Commissioner adjustment | `/market-admin budget adjust` |
 
@@ -154,7 +159,7 @@ earnings.
 - A Discord server where you have **Manage Server**.
 - A Google account, if you want results imported from Sheets. Strongly
   recommended: typing results by hand does not scale past one tier, and
-  **▸ new** escrow and contract terms both advance off imported results,
+  escrow and contract terms both advance off imported results,
   so importing is now how the economy moves at all.
 - 45 minutes for first-time setup; about five minutes per tier per week
   after that.
@@ -164,7 +169,7 @@ Decide these now, because they shape everything else:
 - **How many tiers?** Each is its own isolated market — a Tier 2 driver
   mathematically cannot move a Tier 1 value.
 - **What is the spending cap?** The preset is $145M.
-- **How many races in a season?** **▸ new** This is the divisor that
+- **How many races in a season?** This is the divisor that
   turns a per-season salary into a per-race payment, so it has to be
   right before anyone signs anything.
 - **Do teams get their own cash?** You can run cap-only or cap + cash.
@@ -295,7 +300,7 @@ table, and a default league config with a $145M cap. Creating a season
 without the preset gives you an empty shell to configure by hand — use
 the preset.
 
-**▸ new** If you already created a season without it, you are no longer
+If you already created a season without it, you are no longer
 stuck. Previously the preset could only be applied at creation, so a
 season made without one had no tiers and no league config and nothing
 could give it either — every command failed with advice to "create a
@@ -351,7 +356,7 @@ embed. Repeat per team, then `/roster list` to check.
 ```
 
 `config edit` covers the cap, salary bounds, contract-length bounds, and
-incentive limits. **▸ new** it also carries **races per season**, the
+incentive limits. it also carries **races per season**, the
 two premium rates, and the length bounds in races.
 
 Then the cash rules:
@@ -363,7 +368,7 @@ Then the cash rules:
 | Setting | Meaning |
 |---|---|
 | `enforce` | Off = cap-only league; cash is recorded but never blocks. On = a team cannot commit beyond its own money |
-| `escrow` **▸ new** | Whether salary is actually drawn from cash per race and settled at term end. Off keeps the old commitment-only model |
+| `escrow` | Whether salary is actually drawn from cash per race and settled at term end. Off keeps the old commitment-only model |
 | `rollover` | Whether cash survives into next season |
 | `opening_m` | What each team starts a season with (preset $145M, equal to the cap) |
 | `per_point_m` | Credit per championship point |
@@ -383,8 +388,7 @@ Turning cash on later is one command; you lose nothing by waiting.
 
 ---
 
-## 8. Contract length, in races ▸ new
-
+## 8. Contract length, in races
 Contract terms are measured in **races**, not seasons. A deal is "24
 races", and it is done when its 24th race has been imported — which may
 land mid-season.
@@ -422,8 +426,7 @@ shorter or longer than what was agreed.
 
 ---
 
-## 9. Pricing: base value and the two premiums ▸ new
-
+## 9. Pricing: base value and the two premiums
 Until now the only price rule was a flat league-wide floor (`min_salary`,
 $1M in the preset) — the driver's own market value was not part of offer
 validation at all. Now an offer must clear a floor derived from what the
@@ -514,7 +517,7 @@ That is deliberate. Don't try to merge them.
 ## 11. The first valuation
 
 Every driver needs a value before anyone can be offered a contract.
-**▸ new** this matters more than it used to: with no published value
+this matters more than it used to: with no published value
 there is no base value, so the price floor in §9 cannot be applied.
 
 With no results imported, this baselines everybody at the minimum salary:
@@ -559,21 +562,21 @@ The flow from here is your TPs' job:
    ttl_hours: 48` and fills in salary, term, bonus, incentives.
 2. The bot validates **before** the driver sees it: TP authority, tier
    eligibility, free-agency window, term bounds, minimum salary, cap
-   headroom, cash, and **▸ new** the price floor from §9. An invalid
+   headroom, cash, and the price floor from §9. An invalid
    offer is refused with a specific reason.
 3. The driver gets the offer privately and can **accept**, **decline**,
    or **counter**. He cannot edit the money inside acceptance — that
    protects the audit trail.
 4. An accepted offer lands in your `#approvals` queue.
 5. You approve. The contract commits, the team role is assigned,
-   **▸ new** an escrow holding opens at zero, and `#transactions` gets a
+   an escrow holding opens at zero, and `#transactions` gets a
    receipt.
 
 Your side is just `/league` → **Approvals**, or
 `/market-admin approve <offer_id>` / `reject <offer_id> [note]`.
 
 Approving is the moment the commitment becomes real. Everything before
-it is a proposal. **▸ new** note that no cash moves at approval — the
+it is a proposal. note that no cash moves at approval — the
 first debit lands with the first imported race.
 
 ---
@@ -583,7 +586,7 @@ first debit lands with the first imported race.
 Press **Race Night** in `/league` — pick a tier, paste the sheet URL,
 import, price, review, publish.
 
-**▸ new** Each tier's sheet URL and tab are now remembered in the
+Each tier's sheet URL and tab are now remembered in the
 database, not just for the session. Paste them once and every later
 race night pre-fills both boxes — including after a bot restart. Change
 the URL any time by typing a new one; the last successful import wins.
@@ -599,7 +602,7 @@ Typed equivalent, per tier:
 /market-admin valuation publish run_id: <id>
 ```
 
-**▸ new** Watch the round label. If you type a label that has no
+Watch the round label. If you type a label that has no
 imported results — a typo like `R1 Bharain` — the valuation has nothing
 to price against and produces a **baseline** run where nobody moves.
 The panel always warned about this; the typed command used to render
@@ -612,16 +615,16 @@ What the import does, beyond recording finishes:
 - Credits race earnings per championship point; debits retirements,
   no-shows, and incident points, charged to the team each driver was
   contracted to at import time.
-- **▸ new** Advances every live contract by one race and debits that
+- Advances every live contract by one race and debits that
   race's share of salary into escrow.
-- **▸ new** Completes any contract whose final race this was: escrow
+- Completes any contract whose final race this was: escrow
   settles at the driver's current value, his team role comes off, and he
   becomes a free agent.
 
 **Order matters in one place: import results before running the
 valuation.** A valuation prices whatever is in the database at that
 moment, so running it first gives you last week's numbers under this
-week's label. **▸ new** it matters a little more now, because a
+week's label. it matters a little more now, because a
 settlement that fires during the import is valued off the last published
 run — so publish before a term's final race if you want that race's
 performance in the settlement.
@@ -635,8 +638,7 @@ the corrected sheet over the top.
 
 ---
 
-## 14. When a contract ends ▸ new
-
+## 14. When a contract ends
 Four ways a deal ends, and what each does to the escrow:
 
 | Ending | What happens |
@@ -682,7 +684,7 @@ Strict order. This is the part most leagues get wrong.
 ```
 
 Check `/market-admin config show` on the new season before anyone signs:
-**▸ new** races per season and the premium rates are per-season config
+races per season and the premium rates are per-season config
 and a fresh season takes preset defaults, not last season's edits.
 
 ### Step 3 — carry contracts over
@@ -696,7 +698,7 @@ For every active contract in the finished season:
 
 | Situation | What happens |
 |---|---|
-| Races remain on the term | A new row in the new season at **exactly the same money, type and incentives**, carrying the remaining race count. The driver keeps his team role. No signing bonus — that was paid once **▸ new** and the escrow holding carries with it |
+| Races remain on the term | A new row in the new season at **exactly the same money, type and incentives**, carrying the remaining race count. The driver keeps his team role. No signing bonus — that was paid once and the escrow holding carries with it |
 | The term is complete | It expires. Escrow settles, the driver becomes a free agent, his team role is removed |
 | The driver already signed a fresh deal in the new season | Skipped and listed under "Needs attention" — you decide |
 | The new season has no tier with that code | Skipped, same treatment |
@@ -720,7 +722,7 @@ touched, so a second run does nothing.
 Each team carries forward its cash and gets its opening balance for the
 new season. Idempotent.
 
-> **▸ new — this number means something different now.** Under the old
+> **— this number means something different now.** Under the old
 > model rollover carried `balance − payroll`, because payroll had never
 > actually been taken. With escrow, salary has already left the cash
 > balance race by race, so rollover carries **the balance as it stands**.
@@ -794,7 +796,7 @@ and state the remaining length honestly — a driver with 12 races left
 should be signed for 12 races so the term and its settlement land
 correctly.
 
-**▸ new — escrow does not apply retroactively.** Contracts that already
+**— escrow does not apply retroactively.** Contracts that already
 exist when you deploy this update keep running under the old model and
 settle nothing; escrow engages on the next signing or carry-over. That
 is deliberate, so a mid-season server does not wake up to a column of
@@ -817,8 +819,8 @@ one model, enter the whole grid fresh at a season boundary.
 | Find any command | `/help` |
 | Approve or reject pending offers and trades | `/league` → Approvals |
 | Check a team's payroll and cap room | `/market team <name>` |
-| Check a team's cash and escrow **▸ new** | `/market-admin budget show <team>` |
-| See a driver's value, contract, races served **▸ new**, and history | `/contract status @driver` |
+| Check a team's cash and escrow | `/market-admin budget show <team>` |
+| See a driver's value, contract, races served ****, and history | `/contract status @driver` |
 | End a contract with cause | `/market-admin void <contract_id> [note]` |
 | Release a driver | `/contract release <contract_id> <note>` |
 | Buy a driver out | `/contract buyout <contract_id> <buyout_m> <note>` |
@@ -853,7 +855,7 @@ re-import the same round.
 
 **An offer was refused and the TP doesn't know why.** The refusal names
 the reason: `cap_exceeded` (league rule), `budget_exceeded` (that team's
-cash), **▸ new** `below_price_floor` (§9), free agency closed, term
+cash), `below_price_floor` (§9), free agency closed, term
 outside bounds, salary below minimum. `/market-admin config show` lists
 the current rules.
 
@@ -863,16 +865,16 @@ existing obligations. It cannot sign anyone until it's back under.
 **Payroll includes drivers from a season that's over.** You haven't run
 `/market-admin season carry-over` for that season. §15, step 3.
 
-**▸ new — nobody's escrow is moving.** Escrow advances only on results
+**— nobody's escrow is moving.** Escrow advances only on results
 import. Check that you are importing every round for every tier, and
 that `escrow` is on in `/market-admin budget config`.
 
-**▸ new — a settlement looks wrong by a race.** Settlement values off
+**— a settlement looks wrong by a race.** Settlement values off
 the **last published** valuation. If you settled before publishing the
 final round, that round isn't in the number. Publish first, then import
 the term's last race.
 
-**▸ new — a team's cash dropped and nobody signed anything.** That is
+**— a team's cash dropped and nobody signed anything.** That is
 escrow working: every imported race debits the per-race share of every
 live salary. `/market-admin budget show` itemises it by contract.
 
@@ -900,11 +902,11 @@ enforces whatever you configure; it cannot referee an argument about
 rules you never published.
 
 - **Cap.** $145M unless you have a reason.
-- **Races per season. ▸ new** Get this right before anyone signs — it is
+- **Races per season.** Get this right before anyone signs — it is
   the divisor for every per-race payment.
-- **Contract length bounds, in races. ▸ new** Long deals now mean long
+- **Contract length bounds, in races.** Long deals now mean long
   exposure to a driver's value, which is the point.
-- **Your two premium rates. ▸ new** Start low. The length premium
+- **Your two premium rates.** Start low. The length premium
   compounds per race, so 0.5% per race is already +15% over 30 races.
 - **Cash and escrow on or off for season one.** Off is a legitimate
   answer while you calibrate.

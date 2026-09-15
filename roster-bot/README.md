@@ -2,11 +2,12 @@
 
 Discord bot that maintains live, self-updating team roster embeds. Admins create teams via a guided `/roster create` flow; the bot keeps roster messages in sync by watching role changes and polling every 15 minutes. On top of the roster layer it runs a per-tier driver market, team budgets, and a full multi-season contract system.
 
-**New here? Start with the owner's runbook:
-[`docs/RUNNING_YOUR_LEAGUE.md`](../docs/RUNNING_YOUR_LEAGUE.md)** — install
-to first race night to offseason, in the order you do them. This README is
-the reference manual behind it; hand your Team Principals and drivers
-[`docs/MARKET_GUIDE.md`](../docs/MARKET_GUIDE.md).
+**New here? Start at [`README.md`](../README.md) in the repository
+root** — empty server to running league, in the order you do it. For
+far more depth on any step, the owner's runbook is
+[`docs/RUNNING_YOUR_LEAGUE.md`](../docs/RUNNING_YOUR_LEAGUE.md). This
+README is the reference manual behind both; hand your Team Principals
+and drivers [`docs/MARKET_GUIDE.md`](../docs/MARKET_GUIDE.md).
 
 ## Requirements
 
