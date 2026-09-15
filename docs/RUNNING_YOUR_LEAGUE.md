@@ -383,8 +383,20 @@ Then the cash rules:
 > let them block signings.** Nobody has calibrated them against your
 > points system.
 
+All of these are also on `/league → Money → Budget settings`, where
+enforcement, rollover, and escrow are toggles and the rates open in a
+modal. Omitting an option on the command leaves that setting untouched,
+so editing a rate will not move your escrow or rollover decision.
+
 A season with no budget config behaves exactly like a cap-only league.
 Turning cash on later is one command; you lose nothing by waiting.
+
+> **Escrow defaults to on** when you first create a budget config, but
+> is **off** on any season that predates the update that added it. If
+> your league has been running commitment-only, set `escrow: false`
+> explicitly on the new season. Turning it on never charges
+> retroactively — contracts already running start being debited from the
+> next race imported.
 
 ---
 

@@ -2712,7 +2712,19 @@ async def upsert_budget_config(
     dnf_penalty: Decimal,
     dns_penalty: Decimal,
     penalty_per_incident_pt: Decimal,
+    escrow_enabled: bool | None = None,
 ) -> budget_engine.BudgetConfig:
+    """
+    Create or update one budget_config row.
+
+    `escrow_enabled` is the only optional field, and None means "leave it
+    alone": on an update the stored value is kept, on an insert the column
+    default applies. Every other field is written as given. It is optional
+    because callers that edit rates or enforcement have no opinion about
+    escrow, and a default of True in this signature would silently switch
+    escrow on for a season that had deliberately turned it off — the same
+    revert-what-you-did-not-touch bug as G1.
+    """
     existing = await fetch_budget_config_exact(conn, season_id, tier_id)
     if existing is None:
         row = await conn.fetchrow(
@@ -2720,13 +2732,16 @@ async def upsert_budget_config(
             INSERT INTO budget_config
                 (season_id, tier_id, enforce_budget, rollover_enabled,
                  opening_budget, earnings_per_point, dnf_penalty, dns_penalty,
-                 penalty_per_incident_pt)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 penalty_per_incident_pt, escrow_enabled)
+            -- TRUE mirrors the column DEFAULT in migration 015. Postgres
+            -- cannot take DEFAULT from a parameter, so it is restated
+            -- here; test_escrow_controls pins the two together.
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, TRUE))
             RETURNING *
             """,
             season_id, tier_id, enforce_budget, rollover_enabled,
             opening_budget, earnings_per_point, dnf_penalty, dns_penalty,
-            penalty_per_incident_pt,
+            penalty_per_incident_pt, escrow_enabled,
         )
     else:
         row = await conn.fetchrow(
@@ -2735,13 +2750,14 @@ async def upsert_budget_config(
                SET enforce_budget = $2, rollover_enabled = $3,
                    opening_budget = $4, earnings_per_point = $5,
                    dnf_penalty = $6, dns_penalty = $7,
-                   penalty_per_incident_pt = $8
+                   penalty_per_incident_pt = $8,
+                   escrow_enabled = COALESCE($9, escrow_enabled)
              WHERE id = $1
             RETURNING *
             """,
             existing.id, enforce_budget, rollover_enabled,
             opening_budget, earnings_per_point, dnf_penalty, dns_penalty,
-            penalty_per_incident_pt,
+            penalty_per_incident_pt, escrow_enabled,
         )
     return _row_to_budget_config(row)
 

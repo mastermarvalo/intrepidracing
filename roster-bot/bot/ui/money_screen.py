@@ -1120,8 +1120,17 @@ class _SettingsFlow(AdminOwnedView):
         self.clear_items()
         enforce = bool(cfg and cfg.enforce_budget)
         rollover = bool(cfg and cfg.rollover_enabled)
+        escrow = bool(cfg and cfg.escrow_enabled)
         self.add_item(_ToggleButton(self, field="enforce_budget", value=enforce))
         self.add_item(_ToggleButton(self, field="rollover_enabled", value=rollover))
+        # Disabled until the row exists: this toggle writes one field and
+        # would have to invent an opening budget and every rate to create
+        # it. Edit rates first, which is what the empty-state embed says.
+        self.add_item(
+            _ToggleButton(
+                self, field="escrow_enabled", value=escrow, enabled=cfg is not None
+            )
+        )
         self.add_item(_EditRatesButton(self, row=1))
         self.add_item(BackButton(self._cancel, label="Back to teams", row=2))
         embed = _build_settings_embed(cfg, self.tier_code)
@@ -1145,9 +1154,15 @@ def _build_settings_embed(cfg, tier_code: str | None) -> discord.Embed:
             ),
             color=COLOR_INFO,
         )
+    escrow_note = (
+        "salary charged from cash race by race"
+        if cfg.escrow_enabled
+        else "commitment only — cash is not drawn down"
+    )
     lines = [
         f"Enforce budgets: **{'on' if cfg.enforce_budget else 'off'}**",
         f"Rollover into the next season: **{'on' if cfg.rollover_enabled else 'off'}**",
+        f"Escrow: **{'on' if cfg.escrow_enabled else 'off'}** — {escrow_note}",
         "",
         f"Opening budget: {_m(cfg.opening_budget)}",
         f"Earnings per point: {_m(cfg.earnings_per_point)}",
@@ -1188,14 +1203,18 @@ class _ScopeSelect(discord.ui.Select):
 class _ToggleButton(discord.ui.Button):
     """Flip one boolean, behind a confirm that states what changes."""
 
-    def __init__(self, flow: _SettingsFlow, *, field: str, value: bool) -> None:
+    def __init__(
+        self, flow: _SettingsFlow, *, field: str, value: bool, enabled: bool = True
+    ) -> None:
         label = {
             "enforce_budget": "Enforce budgets",
             "rollover_enabled": "Rollover",
+            "escrow_enabled": "Escrow",
         }[field]
         super().__init__(
             label=f"{label}: {'on' if value else 'off'} → {'off' if value else 'on'}",
             style=discord.ButtonStyle.primary if value else discord.ButtonStyle.secondary,
+            disabled=not enabled,
         )
         self._flow = flow
         self._field = field
@@ -1214,13 +1233,27 @@ class _ToggleButton(discord.ui.Button):
                 "entirely — balances keep being recorded, but nothing is "
                 "blocked by them."
             )
-        else:
+        elif self._field == "rollover_enabled":
             consequence = (
                 "Unspent budget from a finished season can be carried into "
                 "this one by the Offseason wizard's rollover step."
                 if target
                 else "Rollover into this season is refused: teams start on "
                 "the opening budget alone, and any unspent money is lost."
+            )
+        else:
+            consequence = (
+                "Each race will debit that race's share of salary from the "
+                "team's **cash** into escrow, and the total comes back when "
+                "the contract ends, adjusted for how the driver's value "
+                "moved. Nothing is charged at signing and nothing reaches "
+                "back: contracts already running start being charged from "
+                "the next race imported, not retroactively."
+                if target
+                else "Race imports stop debiting salary. Contracts still "
+                "count against the spending cap, but balances are no longer "
+                "drawn down. Money already held on live contracts stays "
+                "held and still settles when they end."
             )
         embed = discord.Embed(
             title=f"⚙ Confirm: {self._field} → {'on' if target else 'off'}",
