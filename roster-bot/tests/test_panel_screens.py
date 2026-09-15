@@ -602,6 +602,45 @@ def test_detail_embed_stays_useful_before_any_valuation_run():
     assert any("no published run" in f.value for f in embed.fields)
 
 
+def test_detail_embed_handles_contract_without_a_published_valuation():
+    """
+    Regression: the P/L field used to `assert detail.pl is not None`
+    inside the `contract_value is not None` branch, but `pl` needs BOTH
+    sides. A league that signed its rosters before publishing a
+    valuation run has contracted drivers with no market value, and every
+    click on the Drivers picker raised AssertionError.
+    """
+    embed = drivers_screen.build_driver_detail_embed(
+        driver_detail(market_value="", contract_value="10.00")
+    )
+    values = "".join(f.value for f in embed.fields)
+    names = [f.name for f in embed.fields]
+
+    assert "$10.00M" in values, "the contract value is known and must show"
+    assert "P/L" in names, "the field stays, so the layout does not shift"
+    assert "no published run" in values
+    assert_embed_within_limits(embed)
+
+
+def test_detail_embed_pl_field_never_asserts_on_any_value_combination():
+    """
+    The panel must render for all four combinations of (market value,
+    contract value) present/absent. Three of them are reachable states
+    on a live server.
+    """
+    for market, contract in (
+        ("12.00", "10.00"), ("", "10.00"), ("12.00", ""), ("", ""),
+    ):
+        embed = drivers_screen.build_driver_detail_embed(
+            driver_detail(
+                market_value=market,
+                contract_value=contract,
+                team="Mercedes" if contract else None,
+            )
+        )
+        assert_embed_within_limits(embed)
+
+
 def test_picker_labels_carry_tier_and_team():
     view = drivers_screen.DriversView(
         summaries=[driver_summary("t1", role_id=100)],

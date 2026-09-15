@@ -463,9 +463,16 @@ def build_driver_detail_embed(detail: workflow.DriverForPanel) -> discord.Embed:
             value=format_money(detail.contract_value),
             inline=True,
         )
+        # P/L needs BOTH sides. A driver can hold a contract before any
+        # valuation run has been published for their tier (a league that
+        # signed its rosters before opening the market), so the absence
+        # of a market value is a normal state, not a broken one.
         pl = detail.pl
-        assert pl is not None  # both market and contract are populated
-        embed.add_field(name="P/L", value=format_pl(pl), inline=True)
+        embed.add_field(
+            name="P/L",
+            value=format_pl(pl) if pl is not None else "— (needs a published run)",
+            inline=True,
+        )
     else:
         embed.add_field(
             name="Contract",
