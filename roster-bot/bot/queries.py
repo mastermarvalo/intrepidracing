@@ -2286,3 +2286,70 @@ async def count_trades_awaiting_approval(conn: asyncpg.Connection, season_id: in
         )
         or 0
     )
+
+
+# ── Approval queue listings (control panel) ──────────────────────────────
+#
+# The counts in `count_*_awaiting_approval` drive the panel's badge; these
+# two return enough detail to render an actionable queue, so a
+# commissioner never has to go hunt for ids.
+
+
+async def fetch_offers_awaiting_approval(
+    conn: asyncpg.Connection, season_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """
+    Offers in `pending_approval`, oldest first, with display names joined.
+
+    Oldest first because the queue is worked front to back — the offer
+    that has been waiting longest is the one holding up a signing.
+    """
+    return await conn.fetch(
+        """
+        SELECT o.id,
+               o.salary,
+               o.term_seasons,
+               o.contract_type,
+               o.signing_bonus,
+               o.offer_kind,
+               o.created_at,
+               d.display_name AS driver_name,
+               t.name         AS team_name,
+               ti.code        AS tier_code
+          FROM contract_offers o
+          JOIN drivers d ON d.id = o.driver_id
+          JOIN teams   t ON t.id = o.team_id
+          JOIN tiers  ti ON ti.id = o.tier_id
+         WHERE o.season_id = $1
+           AND o.state = 'pending_approval'
+         ORDER BY o.created_at ASC
+         LIMIT $2
+        """,
+        season_id,
+        limit,
+    )
+
+
+async def fetch_trades_awaiting_approval(
+    conn: asyncpg.Connection, season_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """Trades in `pending_approval`, oldest first, with team names and size."""
+    return await conn.fetch(
+        """
+        SELECT tr.id,
+               tr.created_at,
+               pt.name AS proposing_team_name,
+               ot.name AS other_team_name,
+               (SELECT COUNT(*) FROM trade_items i WHERE i.trade_id = tr.id)
+                   AS item_count
+          FROM trades tr
+          JOIN teams pt ON pt.id = tr.proposing_team_id
+          JOIN teams ot ON ot.id = tr.other_team_id
+         WHERE tr.season_id = $1
+           AND tr.state = 'pending_approval'
+         ORDER BY tr.created_at ASC
+         LIMIT $2
+        """,
+        season_id,
+        limit,
+    )

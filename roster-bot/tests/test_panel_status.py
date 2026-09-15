@@ -13,7 +13,8 @@ import pytest
 
 from bot import workflow
 from bot.cogs.panel import _next_step_text as next_step
-from bot.cogs.panel import build_setup_embed, build_status_embed
+from bot.cogs.panel import build_status_embed
+from bot.ui.setup_screen import build_setup_embed
 
 EMBED_FIELD_VALUE_LIMIT = 1024
 EMBED_TOTAL_LIMIT = 6000
@@ -31,8 +32,9 @@ def tier(
 ):
     return workflow.TierStatus(
         code=code,
-        name=f"Tier {code}",
+        label=f"Tier {code}",
         driver_count=drivers,
+        has_role=False,
         latest_round_label=round_label,
         latest_round_order=round_order,
         unpublished_run_id=unpublished,
@@ -103,7 +105,7 @@ def test_missing_tiers_comes_before_config():
 
 def test_missing_config_comes_before_drivers():
     s = status(tiers=[tier(drivers=0)], has_config=False)
-    assert "config" in next_step(s).lower()
+    assert "cap" in next_step(s).lower()
 
 
 def test_missing_drivers_comes_before_valuation_work():

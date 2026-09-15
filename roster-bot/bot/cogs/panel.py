@@ -33,6 +33,9 @@ from discord.ext import commands
 
 from bot import workflow
 from bot.panel_help import COMMAND_CATALOG, build_help_embed, help_category_options
+from bot.ui.approvals_screen import open_approvals
+from bot.ui.boards_screen import open_boards
+from bot.ui.setup_screen import open_setup
 
 log = logging.getLogger(__name__)
 
@@ -133,9 +136,13 @@ def _next_step_text(status: workflow.LeagueStatus) -> str:
     if not status.has_tiers:
         return "Add at least one tier → **Setup**"
     if not status.has_config:
-        return "Seed league config (cap, min salary, movement caps) → **Setup**"
+        return "Set the cap, minimum salary and movement caps → **Setup**"
     if not status.has_drivers:
-        return "Register drivers into your tiers → **Setup**"
+        # Deliberately a command, not a button: registering drivers is a
+        # per-person action better suited to autocomplete than a panel,
+        # and naming a button that does not exist is worse than naming
+        # the command that does.
+        return "Register drivers with `/roster add`, then reopen `/league`"
 
     unpublished = [t for t in status.tiers if t.unpublished_run_id is not None]
     if unpublished:
@@ -507,69 +514,21 @@ class _BackHomeButton(discord.ui.Button):
         )
 
 
-# ── Setup ────────────────────────────────────────────────────────────
-
-
-def build_setup_embed(status: workflow.LeagueStatus) -> discord.Embed:
+async def _back_to_home(interaction: discord.Interaction) -> None:
     """
-    A checklist, not a wall of commands.
+    Re-render the home panel from a fresh status read.
 
-    Each line is either done or is the next thing to do, with the exact
-    command to run. Admins can follow it top to bottom on a fresh server.
+    Passed into every screen as its "go back" behaviour so the screens
+    never import this module, which would be circular.
     """
-    steps = [
-        (
-            status.has_season,
-            "Create and activate a season",
-            "`/market-admin season create name:\"Season 7\" preset:f1`\n"
-            "`/market-admin season activate name:\"Season 7\"`",
-        ),
-        (
-            status.has_tiers,
-            "Add your tiers",
-            "`/market-admin tier add code:t1 name:\"Tier 1\" rank_order:1`",
-        ),
-        (
-            status.has_config,
-            "Check league config",
-            "`/market-admin config show` · `/market-admin config edit`\n"
-            "Salary cap, min salary, movement caps, offer expiry.",
-        ),
-        (
-            status.has_drivers,
-            "Register drivers into tiers",
-            "Drivers enter the market when signed to a team roster.",
-        ),
-        (
-            status.commissioner_role_id is not None,
-            "Set the commissioner role",
-            "`/market-admin config role`",
-        ),
-        (
-            status.board_count > 0,
-            "Post market boards",
-            "`/market-admin board add kind:market channel:#market`",
-        ),
-    ]
-
-    embed = discord.Embed(
-        title="⚙ League setup",
-        description="Work down the list. Anything already done is ticked.",
-        color=_COLOR_INFO,
-    )
-    for done, title, detail in steps:
-        mark = "✅" if done else "⬜"
-        embed.add_field(name=f"{mark} {title}", value=detail, inline=False)
-    embed.add_field(
-        name="Google Sheets access",
-        value="Results import needs a service account. See **Google Sheets access** in the "
-        "bot README — it is the most common first-time blocker.",
-        inline=False,
-    )
-    return embed
-
-
-# ── Home ─────────────────────────────────────────────────────────────
+    status = await workflow.fetch_league_status(interaction.guild_id)
+    is_admin = _is_admin(interaction)
+    embed = build_status_embed(status, is_admin=is_admin)
+    view = HomeView(status=status, opener_id=interaction.user.id, is_admin=is_admin)
+    if interaction.response.is_done():
+        await interaction.edit_original_response(embed=embed, view=view)
+    else:
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 class HomeView(_OwnedView):
@@ -584,10 +543,15 @@ class HomeView(_OwnedView):
 
         if is_admin:
             self.add_item(_SetupButton())
-            if status.setup_complete or status.has_tiers:
+            if status.has_tiers:
                 self.add_item(_RaceNightButton())
-            if status.pending_offers or status.pending_trades:
+            # Shown even when empty: "nothing is waiting on you" is a
+            # useful answer, and a button that appears and disappears is
+            # harder to learn than one that is always in the same place.
+            if status.has_season:
                 self.add_item(_ApprovalsButton(status))
+            if status.has_tiers:
+                self.add_item(_BoardsButton(status))
         self.add_item(_HelpButton())
 
 
@@ -596,10 +560,9 @@ class _SetupButton(discord.ui.Button):
         super().__init__(label="Setup", style=discord.ButtonStyle.secondary, emoji="⚙")
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        status = await workflow.fetch_league_status(interaction.guild_id)
-        view = _OwnedView(opener_id=interaction.user.id)
-        view.add_item(_BackHomeButton())
-        await interaction.response.edit_message(embed=build_setup_embed(status), view=view)
+        await open_setup(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
+        )
 
 
 class _RaceNightButton(discord.ui.Button):
@@ -638,6 +601,11 @@ class _RaceNightButton(discord.ui.Button):
 
 
 class _ApprovalsButton(discord.ui.Button):
+    """
+    Opens the live queue. The count is baked into the label so an admin
+    can see there is work waiting without opening anything.
+    """
+
     def __init__(self, status: workflow.LeagueStatus) -> None:
         total = status.pending_offers + status.pending_trades
         super().__init__(
@@ -647,28 +615,37 @@ class _ApprovalsButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        status = await workflow.fetch_league_status(interaction.guild_id)
-        embed = discord.Embed(
-            title="📋 Awaiting approval",
-            description=(
-                f"**{status.pending_offers}** contract offer(s)\n"
-                f"**{status.pending_trades}** trade(s)"
-            ),
-            color=_COLOR_WARN if (status.pending_offers or status.pending_trades) else _COLOR_OK,
+        await open_approvals(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
         )
-        embed.add_field(
-            name="Approve or reject",
-            value=(
-                "`/market-admin approve offer_id:<id>`\n"
-                "`/market-admin reject offer_id:<id> note:<why>`\n"
-                "`/market-admin approve-trade trade_id:<id>`\n"
-                "`/market-admin reject-trade trade_id:<id> note:<why>`"
+
+
+class _BoardsButton(discord.ui.Button):
+    """
+    Boards are reachable from home as well as from Setup.
+
+    The home panel's "next step" line can point here once a league is
+    otherwise configured but has no public market board, and a button it
+    names has to exist.
+    """
+
+    def __init__(self, status: workflow.LeagueStatus) -> None:
+        super().__init__(
+            label=(
+                "Boards" if status.board_count else "Boards (none yet)"
             ),
-            inline=False,
+            style=(
+                discord.ButtonStyle.secondary
+                if status.board_count
+                else discord.ButtonStyle.primary
+            ),
+            emoji="📊",
         )
-        view = _OwnedView(opener_id=interaction.user.id)
-        view.add_item(_BackHomeButton())
-        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_boards(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
+        )
 
 
 class _HelpButton(discord.ui.Button):

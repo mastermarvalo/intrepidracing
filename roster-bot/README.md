@@ -109,8 +109,48 @@ t3 · 16 driver(s) · no results imported
 Next step
 Run #38 for t1 is priced but not published. Review and publish it → Race Night
 
-[ Setup ]  [ Race Night ]  [ Approvals (4) ]  [ Help ]
+[ Setup ]  [ Race Night ]  [ Approvals (4) ]  [ Boards ]  [ All commands ]
 ```
+
+### Setup
+
+**Setup** is a checklist that fills itself in. Each line is either ticked
+or is the next thing to do, and each button opens the dialog for it —
+no argument names, no channel or role ids to copy.
+
+```text
+⚙️ League setup
+✅ Season — Season 7 is active
+✅ Tiers — 3 configured (t1, t2, t3)
+⬜ Drivers — none yet, add them with /roster add
+
+Tiers
+t1 Tier 1 · 0 driver(s) · 🏷 role linked
+t2 Tier 2 · 0 driver(s)
+t3 Tier 3 · 0 driver(s)
+
+[ 📅 Season ]  [ 🧱 Tier ]  [ 💰 Cap & rules ]
+[ 🏷 Tier role ]  [ 🧑‍⚖️ Commissioner role ]  [ 📣 Channels ]
+[ 📊 Boards ]  [ ◀ Back to home ]
+```
+
+| Button | Replaces |
+|---|---|
+| Season | `season create` + `season activate` |
+| Tier | `tier add` |
+| Cap & rules | `config edit` |
+| Tier role | `tier edit role:` |
+| Commissioner role | `config role` |
+| Channels | `config channel` |
+| Boards | `board add` / `remove` / `refresh` / `list` |
+
+Buttons for steps that cannot work yet are greyed out — you can't add a
+tier before a season exists. Roles and channels use Discord's own
+pickers, so ids are never typed by hand. Choosing the **f1** preset when
+creating a season seeds three tiers, the scoring table, the valuation
+factors and the default **$145.00M** salary cap in one step.
+
+### Race Night
 
 **Race Night** is the weekly loop in the order it happens: pick a tier →
 paste the sheet URL in a popup → import → price → review the movers →
@@ -118,8 +158,47 @@ publish. The panel remembers each tier's sheet URL for the rest of the
 session, so a three-tier race night means pasting three URLs once, not
 re-typing them at each step.
 
+### Approvals
+
+**Approvals** is a live queue, not a list of ids to go and type. Every
+pending offer and trade is listed oldest-first with its terms; pick one
+and approve or reject it in place. Rejecting prompts for an optional
+reason, which lands in the audit log.
+
+```text
+📋 Awaiting approval
+3 contract offer(s) and 1 trade(s) in Season 7.
+
+Contract offers
+17 · ZeezinDomar → McLaren (t1) · $22.00M/season × 2
+18 · DuelExploration → Aston Martin (t2) · $6.25M/season × 1
+
+Trades
+42 · Williams ⇄ Aston Martin · 2 contract(s)
+
+[ Pick an item to review… ▼ ]
+[ ◀ Back ]
+```
+
+Approving runs exactly the same code as `/market-admin approve`: the
+money commits inside the transaction, the team role is assigned after
+it, and a role failure is reported without undoing the contract.
+
+### Boards
+
+**Boards** lists every auto-updating market embed with its id, kind,
+tier and channel, and flags any that have no message yet — almost always
+missing **Send Messages** or **Embed Links** in that channel. Adding one
+is a three-step wizard (kind → tier → channel) that refuses the invalid
+combinations: tier boards must have a tier, the cross-tier dashboard
+must not.
+
 Everything the panel does is also still a slash command, and the panel
 calls the same code as the commands — nothing was removed or renamed.
+All 74 commands are still there. Setup, Approvals and Boards route
+through `bot/workflow.py` and `bot/approvals.py`, which the
+`/market-admin` commands now call too, so there is one code path per
+operation regardless of which route you take.
 The panel is a shortcut, not a replacement. Buttons are usable only by
 the person who opened the panel, and admin-only actions still check
 Manage Server.
