@@ -140,6 +140,7 @@ roster-bot/
 docs/
   ADR-001-f1-with-generic-future.md   BINDING architecture decision
   MARKET_GUIDE.md                     league-member walkthrough
+  RUNNING_YOUR_LEAGUE.md              owner runbook: install → first race → offseason
 ```
 
 ---
@@ -432,7 +433,7 @@ sheets: add list refresh remove
 
 ## 8. The control panel
 
-`/league` is the intended entry point for admins. It exists because 74
+`/league` is the intended entry point for admins. It exists because 83
 slash commands is an unusable discovery surface. The panel wraps them in
 a guided flow; it **adds** a layer and removes nothing.
 
