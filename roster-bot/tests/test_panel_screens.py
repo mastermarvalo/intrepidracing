@@ -947,6 +947,42 @@ def test_free_agency_button_is_disabled_without_a_season():
     )
 
 
+def test_teams_button_appears_and_is_disabled_without_a_season():
+    view = setup_screen.SetupView(
+        status=league_status(season=None, season_id=None, tiers=[], has_config=False),
+        opener_id=1,
+        on_back=noop_back,
+    )
+    by_label = {c.label: c for c in view.children if getattr(c, "label", None)}
+
+    assert "Teams" in by_label
+    assert by_label["Teams"].disabled
+
+
+def test_teams_embed_lists_names_and_payrolls():
+    teams = [
+        workflow.TeamForPanel(team_id=1, key="a", name="Alpha", payroll=Decimal("15.00")),
+        workflow.TeamForPanel(team_id=2, key="b", name="Beta", payroll=Decimal("5.00")),
+    ]
+    embed = setup_screen._build_teams_embed(teams)
+
+    assert "Alpha" in embed.description
+    assert "$15.00M" in embed.description
+    assert "Beta" in embed.description
+
+
+def test_boards_view_exposes_single_board_refresh_when_boards_exist():
+    view = boards_screen.BoardsView(
+        boards=[board(1), board(2)], opener_id=1, on_back=noop_back
+    )
+
+    selects = [c for c in view.children if isinstance(c, discord.ui.Select)]
+    assert any(
+        isinstance(s, boards_screen._RefreshOneSelect) for s in selects
+    )
+    assert_view_within_limits(view)
+
+
 def test_channel_kind_options_match_the_workflow_list():
     parent = setup_screen.SetupView(
         status=league_status(), opener_id=1, on_back=noop_back

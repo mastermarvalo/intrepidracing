@@ -964,3 +964,59 @@ async def test_set_free_agency_rejects_missing_config_row(workflow_db):
     await workflow.create_and_activate_season(guild_id=GUILD, name="empty")
     with pytest.raises(workflow.WorkflowError, match="config row"):
         await workflow.set_free_agency(guild_id=GUILD, is_open=True)
+
+
+# ── team cap adjustments ─────────────────────────────────────────────
+
+
+async def test_list_teams_sorts_by_payroll_desc(workflow_db):
+    await _seeded_season(workflow_db)
+    await _driver_with_contract(
+        workflow_db, team_key="a", contract_value="15.00", member_id=1,
+    )
+    await _driver_with_contract(
+        workflow_db, team_key="b", contract_value="5.00",
+        member_id=2, display_name="B",
+    )
+
+    teams = await workflow.list_teams(GUILD)
+
+    assert [t.key for t in teams] == ["a", "b"], "highest payroll first"
+    assert teams[0].payroll == Decimal("15.00")
+
+
+async def test_adjust_team_cap_appends_ledger_row(workflow_db):
+    await _seeded_season(workflow_db)
+    await _driver_with_contract(workflow_db, team_key="a")
+
+    await workflow.adjust_team_cap(
+        guild_id=GUILD, actor_id=42,
+        team_key="a", delta=Decimal("-2.50"), note="stewards' sanction",
+    )
+
+    row = await workflow_db.fetchrow(
+        "SELECT amount, kind FROM contract_ledger "
+        "WHERE kind = 'cap_adjustment' ORDER BY created_at DESC LIMIT 1",
+    )
+    assert row["kind"] == "cap_adjustment"
+    assert row["amount"] == Decimal("-2.50")
+
+
+async def test_adjust_team_cap_requires_a_note(workflow_db):
+    await _seeded_season(workflow_db)
+    await _driver_with_contract(workflow_db, team_key="a")
+
+    with pytest.raises(workflow.WorkflowError, match="note"):
+        await workflow.adjust_team_cap(
+            guild_id=GUILD, actor_id=1,
+            team_key="a", delta=Decimal("1.0"), note="   ",
+        )
+
+
+async def test_adjust_team_cap_rejects_unknown_team(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="No team"):
+        await workflow.adjust_team_cap(
+            guild_id=GUILD, actor_id=1,
+            team_key="ghost", delta=Decimal("1.0"), note="test",
+        )

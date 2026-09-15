@@ -25,7 +25,7 @@ ab25adc  Phase 6: race-results ingestion and normalization
 d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
-- **500 tests passing**, 27 test modules.
+- **533 tests passing**, 27 test modules.
 - **77 slash commands** across 7 groups.
 - **11 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
@@ -79,7 +79,7 @@ roster-bot/
     db.py              75   asyncpg pool, connect() context manager (auto transaction),
                             _run_migrations() applies migrations/*.sql in sorted filename order
     models.py         235   dataclasses: Team, TeamSlot, GuildConfig, StatBoard, LeagueConfig, …
-    queries.py       2367   ALL SQL. Functions take an open asyncpg.Connection
+    queries.py       2405   ALL SQL. Functions take an open asyncpg.Connection
     limits.py          53   Discord protocol limits + render widths (deliberately outside
                             the magic-number guard — protocol facts, not league policy)
     roster_ops.py     106   sign_to_team / drop_from_team — the ONLY role-mutation path
@@ -89,7 +89,7 @@ roster-bot/
     sheets.py         245   Google Sheets fetch/format
     results_ingest.py 293   CSV/Sheets → parsed race results, Discord-free
     approvals.py      341   Discord-AWARE approval orchestration
-    workflow.py      1211   Discord-FREE shared layer behind the panel and the cogs
+    workflow.py      1621   Discord-FREE shared layer behind the panel and the cogs
     panel_help.py     214   /help catalog, built from live tree.walk_commands()
 
     market/
@@ -111,10 +111,11 @@ roster-bot/
     ui/                     Interactive panel screens (discord.ui views/modals)
       base.py         125   OwnedView, AdminOwnedView, BackButton, truncate_field,
                             report_error, PANEL_TIMEOUT_SECONDS, MODAL_MAX_INPUTS
-      setup_screen.py 681   guided setup checklist + season/tier/role/channel flows
+      setup_screen.py 1198  setup checklist + season/tier menus, config, roles, channels, FA, teams
       approvals_screen.py 359  approval queue browser with detail + reject modal
-      boards_screen.py 325  board add/remove wizard
+      boards_screen.py 368  board add/remove/refresh (single or all)
       drivers_screen.py 807  enrol + sync + per-driver detail (void, set-status, promote, relegate)
+      history_screen.py 544  Race Night → history: valuation list/preview + rounds list/show
       config_modal.py 460   league config editors (money limits / contract rules)
 
     cogs/
@@ -124,7 +125,7 @@ roster-bot/
       contracts.py   1082   /contract (9)
       trades.py       393   /trade (5)
       admin_market.py 1769  /market-admin (34)
-      panel.py        765   /league + /help (2)
+      panel.py        783   /league + /help (2)
 
   migrations/               001–012, forward-only
   scripts/check_magic_numbers.py  125  the ADR-001 CI guard
@@ -368,12 +369,14 @@ a guided flow; it **adds** a layer and removes nothing.
 
 ```
 /league
-├── ⚙️  Setup      → guided checklist (season → tiers → rules → roles → channels → boards)
-├── 🏁 Race Night  → import results → preview valuation → publish   (needs tiers)
-├── 👥 Drivers     → enrol / sync + click a driver for per-driver admin actions (needs tiers)
-│                    (detail view drives void, set-status, promote, relegate)
+├── ⚙️  Setup      → season menu · tier menu · cap & rules · roles · channels · boards
+│                    · free-agency toggle · teams (cap adjust)
+├── 🏁 Race Night  → import → preview valuation → publish (needs tiers)
+│   └── 📜 History → valuation list/preview + race rounds list/show
+├── 👥 Drivers     → enrol / sync + click a driver for per-driver admin actions
+│                    (detail drives void, set-status, promote, relegate)
 ├── 📋 Approvals   → pending offer + trade queue with detail view    (needs season)
-└── 📊 Boards      → add / remove / refresh market boards            (needs tiers)
+└── 📊 Boards      → add / remove / refresh all or one board          (needs tiers)
 ```
 
 Buttons for steps that cannot work yet are greyed out — you cannot add a

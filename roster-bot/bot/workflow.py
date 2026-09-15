@@ -1538,6 +1538,74 @@ async def set_free_agency(
         )
 
 
+# ── Team cap adjustments (rare admin action) ─────────────────────────
+
+
+@dataclass(frozen=True)
+class TeamForPanel:
+    team_id: int
+    key: str
+    name: str
+    payroll: Decimal
+
+
+async def list_teams(guild_id: int) -> list[TeamForPanel]:
+    """Every team in the guild with its current payroll (highest first)."""
+    async with db.connect() as conn:
+        teams = await queries.fetch_all_teams(conn, guild_id)
+        out: list[TeamForPanel] = []
+        for t in teams:
+            payroll = await queries.fetch_team_payroll(conn, t.id)
+            out.append(
+                TeamForPanel(
+                    team_id=t.id, key=t.key, name=t.name, payroll=payroll
+                )
+            )
+    out.sort(key=lambda t: (-(t.payroll or Decimal("0")), t.name.casefold()))
+    return out
+
+
+async def adjust_team_cap(
+    *,
+    guild_id: int,
+    actor_id: int,
+    team_key: str,
+    delta: Decimal,
+    note: str,
+) -> Decimal:
+    """
+    Append a `cap_adjustment` ledger row for the team.
+
+    Returns the delta as recorded so the caller can echo the sign back.
+    Mirrors `/market-admin adjust-cap` — Phase 4 records this in the
+    ledger only; enforcement lands later.
+    """
+    if not note.strip():
+        raise WorkflowError("Cap adjustments require a note for the audit trail.")
+    async with db.connect() as conn:
+        team = await queries.fetch_team(conn, guild_id, team_key.lower())
+        if team is None:
+            raise WorkflowError(f"No team `{team_key}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        # Cap adjustments are per-team, not per-tier, so the tier column
+        # takes any tier in the season for schema satisfaction. The
+        # ledger detail carries the semantic meaning.
+        tier_row = (await queries.fetch_all_tiers(conn, season.id))[0]
+        await queries.append_ledger(
+            conn,
+            season_id=season.id,
+            tier_id=tier_row.id,
+            team_id=team.id,
+            kind="cap_adjustment",
+            amount=delta,
+            detail={"note": note, "team_key": team.key},
+            actor_id=actor_id,
+        )
+    return delta
+
+
 async def list_tier_choices(guild_id: int) -> list[tuple[str, str]]:
     """
     `(code, label)` pairs for the active season's tiers, in rank order.

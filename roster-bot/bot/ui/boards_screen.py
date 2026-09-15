@@ -252,11 +252,12 @@ class BoardsView(AdminOwnedView):
 
         if boards:
             self.add_item(_RemoveBoardSelect(boards, self))
+            self.add_item(_RefreshOneSelect(boards, self))
 
-        self.add_item(_AddBoardButton(row=1))
+        self.add_item(_AddBoardButton(row=2))
         if boards:
-            self.add_item(_RefreshBoardsButton(row=1))
-        self.add_item(BackButton(on_back, row=1))
+            self.add_item(_RefreshBoardsButton(row=2))
+        self.add_item(BackButton(on_back, row=2))
 
     async def reload(
         self, interaction: discord.Interaction, *, note: str | None = None
@@ -312,6 +313,48 @@ class _RefreshBoardsButton(discord.ui.Button):
             await report_error(interaction, str(exc))
             return
         await view.reload(interaction, note="✅ Refreshed every board.")
+
+
+class _RefreshOneSelect(discord.ui.Select):
+    """
+    Re-render one board in place.
+
+    Useful when a single board is showing stale content (e.g. bot lost
+    the message, admin deleted it) and re-posting just the one is
+    quicker than refreshing every board.
+    """
+
+    def __init__(self, boards: list[workflow.BoardInfo], parent: BoardsView) -> None:
+        super().__init__(
+            placeholder="Refresh one board…",
+            options=[
+                discord.SelectOption(
+                    label=(
+                        f"#{b.board_id} "
+                        f"{workflow.BOARD_KIND_LABELS.get(b.kind, b.kind)}"
+                    )[:100],
+                    value=str(b.board_id),
+                    description=(
+                        f"{'tier ' + b.tier_code if b.tier_code else 'cross-tier'}"
+                    )[:100],
+                )
+                for b in boards[:SELECT_MAX_OPTIONS]
+            ],
+            disabled=not boards,
+        )
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        board_id = int(self.values[0])
+        try:
+            await workflow.refresh_boards(interaction.client, board_id=board_id)
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        await self._parent.reload(
+            interaction, note=f"✅ Refreshed board `{board_id}`."
+        )
 
 
 async def open_boards(

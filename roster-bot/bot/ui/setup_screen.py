@@ -15,6 +15,8 @@ commands lack; it routes to the identical `bot.workflow` functions.
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
+
 import discord
 
 from bot import workflow
@@ -506,7 +508,8 @@ class SetupView(AdminOwnedView):
         self.add_item(_ChannelsButton(row=1, enabled=has_season))
         self.add_item(_BoardsButton(row=2, enabled=status.has_tiers))
         self.add_item(_FreeAgencyButton(row=2, enabled=has_season))
-        self.add_item(BackButton(on_back, label="Back to home", row=2))
+        self.add_item(_TeamsButton(row=2, enabled=has_season))
+        self.add_item(BackButton(on_back, label="Back to home", row=3))
 
     async def reload(
         self, interaction: discord.Interaction, *, note: str | None = None
@@ -542,6 +545,10 @@ class SetupView(AdminOwnedView):
 
     async def open_free_agency(self, interaction: discord.Interaction) -> None:
         view = _FreeAgencyView(parent=self)
+        await view.render(interaction)
+
+    async def open_teams(self, interaction: discord.Interaction) -> None:
+        view = _TeamsView(parent=self)
         await view.render(interaction)
 
 
@@ -1038,5 +1045,154 @@ class _FreeAgencyToggle(discord.ui.Button):
         await self._parent.render(interaction)
         await interaction.followup.send(
             "✅ Free agency " + ("opened." if not self._current else "closed."),
+            ephemeral=True,
+        )
+
+
+# ── teams (cap adjustment shelf) ─────────────────────────────────────
+
+
+class _TeamsButton(discord.ui.Button):
+    def __init__(self, *, row: int, enabled: bool) -> None:
+        super().__init__(
+            label="Teams",
+            style=_style(enabled),
+            emoji="🏎",
+            row=row,
+            disabled=not enabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, SetupView)
+        await view.open_teams(interaction)
+
+
+class _TeamsView(AdminOwnedView):
+    """
+    List teams with current payroll, and offer per-team cap adjustment.
+
+    Cap adjustments are audit-ledger writes (Phase 4 records only —
+    enforcement lands later per the underlying command's own docstring),
+    so this screen is intentionally read-heavy with one write action.
+    """
+
+    def __init__(self, *, parent: SetupView) -> None:
+        super().__init__(opener_id=parent.opener_id)
+        self.parent = parent
+
+    async def render(self, interaction: discord.Interaction) -> None:
+        teams = await workflow.list_teams(interaction.guild_id)
+        self.clear_items()
+        if teams:
+            self.add_item(_AdjustCapSelect(self, teams))
+        self.add_item(BackButton(self._back))
+        embed = _build_teams_embed(teams)
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await self.parent.reload(interaction)
+
+
+def _build_teams_embed(teams) -> discord.Embed:
+    if not teams:
+        return discord.Embed(
+            title="🏎 Teams",
+            description=(
+                "No teams yet. Create one with `/roster create` — the "
+                "roster commands remain the source of truth for team "
+                "membership."
+            ),
+            color=COLOR_INFO,
+        )
+    lines = [
+        f"**{t.name}** (`{t.key}`) — payroll ${t.payroll:,.2f}M"
+        for t in teams
+    ]
+    return discord.Embed(
+        title="🏎 Teams",
+        description=truncate_field("\n".join(lines)),
+        color=COLOR_INFO,
+    ).set_footer(
+        text="Cap adjustments write an audit-ledger row · "
+             "equivalent: /market-admin adjust-cap"
+    )
+
+
+class _AdjustCapSelect(discord.ui.Select):
+    def __init__(self, parent: _TeamsView, teams) -> None:
+        super().__init__(
+            placeholder="Adjust cap for which team?",
+            options=[
+                discord.SelectOption(
+                    label=f"{t.name} · payroll ${t.payroll:,.2f}M"[:100],
+                    value=t.key,
+                )
+                for t in teams[:SELECT_MAX_OPTIONS]
+            ],
+        )
+        self._parent = parent
+        self._by_key = {t.key: t for t in teams}
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        team = self._by_key[self.values[0]]
+        await interaction.response.send_modal(_CapAdjustModal(self._parent, team))
+
+
+class _CapAdjustModal(discord.ui.Modal, title="Adjust team cap"):
+    """
+    Records a cap_adjustment ledger entry.
+
+    Delta accepts a signed dollar-in-millions value (e.g. `-2.5` or
+    `+1.0`); the note is required for the audit trail.
+    """
+
+    def __init__(self, parent: _TeamsView, team) -> None:
+        super().__init__()
+        self._parent = parent
+        self._team = team
+        self._delta = discord.ui.TextInput(
+            label="Delta in $M (positive = more space)",
+            placeholder="e.g. -2.5 or +1.0",
+            max_length=16,
+        )
+        self._note = discord.ui.TextInput(
+            label="Reason (required — audit trail)",
+            placeholder="e.g. luxury-tax refund, sanction from stewards…",
+            max_length=200,
+        )
+        self.add_item(self._delta)
+        self.add_item(self._note)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = str(self._delta.value).strip().lstrip("+").rstrip("Mm").replace("$", "")
+        try:
+            delta = Decimal(raw)
+        except InvalidOperation:
+            await report_error(
+                interaction,
+                f"Could not read `{self._delta.value}` as a dollar delta.",
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            recorded = await workflow.adjust_team_cap(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                team_key=self._team.key,
+                delta=delta,
+                note=str(self._note.value),
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        sign = "+" if recorded >= Decimal("0") else ""
+        await self._parent.render(interaction)
+        await interaction.followup.send(
+            f"✅ Cap adjustment for **{self._team.name}**: {sign}${recorded}M. "
+            f"(Ledger only — enforcement lands in Phase 5.)",
             ephemeral=True,
         )
