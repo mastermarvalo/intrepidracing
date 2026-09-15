@@ -154,7 +154,9 @@ async def snapshot(
         config=cfg,
         balance=balance,
         effective_payroll=payroll,
-        available=budget_engine.available_to_spend(balance, payroll),
+        available=budget_engine.available_to_spend(
+            balance, payroll, escrow_enabled=cfg.escrow_enabled,
+        ),
         opened_now=opened,
     )
 
@@ -348,6 +350,16 @@ async def rollover(
     if not to_cfg.rollover_enabled:
         raise BudgetError("Rollover is disabled for the target season.")
 
+    # Whether salary was taken in cash is a property of the season being
+    # carried FROM, not the one being carried into: that is the season
+    # whose balance already had its escrow debits applied. Reading the
+    # target's flag here would net off a season of payroll that the
+    # source season never charged (or charge it twice). A source season
+    # with no config at all is treated as commitment-only, matching how
+    # every season behaved before migration 015.
+    from_cfg = await queries.fetch_budget_config(conn, from_season_id, None)
+    from_escrow = from_cfg.escrow_enabled if from_cfg is not None else False
+
     lines: list[RolloverLine] = []
     for team_id, team_name in teams:
         if await queries.budget_entry_exists(conn, team_id, to_season_id, KIND_ROLLOVER):
@@ -363,7 +375,9 @@ async def rollover(
         from_payroll = await queries.fetch_team_season_payroll(
             conn, team_id, from_season_id
         )
-        carried = budget_engine.rollover_amount(from_balance, from_payroll)
+        carried = budget_engine.rollover_amount(
+            from_balance, from_payroll, escrow_enabled=from_escrow,
+        )
         # The opening balance for the new season is credited alongside
         # the rollover so the target season's first row is never a
         # bare rollover with no baseline underneath it.
@@ -390,6 +404,7 @@ async def rollover(
                 "from_season_id": str(from_season_id),
                 "from_balance": str(from_balance),
                 "from_effective_payroll": str(from_payroll),
+                "escrow_enabled": str(from_escrow),
             },
             actor_id=actor_id,
         )

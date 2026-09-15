@@ -33,6 +33,9 @@ def _baseline_ok() -> rules.OfferInputs:
         has_linked_release=False,
         term_seasons=2,
         max_term_seasons=3,
+        term_races=24,
+        min_term_races=1,
+        max_term_races=48,
         offer_kind="new",
         free_agency_open=True,
     )
@@ -276,6 +279,63 @@ def test_validation_to_json_is_serialisable():
     assert isinstance(dumped, str)
 
 
+def test_price_floor_is_inert_until_premiums_are_configured():
+    """
+    Both premiums default to zero, which is how this league priced its
+    first seven seasons. At zero the floor can only ever be the league
+    salary minimum, so an offer at market value must pass — otherwise
+    enabling Phase 9 would silently reprice every contract in the league.
+    """
+    at_market = _replace(
+        _baseline_ok(),
+        salary=Decimal("20.00"), driver_base_value=Decimal("20.00"),
+        term_races=36, min_term_races=5,
+    )
+    v = rules.validate_offer(at_market)
+    assert v.ok, [b.code for b in v.blockers]
+
+
+def test_resigning_your_own_driver_costs_more_than_signing_a_rivals():
+    """The anti-cycling rule: the same deal must cost the incumbent more."""
+    common = dict(
+        driver_base_value=Decimal("20.00"), term_races=36, min_term_races=5,
+        length_premium_pct=Decimal("0.005"),
+        resign_premium_pct=Decimal("0.150"),
+    )
+    rival = _replace(_baseline_ok(), salary=Decimal("23.10"),
+                     is_resign=False, **common)
+    incumbent = _replace(_baseline_ok(), salary=Decimal("23.10"),
+                         is_resign=True, **common)
+
+    assert rules.validate_offer(rival).ok
+    blocked = rules.validate_offer(incumbent)
+    assert not blocked.ok
+    codes = [b.code for b in blocked.blockers]
+    assert "salary_below_price_floor" in codes
+    floor_note = next(
+        r for r in blocked.results if r.code == "salary_below_price_floor"
+    )
+    assert floor_note.detail["price_floor"] == "26.57"
+    assert "re-signing premium" in floor_note.message
+
+
+def test_an_unpriced_driver_is_still_signable_but_says_so():
+    """
+    A driver enrolled mid-season has no valuation, so no floor can be
+    derived. Blocking would make him unsignable; passing silently would
+    imply a check that never happened.
+    """
+    unpriced = _replace(
+        _baseline_ok(), salary=Decimal("5.00"), driver_base_value=None,
+        term_races=36, min_term_races=5,
+        resign_premium_pct=Decimal("0.150"),
+    )
+    v = rules.validate_offer(unpriced)
+    assert v.ok
+    note = next(r for r in v.results if r.code == "price_floor_unpriced")
+    assert "not checked against a market value" in note.message
+
+
 def test_every_documented_rule_code_is_reachable():
     # This test locks the codes rule_codes() advertises. Adding a new
     # rule requires either extending rule_codes() OR explicitly
@@ -308,6 +368,16 @@ def test_every_documented_rule_code_is_reachable():
                  max_incentive_pct=Decimal("0.15")),
         _replace(_baseline_ok(), free_agency_open=False),
         _replace(_baseline_ok(), duplicate_open_offer_exists=True),
+        _replace(_baseline_ok(), term_races=0),
+        _replace(_baseline_ok(), term_races=1, min_term_races=5),
+        _replace(_baseline_ok(), term_races=999, max_term_races=48),
+        # Price floor: a $20 driver on a 36-race deal with a 5-race
+        # minimum and both premiums live cannot be had for $5.
+        _replace(_baseline_ok(),
+                 salary=Decimal("5.00"), driver_base_value=Decimal("20.00"),
+                 term_races=36, min_term_races=5,
+                 length_premium_pct=Decimal("0.005"),
+                 resign_premium_pct=Decimal("0.150"), is_resign=True),
     ]
     for scenario in scenarios:
         v = rules.validate_offer(scenario)

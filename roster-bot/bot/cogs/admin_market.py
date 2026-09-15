@@ -66,6 +66,7 @@ from bot.contracts import service as contracts_service
 from bot.market import driver_ops
 from bot.market import results as results_engine
 from bot.market.money import format_money, format_pl
+from bot.ui import receipts
 from bot.ui.config_modal import ConfigSectionView, build_config_embed
 
 log = logging.getLogger(__name__)
@@ -197,6 +198,48 @@ class AdminMarketCog(commands.Cog):
             f"Created season **{created.name}** (id `{created.season_id}`)."
             f"{preset_note}\nUse `/market-admin season activate {created.name}` "
             "to make it active.",
+            ephemeral=True,
+        )
+
+    @season.command(
+        name="seed-preset",
+        description="Seed the F1 preset into a season created without one",
+    )
+    @app_commands.describe(name="Season name")
+    @app_commands.choices(
+        preset=[app_commands.Choice(name="F1 25/26", value="f1")]
+    )
+    async def season_seed_preset(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        preset: app_commands.Choice[str] | None = None,
+    ) -> None:
+        """
+        G2 recovery: a season created without a preset had no tiers and
+        no league config, and nothing could ever give it either. Refuses
+        to touch a season that is already set up.
+        """
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await workflow.seed_preset_into_season(
+                guild_id=interaction.guild_id,
+                name=name,
+                preset=(preset.value if preset is not None else "f1"),
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.followup.send(f"\u274c {exc}", ephemeral=True)
+            return
+
+        await interaction.followup.send(
+            f"\u2705 Seeded the F1 preset into **{result.name}**: "
+            f"{result.tiers_created} tier(s), lookups, valuation factors "
+            f"and a default league config.\nNext: assign tier roles from "
+            f"`/league` \u2192 Setup, then sync drivers.",
             ephemeral=True,
         )
 
@@ -487,10 +530,10 @@ class AdminMarketCog(commands.Cog):
         if cfg is None:
             scope = f"tier `{tier}`" if tier else "the season default"
             await interaction.response.send_message(
-                f"No league_config row for {scope}. Seed one first by creating a "
-                f"season with `--preset f1`, or (for a tier override) copy from the "
-                f"season default by editing without a tier once, then re-run with "
-                f"a tier.",
+                f"No league_config row for {scope}. Seed one with "
+                f"`/market-admin season seed-preset`, or (for a tier "
+                f"override) copy from the season default by editing without "
+                f"a tier once, then re-run with a tier.",
                 ephemeral=True,
             )
             return
@@ -682,6 +725,7 @@ class AdminMarketCog(commands.Cog):
                 round_label=round_label,
                 published=False,
                 outcomes=result.outcomes,
+                priced_round=result.priced_round,
             ),
             ephemeral=True,
         )
@@ -1125,10 +1169,11 @@ class AdminMarketCog(commands.Cog):
             await interaction.followup.send(str(exc), ephemeral=True)
             return
 
-        role_note = (
-            f"\n\u26a0 Role not assigned: {result.role_warning}"
-            if result.role_warning
-            else ""
+        # Every warning the approval produced: a missing valuation, an
+        # unassigned role, or an announcement that never went out. Each
+        # one is otherwise silent.
+        role_note = "".join(
+            f"\n\u26a0 {warning}" for warning in result.warnings
         )
         await interaction.followup.send(
             f"\u2705 Approved offer `{offer_id}` \u2192 contract "
@@ -1501,7 +1546,7 @@ class AdminMarketCog(commands.Cog):
                 + ("\u2026" if len(missing) > _MAX_LISTED_NAMES else "")
                 + ". They will score nothing for this round."
             )
-        lines.extend(_render_budget_outcome(outcome))
+        lines.extend(receipts.render_money_outcome(outcome))
         lines.append(
             f"Next: `/market-admin valuation run tier: {tier} "
             f"round_label: {round_label}` to price it (dry-run)."
@@ -1922,6 +1967,14 @@ def _delta_arrow(delta: Decimal) -> str:
     return "•"
 
 
+BASELINE_RUN_WARNING = (
+    "\u26a0 No imported results under that round label, so this is a "
+    "**baseline** run \u2014 no driver moves. That is expected before a "
+    "season's first race. If you expected movement, check the round "
+    "label spelling against `/results list`."
+)
+
+
 def _render_valuation_preview(
     *,
     run_id: int,
@@ -1929,12 +1982,21 @@ def _render_valuation_preview(
     round_label: str,
     published: bool,
     outcomes,
+    priced_round: bool = True,
 ) -> str:
     """
     Two-line-per-driver Discord-safe layout (see CLAUDE.md §5). Mirrors
     what the public `/market view` will render in Phase 3.
+
+    G8: `priced_round` is False when no imported round matched the label
+    given. The panel already warned about this; the typed command did
+    not, so a single mistyped round label produced a silent baseline run
+    whose values looked authoritative and could then be published over a
+    real market. Defaults to True so existing callers are unaffected.
     """
     header = _preview_header(run_id, tier_code, round_label, published)
+    if not priced_round:
+        header = f"{header}\n{BASELINE_RUN_WARNING}"
     body_lines: list[str] = []
     for v in outcomes:
         body_lines.extend(_preview_body_lines(
@@ -2013,30 +2075,6 @@ def _join_preview(
         )
     tail = ("\n" + "\n".join(tail_bits)) if tail_bits else ""
     return header + "\n" + "\n".join(body_lines) + tail
-
-
-def _render_budget_outcome(outcome: workflow.ImportOutcome) -> list[str]:
-    """Budget lines for the results-import receipt; empty when not enforced."""
-    b = outcome.budget
-    if b is None:
-        return []
-    lines = [
-        f"\U0001f4b0 Budgets: {b.entries_written} entr(ies) written \u2014 "
-        f"+{format_money(b.total_credited)} earned, "
-        f"\u2212{format_money(b.total_debited)} in penalties"
-        + (f", {b.corrections_written} correction(s)" if b.corrections_written else "")
-        + "."
-    ]
-    if outcome.budget_unattributed:
-        names = outcome.budget_unattributed
-        lines.append(
-            f"\u26a0 {len(names)} driver(s) had no active contract, so no team was "
-            "charged or credited: "
-            + ", ".join(names[:_MAX_LISTED_NAMES])
-            + ("\u2026" if len(names) > _MAX_LISTED_NAMES else "")
-            + "."
-        )
-    return lines
 
 
 def _render_budget_summary(s: workflow.TeamBudgetSummary) -> discord.Embed:

@@ -29,8 +29,8 @@ d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
 - **582 tests passing**, 30 test modules.
-- **83 slash commands** across 7 groups.
-- **13 migrations** (005 is deliberately absent — see §5).
+- **84 slash commands** across 7 groups.
+- **16 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
 
 > **Unverified:** at the time of writing, these commits were **local only
@@ -300,6 +300,8 @@ runner already wraps each file in a transaction.
 | `012_driver_registered_kind.sql` | seeds the `driver_registered` transaction kind for `/market-admin driver` enrolment |
 | `013_team_budgets.sql` | `budget_entry_kinds`, `team_budget_ledger` (+ sign trigger, one `opening_balance` and one `rollover` per team-season), `budget_config` (season default + per-tier override) |
 | `014_contract_carryover.sql` | alters `contracts`: `season_index` (CHECK ≥ 1), `carried_from_contract_id`, `origin_contract_id`; partial unique `uq_contracts_carried_once`; seeds `contract_states.carried`, `transaction_kinds.contract_carried` / `contract_expired` |
+| `015_race_terms_and_escrow.sql` | race-denominated contract terms and salary escrow (Phase 9): `races_per_season`, `min_term_races`, `max_term_races`, `resign_premium_pct`, `length_premium_pct` on `league_config`; `escrow_enabled` on `budget_config`; contract escrow holdings and per-race charge tracking; seeds `contract_states.completed` and the escrow transaction kinds |
+| `016_remembered_results_sheet.sql` | `results_config.sheet_url` / `sheet_range` (both nullable, both CHECK-guarded against blanks) so Race Night remembers each tier's spreadsheet across restarts instead of only for the life of one panel |
 
 ### The `drivers` exception
 
@@ -346,7 +348,7 @@ implement it twice.
 
 ---
 
-## 7. Command surface — 83 commands
+## 7. Command surface — 84 commands
 
 **Nothing here may be removed or renamed.** The panel (§8) is an additive
 layer on top; every command remains available for power users.
@@ -391,10 +393,10 @@ layer on top; every command remains available for power users.
 /trade propose | accept | decline | withdraw | status
 ```
 
-### `/market-admin` (40, commissioner)
+### `/market-admin` (41, commissioner)
 
 ```
-season create | activate | list | carry-over
+season create | seed-preset | activate | list | carry-over
 tier add | edit | list
 config edit | show | channel | role | free-agency
 valuation run | preview | publish | list
@@ -433,7 +435,7 @@ sheets: add list refresh remove
 
 ## 8. The control panel
 
-`/league` is the intended entry point for admins. It exists because 83
+`/league` is the intended entry point for admins. It exists because 84
 slash commands is an unusable discovery surface. The panel wraps them in
 a guided flow; it **adds** a layer and removes nothing.
 
@@ -825,8 +827,36 @@ Required coverage per area:
 - **`fetch_team_payroll` is still not season-scoped** by design — it is
   "everything currently active", which is correct once carry-over has
   run. Left unchanged rather than risk the signing rule.
-- **Void/release still do not drop the Discord team role** (pre-existing;
-  only expiry via carry-over and trade approval touch roles).
+- **Release and buyout *do* attempt the Discord role drop**, best-effort:
+  `bot/cogs/contracts.py` calls `roster_ops.drop_from_team` inside a
+  `try` and reports `⚠ Role not dropped: …` on failure without failing
+  the release itself. This entry previously said releases left roles
+  alone, which was wrong. **Void still does not touch roles**, and a
+  best-effort drop means a role can survive a released contract — so
+  the roster poll, not this path, is the backstop.
+- **Contract premiums ship at zero.** `resign_premium_pct` and
+  `length_premium_pct` default to `0`, which reproduces exactly the
+  pricing behaviour of every season before migration 015. Nothing gets
+  more expensive on deploy; the commissioner tunes both from the config
+  panel's **Race terms & premiums** section. Deliberate, per the owner.
+- **Escrow starts in season 9, not mid-season 8.** `escrow_enabled`
+  gates it and there is no backfill: contracts signed before it is
+  switched on have no escrow holding and settle under the old rules.
+  Season 8 finishes as it started.
+- **Under escrow, `available_to_spend` reserves nothing for the
+  unescrowed remainder of a term.** A team can commit to a payroll it
+  cannot fund later and only find out when a race-night charge takes
+  the balance negative. The cap is a commitment gate, not a solvency
+  test. Reserving the remaining term is the stricter rule and is
+  deliberately not implemented; revisit first if teams run dry.
+- **Early exits pro-rate the P/L** by `races_served / term_races`, and a
+  team can lose its escrow but never more than it — `amount_returned`
+  is clamped at zero and `Settlement.clamped` records when it bit.
+- **Season carry-over preserves the service chain** rather than
+  shortening the term to the remainder: `term_races` is unchanged and
+  `races_served_before` is inherited, and the live escrow holding is
+  repointed onto the new contract row with zero money movement. An
+  unfinished term must not settle at a season boundary.
 - **Budget preset rates are untuned.** `earnings_per_point 0.05`,
   `dnf_penalty 0.50`, `dns_penalty 1.00`, `penalty_per_incident_pt 0.25`
   are placeholders sized so a season moves a budget by single-digit

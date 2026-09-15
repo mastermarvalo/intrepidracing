@@ -128,7 +128,8 @@ no argument names, no channel or role ids to copy.
 ⚙️ League setup
 ✅ Season — Season 7 is active
 ✅ Tiers — 3 configured (t1, t2, t3)
-⬜ Drivers — none yet, add them with /roster add
+⬜ Drivers — none yet — bulk-enrol with /market-admin driver sync-all,
+   or press Drivers
 
 Tiers
 t1 Tier 1 · 0 driver(s) · 🏷 role linked
@@ -249,7 +250,7 @@ must not.
 
 Everything the panel does is also still a slash command, and the panel
 calls the same code as the commands — nothing was removed or renamed.
-All 83 commands are still there. Setup, Approvals and Boards route
+All 84 commands are still there. Setup, Approvals and Boards route
 through `bot/workflow.py` and `bot/approvals.py`, which the
 `/market-admin` commands now call too, so there is one code path per
 operation regardless of which route you take.

@@ -139,10 +139,12 @@ def render_driver_card(
 ) -> discord.Embed:
     """
     Driver card: current market value, movement, tier, trend of last N
-    published runs. Contract/P/L block is intentionally absent — that
-    lights up in Phase 4 when contracts land; showing a placeholder
-    line here makes the missing information obvious rather than
-    surprising.
+    published runs.
+
+    The contract block is a pointer rather than a rendering: contracts
+    and P/L now exist, but they live behind `/market team` and
+    `/contract status`, which read the contract tables this renderer is
+    not given. Saying where to look beats printing a dash.
     """
     embed = discord.Embed(
         title=display_name,
@@ -169,14 +171,22 @@ def render_driver_card(
             ),
             inline=True,
         )
+        # Tolerant of a row without the column: a caller passing a row
+        # from a different query should degrade to "—", not crash the
+        # whole card. The query now selects it (see `queries`).
+        rank = latest.get("rank_in_tier") if hasattr(latest, "get") else None
         embed.add_field(
             name="Rank in tier",
-            value=str(latest["rank_in_tier"]),
+            value=str(rank) if rank is not None else "—",
             inline=True,
         )
+    # D2: this said "contracts land in Phase 4". They landed.
     embed.add_field(
         name="Contract",
-        value="—  (contracts land in Phase 4)",
+        value=(
+            "See `/contract status` for this driver's deal, or "
+            "`/market team` for the team's cap sheet and P/L."
+        ),
         inline=False,
     )
     trend = _trend_field(history)

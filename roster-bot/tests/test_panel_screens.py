@@ -7,6 +7,7 @@ exceeds a limit does not degrade gracefully — Discord rejects the whole
 message, so the panel would simply fail to open.
 """
 
+import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -222,12 +223,343 @@ def test_offer_and_trade_options_are_distinguishable():
         opener_id=1,
         on_back=noop_back,
     )
-    select = next(c for c in view.children if isinstance(c, discord.ui.Select))
-    values = {o.value for o in select.options}
+    values = _all_option_values(view)
 
     assert values == {"offer:5", "trade:5"}, (
         "an offer and a trade can share an id, so the kind must be in the value"
     )
+
+
+def _all_option_values(view: discord.ui.View) -> set[str]:
+    return {
+        o.value
+        for c in view.children
+        if isinstance(c, discord.ui.Select)
+        for o in c.options
+    }
+
+
+def test_offers_and_trades_each_get_their_own_select():
+    view = approvals_screen.ApprovalsView(
+        queue=queue(offers=[offer(1)], trades=[trade(1)]),
+        opener_id=1,
+        on_back=noop_back,
+    )
+
+    assert any(
+        isinstance(c, approvals_screen._OfferSelect) for c in view.children
+    )
+    assert any(
+        isinstance(c, approvals_screen._TradeSelect) for c in view.children
+    )
+
+
+def test_a_busy_offer_queue_never_hides_a_pending_trade():
+    """G17: one shared select cut at 25 made trades unreachable."""
+    view = approvals_screen.ApprovalsView(
+        queue=queue(
+            offers=[offer(i) for i in range(40)], trades=[trade(777)]
+        ),
+        opener_id=1,
+        on_back=noop_back,
+    )
+
+    assert "trade:777" in _all_option_values(view), (
+        "the embed lists the trade, so the picker has to be able to reach it"
+    )
+    assert_view_within_limits(view)
+
+
+def test_each_queue_select_stays_inside_the_option_limit():
+    view = approvals_screen.ApprovalsView(
+        queue=queue(
+            offers=[offer(i) for i in range(60)],
+            trades=[trade(i) for i in range(60)],
+        ),
+        opener_id=1,
+        on_back=noop_back,
+    )
+
+    for child in view.children:
+        if isinstance(child, discord.ui.Select):
+            assert len(child.options) <= SELECT_MAX_OPTIONS
+    assert_view_within_limits(view)
+
+
+def test_both_queues_get_their_own_paging_buttons():
+    view = approvals_screen.ApprovalsView(
+        queue=queue(
+            offers=[offer(i) for i in range(30)],
+            trades=[trade(i) for i in range(30)],
+        ),
+        opener_id=1,
+        on_back=noop_back,
+    )
+    labels = {c.label for c in view.children if getattr(c, "label", None)}
+
+    assert {"Prev offers", "Next offers"} <= labels
+    assert {"Prev trades", "Next trades"} <= labels
+    assert_view_within_limits(view), "paging must not blow the 5-row budget"
+
+
+def test_a_short_queue_gets_no_paging_buttons():
+    view = approvals_screen.ApprovalsView(
+        queue=queue(offers=[offer(1)], trades=[trade(1)]),
+        opener_id=1,
+        on_back=noop_back,
+    )
+    labels = {c.label for c in view.children if getattr(c, "label", None)}
+
+    assert not any("Next" in label for label in labels), (
+        "paging a single page is a button that does nothing"
+    )
+
+
+def test_the_second_offer_page_reaches_the_rest_of_the_queue():
+    view = approvals_screen.ApprovalsView(
+        queue=queue(offers=[offer(i) for i in range(30)]),
+        opener_id=1,
+        on_back=noop_back,
+        offer_page=1,
+    )
+    values = _all_option_values(view)
+
+    assert "offer:29" in values, "page 2 must show what page 1 could not"
+    assert "offer:0" not in values
+
+
+def test_an_out_of_range_page_clamps_instead_of_rendering_empty():
+    view = approvals_screen.ApprovalsView(
+        queue=queue(offers=[offer(1)]),
+        opener_id=1,
+        on_back=noop_back,
+        offer_page=9,
+    )
+
+    assert view.offer_page == 0
+    assert "offer:1" in _all_option_values(view)
+
+
+def test_queue_embed_states_which_slice_is_pickable():
+    view = approvals_screen.ApprovalsView(
+        queue=queue(offers=[offer(i) for i in range(30)], trades=[trade(1)]),
+        opener_id=1,
+        on_back=noop_back,
+    )
+    blob = "\n".join(f.value for f in view.embed().fields)
+
+    assert "page" in blob.lower(), "silent truncation is the defect (G17)"
+    assert "approve-trade" in blob, "name the typed fallback for the rest"
+    assert_embed_within_limits(view.embed())
+
+
+# ── approvals: offer context + confirm (G13) ──────────────────────────
+
+
+def offer_context(
+    *,
+    payroll_before="34.00",
+    salary="22.00",
+    bonus="1.50",
+    cap="60.00",
+    market="20.75",
+    balance="50.00",
+    slots_used=1,
+    slots=2,
+    notes=(),
+):
+    before = Decimal(payroll_before)
+    after = before + Decimal(salary) + Decimal(bonus)
+    return approvals_screen.OfferContext(
+        payroll_before=before,
+        payroll_after=after,
+        salary_cap=Decimal(cap) if cap else None,
+        budget_balance=Decimal(balance) if balance else None,
+        budget_headroom_after=(
+            Decimal(balance) - after if balance else None
+        ),
+        budgets_enforced=True,
+        market_value=Decimal(market) if market else None,
+        has_published_valuation=bool(market),
+        slots_used=slots_used,
+        active_driver_slots=slots,
+        notes=tuple(notes),
+        _salary=Decimal(salary),
+    )
+
+
+def test_offer_context_derives_cap_space_and_market_delta():
+    context = offer_context()
+
+    assert context.payroll_after == Decimal("57.50")
+    assert context.cap_space_after == Decimal("2.50")
+    assert not context.over_cap
+    assert context.offer_vs_market == Decimal("-1.25"), (
+        "market minus salary: a negative delta is a premium paid"
+    )
+
+
+def test_offer_context_flags_an_offer_that_breaks_the_cap():
+    context = offer_context(payroll_before="55.00")
+
+    assert context.over_cap
+    assert context.cap_space_after < 0
+
+
+def test_offer_context_leaves_unknowns_unknown():
+    context = approvals_screen.OfferContext()
+
+    assert context.cap_space_after is None, (
+        "a zero here reads as a real cap; unknown has to stay unknown"
+    )
+    assert context.offer_vs_market is None
+    assert not context.over_cap
+    assert not context.slots_full
+
+
+def test_offer_detail_shows_payroll_cap_budget_market_and_slots():
+    embed = approvals_screen._build_offer_detail(offer(1), offer_context())
+    names = " ".join(f.name for f in embed.fields).lower()
+    blob = " ".join(f.value for f in embed.fields)
+
+    assert "payroll" in names
+    assert "cap space" in names
+    assert "budget" in names
+    assert "market value" in names
+    assert "slots" in names
+    assert "1 of 2 used" in blob
+    assert "→" in blob, "payroll before → after is the point of the panel"
+    assert_embed_within_limits(embed)
+
+
+def test_offer_detail_says_outright_when_there_is_no_valuation():
+    """G13: approving without a valuation loses the P/L baseline for good."""
+    embed = approvals_screen._build_offer_detail(
+        offer(1), offer_context(market="")
+    )
+    blob = " ".join(f.value for f in embed.fields).lower()
+
+    assert "no published valuation" in blob
+    assert "baseline" in blob
+    assert_embed_within_limits(embed)
+
+
+def test_offer_detail_without_context_admits_it_rather_than_implying_zero():
+    embed = approvals_screen._build_offer_detail(offer(1))
+    blob = " ".join(f.value for f in embed.fields).lower()
+
+    assert "not loaded" in blob
+    assert_embed_within_limits(embed)
+
+
+def test_offer_detail_surfaces_context_it_could_not_verify():
+    embed = approvals_screen._build_offer_detail(
+        offer(1), offer_context(notes=["Budget position unavailable: nope"])
+    )
+    names = " ".join(f.name for f in embed.fields).lower()
+
+    assert "could not verify" in names, (
+        "a failed context read has to be visible, not silently absent"
+    )
+
+
+def test_approve_consequence_names_the_terms_being_approved():
+    text = approvals_screen.approve_consequence_text(
+        kind="offer", item_id=1, offer=offer(1), context=offer_context()
+    )
+
+    assert "ZeezinDomar" in text
+    assert "McLaren" in text
+    assert "Press again" in text
+
+
+def test_approve_consequence_repeats_the_irreversible_warnings():
+    text = approvals_screen.approve_consequence_text(
+        kind="offer",
+        item_id=1,
+        offer=offer(1),
+        context=offer_context(market="", payroll_before="55.00", slots_used=2),
+    )
+
+    assert "over the salary cap" in text
+    assert "no free active-driver slot" in text.lower()
+    assert "P/L baseline" in text
+
+
+def test_approve_consequence_for_a_trade_names_both_teams():
+    text = approvals_screen.approve_consequence_text(
+        kind="trade", item_id=4, trade=trade(4)
+    )
+
+    assert "Williams" in text
+    assert "Aston Martin" in text
+
+
+class _FakeResponse:
+    def __init__(self):
+        self.edits = []
+
+    async def edit_message(self, **kwargs):
+        self.edits.append(kwargs)
+
+    def is_done(self):
+        return True
+
+
+class _FakeFollowup:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, content, **_kwargs):
+        self.sent.append(content)
+
+
+class _FakeInteraction:
+    """Just enough interaction to exercise the arming branch."""
+
+    def __init__(self):
+        self.response = _FakeResponse()
+        self.followup = _FakeFollowup()
+
+
+def test_approve_arms_before_it_acts():
+    """G13: approve used to fire on the first click, next to Reject."""
+    parent = approvals_screen.ApprovalsView(
+        queue=queue(offers=[offer(1)]), opener_id=7, on_back=noop_back
+    )
+    item = approvals_screen._ItemView(
+        kind="offer",
+        item_id=1,
+        opener_id=7,
+        parent=parent,
+        offer=offer(1),
+        context=offer_context(market=""),
+    )
+    button = next(
+        c for c in item.children if getattr(c, "label", None) == "Approve"
+    )
+    interaction = _FakeInteraction()
+
+    asyncio.run(button.callback(interaction))
+
+    assert item._armed, "the first click must arm, not approve"
+    assert button.label == "Confirm approval"
+    assert button.style == discord.ButtonStyle.danger
+    assert interaction.followup.sent, "say what the second click will do"
+    assert "P/L baseline" in interaction.followup.sent[0]
+
+
+def test_page_helpers_cover_the_whole_queue():
+    rows = list(range(60))
+
+    assert approvals_screen.page_count(0) == 1
+    assert approvals_screen.page_count(60) == 3
+    seen = []
+    for page in range(approvals_screen.page_count(len(rows))):
+        seen.extend(approvals_screen.page_slice(rows, page))
+
+    assert seen == rows, "paging must reach every row exactly once"
+    assert approvals_screen.page_slice(rows, 99) == []
 
 
 def test_item_view_offers_approve_reject_and_back():
@@ -687,6 +1019,209 @@ def test_drivers_view_without_drivers_shows_no_picker():
         isinstance(c, drivers_screen._DriverPickerSelect) for c in view.children
     )
     assert_view_within_limits(view)
+
+
+def tier_row(code="t1", *, rank=1, label=None, role_id=None):
+    from bot.models import Tier
+
+    return Tier(
+        id=rank,
+        season_id=1,
+        code=code,
+        label=label or f"Tier {code[-1]}",
+        rank_order=rank,
+        tier_role_id=role_id,
+    )
+
+
+def test_picker_pages_reach_every_driver():
+    """G16: a silent "top 25 of N" made the rest of the league unreachable."""
+    many = [driver_detail(driver_id=i, display_name=f"D{i}") for i in range(40)]
+    seen: set[str] = set()
+    for page in range(drivers_screen.page_count(len(many))):
+        view = drivers_screen.DriversView(
+            summaries=[driver_summary("t1", role_id=100)],
+            drivers=many,
+            opener_id=1,
+            on_back=noop_back,
+            page=page,
+        )
+        picker = next(
+            c for c in view.children
+            if isinstance(c, drivers_screen._DriverPickerSelect)
+        )
+        assert len(picker.options) <= SELECT_MAX_OPTIONS
+        seen.update(o.value for o in picker.options)
+
+    assert seen == {str(d.driver_id) for d in many}
+
+
+def test_picker_gets_paging_buttons_only_when_it_needs_them():
+    one_page = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail()],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    two_pages = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail(driver_id=i) for i in range(30)],
+        opener_id=1,
+        on_back=noop_back,
+    )
+
+    def labels(view):
+        return {c.label for c in view.children if getattr(c, "label", None)}
+
+    assert not any("Next drivers" in label for label in labels(one_page))
+    assert "Next drivers" in labels(two_pages)
+    assert "Prev drivers" in labels(two_pages)
+    assert_view_within_limits(two_pages)
+
+
+def test_tier_filter_narrows_the_picker_to_one_tier():
+    view = drivers_screen.DriversView(
+        summaries=[
+            driver_summary("t1", role_id=100),
+            driver_summary("t2", role_id=101),
+        ],
+        drivers=[
+            driver_detail(driver_id=1, tier_code="t1"),
+            driver_detail(driver_id=2, tier_code="t2"),
+        ],
+        opener_id=1,
+        on_back=noop_back,
+        tier_filter="t2",
+    )
+    picker = next(
+        c for c in view.children
+        if isinstance(c, drivers_screen._DriverPickerSelect)
+    )
+
+    assert [o.value for o in picker.options] == ["2"]
+    assert any(
+        isinstance(c, drivers_screen._DriverTierFilterSelect)
+        for c in view.children
+    )
+    assert_view_within_limits(view)
+
+
+def test_a_filter_naming_a_missing_tier_falls_back_to_all():
+    view = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail(driver_id=1, tier_code="t1")],
+        opener_id=1,
+        on_back=noop_back,
+        tier_filter="deleted",
+    )
+
+    assert view.tier_filter is None, (
+        "an empty screen with no way to clear the filter is a dead end"
+    )
+    assert len(view.filtered) == 1
+
+
+def test_drivers_embed_states_the_picker_scope_and_typed_fallback():
+    embed = drivers_screen.build_drivers_embed(
+        [driver_summary("t1", drivers=40, role_id=100)],
+        picker_total=40,
+        tier_filter="t1",
+        page=1,
+        pages=2,
+    )
+    blob = "\n".join(f.value for f in embed.fields)
+
+    assert "t1" in blob
+    assert "40" in blob
+    assert "market-admin" in blob, "name where the rest of the league lives"
+    assert_embed_within_limits(embed)
+
+
+def test_promote_only_offers_tiers_above_and_relegate_only_below():
+    """G14: one shared select let Promote relegate a driver."""
+    tiers = [tier_row("t1", rank=1), tier_row("t2", rank=2), tier_row("t3", rank=3)]
+
+    up = drivers_screen.move_targets(tiers, current_rank=2, direction="promote")
+    down = drivers_screen.move_targets(
+        tiers, current_rank=2, direction="relegate"
+    )
+
+    assert [t.code for t in up] == ["t1"]
+    assert [t.code for t in down] == ["t3"]
+
+
+def test_the_top_tier_has_nothing_to_promote_into():
+    tiers = [tier_row("t1", rank=1), tier_row("t2", rank=2)]
+
+    assert (
+        drivers_screen.move_targets(
+            tiers, current_rank=1, direction="promote"
+        )
+        == []
+    )
+
+
+def test_equal_ranked_tiers_are_not_a_direction():
+    """rank_order is not unique (G25); a sideways move has no direction."""
+    tiers = [tier_row("t2a", rank=2), tier_row("t2b", rank=2)]
+
+    for direction in ("promote", "relegate"):
+        assert (
+            drivers_screen.move_targets(
+                tiers, current_rank=2, direction=direction
+            )
+            == []
+        )
+
+    note = drivers_screen.no_move_target_note(
+        tiers, current=tiers[0], direction="promote"
+    )
+    assert "t2b" in note, "name the tie so it can be fixed"
+    assert "Setup" in note
+
+
+def test_move_confirm_embed_states_the_direction():
+    embed = drivers_screen.build_move_confirm_embed(
+        driver_detail(),
+        direction="relegate",
+        current=tier_row("t1", rank=1),
+        target=tier_row("t2", rank=2),
+    )
+    blob = f"{embed.title} {embed.description}"
+
+    assert "relegate" in blob.lower()
+    assert "down" in blob.lower()
+    assert "t1" in blob and "t2" in blob
+    assert "contract" in blob.lower(), (
+        "the contract moving with the driver is the surprising part"
+    )
+
+
+def test_move_picker_pages_and_stays_in_the_row_budget():
+    parent = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail()],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    detail = drivers_screen._DriverDetailView(
+        detail=driver_detail(), opener_id=1, parent=parent
+    )
+    targets = [tier_row(f"t{i}", rank=i + 2) for i in range(30)]
+    picker = drivers_screen._MoveTierPickerView(
+        parent=detail,
+        direction="relegate",
+        tiers=targets,
+        current=tier_row("t1", rank=1),
+    )
+    select = next(
+        c for c in picker.children if isinstance(c, discord.ui.Select)
+    )
+    labels = {c.label for c in picker.children if getattr(c, "label", None)}
+
+    assert len(select.options) <= SELECT_MAX_OPTIONS
+    assert "Next tiers" in labels
+    assert_view_within_limits(picker)
 
 
 def test_drivers_view_stays_inside_row_limit_with_picker_and_sync():

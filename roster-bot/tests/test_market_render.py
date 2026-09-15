@@ -221,7 +221,14 @@ def test_movers_empty_both_sides_message():
 # ── driver card ──────────────────────────────────────────────────────
 
 
-def test_driver_card_shows_contract_placeholder_pre_phase4():
+def test_driver_card_points_at_where_the_contract_lives():
+    """
+    Was `..._shows_contract_placeholder_pre_phase4`, asserting the card
+    said "contracts land in Phase 4". Contracts landed, so that text was
+    stale and the test was pinning it in place (D2). The card still does
+    not render contract terms — it is not given them — but it now names
+    the commands that do.
+    """
     embed = render.render_driver_card(
         display_name="Verstappen",
         tier_label="Tier 1",
@@ -230,7 +237,8 @@ def test_driver_card_shows_contract_placeholder_pre_phase4():
         history=[],
     )
     contract_field = next(f for f in embed.fields if f.name == "Contract")
-    assert "Phase 4" in contract_field.value
+    assert "Phase 4" not in contract_field.value
+    assert "/contract status" in contract_field.value
 
 
 def test_driver_card_no_valuations_still_renders():

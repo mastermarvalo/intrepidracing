@@ -193,6 +193,7 @@ class MarketCog(commands.Cog):
             budget_snap = await budget_ops.snapshot(
                 conn, season_id=season.id, tier_id=None, team_id=team_row.id,
             )
+            budget_cfg = await queries.fetch_budget_config(conn, season.id, None)
 
         embed = contract_render.render_cap_sheet(
             team_name=team_row.name,
@@ -208,6 +209,10 @@ class MarketCog(commands.Cog):
                 for r in dead_money_rows
             ],
             budget_balance=budget_snap.balance if budget_snap else None,
+            # D7: without this the cap sheet subtracts payroll from the
+            # balance even under escrow, where salary has already been
+            # charged race by race -- understating headroom.
+            escrow_enabled=bool(budget_cfg and budget_cfg.escrow_enabled),
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 

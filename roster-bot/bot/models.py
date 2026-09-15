@@ -120,6 +120,17 @@ class Contract:
     season_index: int = 1
     carried_from_contract_id: int | None = None
     origin_contract_id: int | None = None
+    # Phase 9: terms are counted in RACES, not seasons. `term_races` is
+    # the whole deal's length; `races_served_before` is how many of them
+    # earlier rows in the chain already served, so a carried row knows
+    # where in the term it starts without re-walking the chain.
+    # `contracts.term_races` is NOT NULL: migration 015 backfilled every
+    # existing row as `term_seasons × races_per_season`, and inserts
+    # derive it the same way when a caller omits it. The Optional here is
+    # only so a caller can say "derive it for me"; a Contract loaded from
+    # the database always carries a real term.
+    term_races: int | None = None
+    races_served_before: int = 0
 
     @property
     def seasons_remaining_after_this(self) -> int:
@@ -238,6 +249,17 @@ class LeagueConfig:
     max_incentive_pct: Decimal
     offer_ttl_hours: int
     tier_id: int | None = None
+    # ── race-denominated terms and contract premiums (Phase 9)
+    # The season bounds above are kept and still enforced; these run
+    # alongside. `races_per_season` converts a season rate to the
+    # per-race charge and is what the season bounds were backfilled with.
+    # Both premium rates default to zero, which reproduces exactly the
+    # pricing behaviour of every season before migration 015.
+    races_per_season: int = 24
+    min_term_races: int = 1
+    max_term_races: int = 24
+    resign_premium_pct: Decimal = Decimal("0")
+    length_premium_pct: Decimal = Decimal("0")
     max_salary: Decimal | None = None
     free_agency_open: bool = False
     market_channel_id: int | None = None

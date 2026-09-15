@@ -26,6 +26,8 @@ from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import Sequence
 
+from bot.market import escrow
+
 _ZERO = Decimal(0)
 _ONE = Decimal(1)
 
@@ -77,6 +79,26 @@ class OfferInputs:
     term_seasons: int = 1
     min_term_seasons: int = 1
     max_term_seasons: int = 1
+
+    # ── term in races (Phase 9)
+    # Terms are counted in races. The season-denominated fields above are
+    # kept and still enforced so nothing that relied on them changed;
+    # these run alongside. Defaults describe the narrowest legal league
+    # (a one-race contract) rather than any particular calendar.
+    term_races: int = 1
+    min_term_races: int = 1
+    max_term_races: int = 1
+
+    # ── price floor (Phase 9)
+    # `driver_base_value` is the driver's published market value, or None
+    # when he has never been priced — there is then no floor to derive
+    # and only `min_salary` can be enforced. `is_resign` is True when the
+    # offering team is already the driver's team, which is what makes
+    # keeping your own driver dearer than signing a rival's.
+    driver_base_value: Decimal | None = None
+    length_premium_pct: Decimal = _ZERO
+    resign_premium_pct: Decimal = _ZERO
+    is_resign: bool = False
 
     # ── window / mechanics
     offer_kind: str = "new"
@@ -332,6 +354,106 @@ def term_within_bounds(inputs: OfferInputs) -> RuleResult:
     return _pass("term_within_bounds", "Term within league bounds.")
 
 
+def term_races_within_bounds(inputs: OfferInputs) -> RuleResult:
+    """
+    The race-denominated term bounds, both from league config.
+
+    Runs alongside `term_within_bounds` rather than replacing it: the
+    season bounds still exist and are still enforced, so a league that
+    has not touched its config is unaffected. The absolute floor of one
+    race stays in code for the same reason the one-season floor does —
+    a zero-race contract is not a policy choice, it is a nonsense value,
+    and the schema carries the same CHECK.
+    """
+    if inputs.term_races < 1:
+        return _block(
+            "term_races_too_short",
+            f"A contract must run for at least 1 race "
+            f"(got {inputs.term_races}).",
+        )
+    if inputs.term_races < inputs.min_term_races:
+        return _block(
+            "term_races_below_minimum",
+            f"Term of {inputs.term_races} race(s) is below the league "
+            f"minimum of {inputs.min_term_races}.",
+            detail={"min_term_races": str(inputs.min_term_races)},
+        )
+    if inputs.term_races > inputs.max_term_races:
+        return _block(
+            "term_races_too_long",
+            f"Term of {inputs.term_races} races exceeds the league maximum "
+            f"of {inputs.max_term_races}.",
+            detail={"max_term_races": str(inputs.max_term_races)},
+        )
+    return _pass("term_races_within_bounds", "Term within league race bounds.")
+
+
+def salary_meets_price_floor(inputs: OfferInputs) -> RuleResult:
+    """
+    An offer may not undercut the driver's value plus the length and
+    re-sign premiums.
+
+    This is the anti-cycling rule. Without it a Team Principal could keep
+    a driver indefinitely on rolling short contracts at his old price,
+    and contract length would carry no cost. With it, a long deal costs
+    more per season than a short one and keeping your own driver costs
+    more than signing someone else's — so term length becomes a real
+    decision rather than a free option.
+
+    Both premium rates default to zero, in which case this rule can only
+    ever agree with `salary_within_bounds` and nothing changes for a
+    league that has not configured them.
+
+    An unpriced driver has no derivable floor. The rule passes with an
+    explicit note rather than blocking, because blocking would make an
+    unvalued driver unsignable, and passing silently would imply the
+    offer had been checked against a market value that does not exist.
+    """
+    if inputs.driver_base_value is None:
+        return _pass(
+            "price_floor_unpriced",
+            "Driver has no published valuation, so only the league salary "
+            "floor applies — this offer was not checked against a market "
+            "value.",
+        )
+
+    floor = escrow.price_floor(
+        base_value=inputs.driver_base_value,
+        term_races=inputs.term_races,
+        min_term_races=inputs.min_term_races,
+        length_premium_pct=inputs.length_premium_pct,
+        resign_premium_pct=inputs.resign_premium_pct,
+        is_resign=inputs.is_resign,
+        min_salary=inputs.min_salary,
+    )
+    detail = {
+        "price_floor": str(floor),
+        "driver_base_value": str(inputs.driver_base_value),
+        "term_races": str(inputs.term_races),
+        "min_term_races": str(inputs.min_term_races),
+        "length_premium_pct": str(inputs.length_premium_pct),
+        "resign_premium_pct": str(inputs.resign_premium_pct),
+        "is_resign": str(inputs.is_resign),
+    }
+    if inputs.salary < floor:
+        extra = (
+            " This includes the re-signing premium for keeping your own "
+            "driver." if inputs.is_resign else ""
+        )
+        return _block(
+            "salary_below_price_floor",
+            f"{inputs.salary} is below the {floor} required for a "
+            f"{inputs.term_races}-race deal for a driver valued at "
+            f"{inputs.driver_base_value}.{extra}",
+            detail=detail,
+        )
+    return _pass(
+        "salary_meets_price_floor",
+        f"Offer meets the {floor} price floor.",
+        detail=detail,
+    )
+
+
 def incentives_within_cap(inputs: OfferInputs) -> RuleResult:
     if inputs.incentives_amount < _ZERO:
         return _block(
@@ -395,6 +517,8 @@ _RULES = (
     budget_headroom_ok,
     seat_available,
     term_within_bounds,
+    term_races_within_bounds,
+    salary_meets_price_floor,
     incentives_within_cap,
     free_agency_window_ok,
     no_duplicate_pending,
@@ -431,6 +555,10 @@ def rule_codes() -> Sequence[str]:
         "term_too_short",
         "term_below_minimum",
         "term_too_long",
+        "term_races_too_short",
+        "term_races_below_minimum",
+        "term_races_too_long",
+        "salary_below_price_floor",
         "incentives_negative",
         "incentives_over_cap",
         "free_agency_closed",

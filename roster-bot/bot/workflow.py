@@ -28,7 +28,7 @@ from bot import db, queries, results_ingest, sheets
 from bot.contracts import carryover as contract_carryover
 from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
-from bot.market import budget_ops, driver_ops
+from bot.market import budget_ops, driver_ops, escrow_ops
 from bot.market import results as results_engine
 from bot.market import valuation as valuation_engine
 
@@ -63,6 +63,10 @@ class ImportOutcome:
     # configured for the season so the renderer can stay silent.
     budget: budget_ops.RoundBudgetOutcome | None = None
     budget_unattributed: list[str] = field(default_factory=list)
+    # Phase 9. None when escrow is off for the season — every season
+    # before this update — so the renderer stays silent rather than
+    # reporting a round that escrowed nothing.
+    escrow: escrow_ops.RoundEscrowOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -207,11 +211,31 @@ async def import_round(
             for did in budget_outcome.unattributed_driver_ids
         ]
 
+        # Salary for this race leaves each team's cash here, and any
+        # contract whose term just ended settles. Same transaction as the
+        # results and the round charges above: a race's facts and all of
+        # its money land together or not at all. Re-importing a sheet
+        # advances no term and takes no second payment.
+        cfg = await queries.fetch_league_config_row(conn, season.id, tier_row.id)
+        if cfg is None:
+            cfg = await queries.fetch_league_config_row(conn, season.id, None)
+        escrow_outcome = None
+        if cfg is not None:
+            escrow_outcome = await escrow_ops.charge_round_for_tier(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                round_id=round_row["id"],
+                races_per_season=cfg.races_per_season,
+                actor_id=user_id,
+            )
+
     return ImportOutcome(
         tier_code=tier,
         round_label=round_label,
         round_order=round_row["round_order"],
         written=written,
+        escrow=escrow_outcome,
         missing_drivers=missing,
         budget=budget_outcome if budget_outcome.enforced else None,
         budget_unattributed=unattributed if budget_outcome.enforced else [],
@@ -516,6 +540,66 @@ async def create_season(
     return SeasonCreated(season_id=season_id, name=name, preset_seeded=seeded)
 
 
+@dataclass(frozen=True)
+class PresetSeeded:
+    season_id: int
+    name: str
+    tiers_created: int
+
+
+async def seed_preset_into_season(
+    *, guild_id: int, name: str, preset: str = "f1"
+) -> PresetSeeded:
+    """
+    Seed a preset into a season that was created without one (G2).
+
+    Before this existed, `create_season` was the only place a preset was
+    ever applied, so a season created without one had no tiers and no
+    `league_config` row and could never get either. Every downstream
+    command then failed with a message telling the admin to "create a
+    season with the preset" — advice that could not be followed for the
+    season they had already named and possibly activated.
+
+    Refuses to run once the season has tiers or a config row. Re-seeding
+    a live season would reset valuation factors and the spending cap
+    underneath contracts already signed against them, so this is a
+    recovery path for an empty season only, never a reset button.
+    """
+    if preset != "f1":
+        raise WorkflowError(f"Unknown preset `{preset}`.")
+
+    async with db.connect() as conn:
+        season = await queries.fetch_season_by_name(conn, guild_id, name.strip())
+        if season is None:
+            raise WorkflowError(f"No season named **{name}** in this server.")
+
+        tiers = await queries.fetch_all_tiers(conn, season.id)
+        if tiers:
+            codes = ", ".join(f"`{t.code}`" for t in tiers)
+            raise WorkflowError(
+                f"**{season.name}** already has tiers ({codes}), so it is "
+                f"already set up. Seeding a preset now would overwrite its "
+                f"valuation factors and spending cap underneath any "
+                f"contracts already signed. Edit settings from the config "
+                f"panel instead."
+            )
+        cfg = await queries.fetch_league_config_row(conn, season.id, None)
+        if cfg is not None:
+            raise WorkflowError(
+                f"**{season.name}** already has a league config row. Edit it "
+                f"from the config panel rather than re-seeding."
+            )
+
+        from bot.presets import f1 as f1_preset
+
+        await f1_preset.seed_season(conn, season.id)
+        seeded = await queries.fetch_all_tiers(conn, season.id)
+
+    return PresetSeeded(
+        season_id=season.id, name=season.name, tiers_created=len(seeded)
+    )
+
+
 async def activate_season(*, guild_id: int, name: str) -> int:
     """Make a season active. Returns its id."""
     async with db.connect() as conn:
@@ -538,6 +622,40 @@ async def create_and_activate_season(
     created = await create_season(guild_id=guild_id, name=name, preset=preset)
     await activate_season(guild_id=guild_id, name=created.name)
     return created
+
+
+def find_rank_conflict(tiers, rank_order: int, *, exclude_code: str | None = None):
+    """
+    The tier already holding `rank_order`, or None.
+
+    `rank_order` is only a sort key in the schema — `002_seasons_tiers.sql`
+    has no unique constraint on it — but `move_driver_to_tier` decides
+    "promotion" versus "relegation" by comparing the two tiers' ranks.
+    Two tiers sharing a rank makes that comparison, and every
+    ordering-dependent display, meaningless. Gaps are harmless, so only
+    an exact collision is reported, and `exclude_code` lets a tier keep
+    the rank it already has when only its label or colour is changing.
+
+    Lives here rather than in the setup screen so the typed
+    `/market-admin tier add|edit` commands are guarded by the same rule
+    as the panel modal. Pure and Discord-free, per CLAUDE.md.
+    """
+    for tier in tiers:
+        if exclude_code is not None and tier.code == exclude_code:
+            continue
+        if tier.rank_order == rank_order:
+            return tier
+    return None
+
+
+def rank_conflict_message(rank_order: int, holder) -> str:
+    """Name the tier in the way, so the fix is obvious without a lookup."""
+    return (
+        f"Rank order {rank_order} is already used by `{holder.code}` "
+        f"**{holder.label}**. Ranks decide which way promote and relegate "
+        f"move a driver, so two tiers cannot share one — pick a different "
+        f"number, or edit `{holder.code}` first."
+    )
 
 
 async def add_tier(
@@ -566,6 +684,12 @@ async def add_tier(
                 f"Tier `{code}` already exists in **{season.name}**. "
                 f"Use `/market-admin tier edit` to change it."
             )
+        # G25 also applies to the typed command, not just the panel modal.
+        holder = find_rank_conflict(
+            await queries.fetch_all_tiers(conn, season.id), rank_order
+        )
+        if holder is not None:
+            raise WorkflowError(rank_conflict_message(rank_order, holder))
         return await queries.insert_tier(
             conn,
             season.id,
@@ -816,8 +940,9 @@ async def fetch_config_for_edit(*, guild_id: int, tier_code: str | None = None):
     if cfg is None:
         scope = f"tier `{tier_code}`" if tier_code else "the season default"
         raise WorkflowError(
-            f"No league config row for {scope}. Create a season with the F1 "
-            f"preset to seed one."
+            f"No league config row for {scope}. Seed the F1 preset into "
+            f"this season with `/market-admin season seed-preset`, or open "
+            f"`/league` \u2192 Setup, which offers the same thing."
         )
     return season.id, tier_id, cfg
 
@@ -1487,6 +1612,14 @@ async def edit_tier(
             raise WorkflowError(
                 f"No tier `{tier_code}` in **{season.name}**."
             )
+        # Excluding this tier so keeping its own rank is not a conflict.
+        holder = find_rank_conflict(
+            await queries.fetch_all_tiers(conn, season.id),
+            rank_order,
+            exclude_code=tier.code,
+        )
+        if holder is not None:
+            raise WorkflowError(rank_conflict_message(rank_order, holder))
         await queries.update_tier(
             conn,
             tier.id,

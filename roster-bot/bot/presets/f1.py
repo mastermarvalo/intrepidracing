@@ -1,6 +1,6 @@
 """
 F1 25/26 preset — data seeded when a commissioner runs
-`/market-admin season create --preset f1`.
+`/market-admin season create` with the F1 preset choice.
 
 This module is *data*, not logic. It only writes rows into the generic
 tables defined by migrations 002/003/006 (and later 004/005/007). Per
@@ -215,6 +215,27 @@ _DEFAULT_LEAGUE_CONFIG: dict[str, object] = {
     "max_term_seasons": 3,
     "max_incentive_pct": Decimal("0.150"),
     "offer_ttl_hours": 48,
+    # ── race-denominated terms (Phase 9)
+    # A modern F1 calendar; the season bounds above are kept and this is
+    # what converts them. Commissioner-editable, because a league that
+    # runs a 12-race split season needs its own number and every
+    # per-race salary charge divides by this.
+    "races_per_season": 24,
+    # Five races is the shortest deal the league recognises and two full
+    # seasons the longest. Deliberately NOT 1 and 72: a one-race contract
+    # is a free look at a driver with no commitment, which is what the
+    # premiums exist to discourage. Both are commissioner-editable.
+    "min_term_races": 5,
+    "max_term_races": 48,
+    # ── contract premiums (Phase 9) — UNTUNED PLACEHOLDERS
+    # Zero means no price floor above the driver's market value, which is
+    # exactly how the first seven seasons of this league priced contracts.
+    # Shipping at zero keeps deploy-day behaviour identical and leaves the
+    # commissioner to dial them in from the config panel against real
+    # contract history, rather than having a number invented here silently
+    # reprice every offer. See PHASE9_PLAN.md — these need tuning.
+    "resign_premium_pct": Decimal("0"),
+    "length_premium_pct": Decimal("0"),
 }
 
 
@@ -377,4 +398,9 @@ async def _seed_default_config(conn: asyncpg.Connection, season_id: int) -> None
         max_term_seasons=_DEFAULT_LEAGUE_CONFIG["max_term_seasons"],  # type: ignore[arg-type]
         max_incentive_pct=_DEFAULT_LEAGUE_CONFIG["max_incentive_pct"],  # type: ignore[arg-type]
         offer_ttl_hours=_DEFAULT_LEAGUE_CONFIG["offer_ttl_hours"],  # type: ignore[arg-type]
+        races_per_season=_DEFAULT_LEAGUE_CONFIG["races_per_season"],  # type: ignore[arg-type]
+        min_term_races=_DEFAULT_LEAGUE_CONFIG["min_term_races"],  # type: ignore[arg-type]
+        max_term_races=_DEFAULT_LEAGUE_CONFIG["max_term_races"],  # type: ignore[arg-type]
+        resign_premium_pct=_DEFAULT_LEAGUE_CONFIG["resign_premium_pct"],  # type: ignore[arg-type]
+        length_premium_pct=_DEFAULT_LEAGUE_CONFIG["length_premium_pct"],  # type: ignore[arg-type]
     )
