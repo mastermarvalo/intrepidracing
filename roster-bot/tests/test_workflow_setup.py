@@ -540,3 +540,197 @@ async def test_sync_all_tiers_records_skipped_alongside_synced(workflow_db):
     assert reports["t1"].skipped_reason is None
     assert reports["t2"].skipped_reason == "no role set"
     assert reports["t3"].skipped_reason == "no role set"
+
+
+# ── per-driver admin actions ─────────────────────────────────────────
+
+
+async def _driver_with_contract(
+    workflow_db, *, tier_code="t1", team_key="mercedes", member_id=100,
+    display_name="Alonso", contract_value="10.00",
+):
+    """Insert one driver + team + active contract; return their ids."""
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    assert season is not None
+    tier = await queries.fetch_tier(workflow_db, season.id, tier_code)
+    assert tier is not None
+    team_id = await queries.insert_team(
+        workflow_db, guild_id=GUILD, key=team_key, name=team_key.title(),
+        team_role_id=1000, channel_id=2000, tagline=None,
+        logo_url=None, banner_url=None, principal_role_id=None,
+    )
+    driver_id = await queries.insert_driver(
+        workflow_db, season.id, tier.id,
+        member_id=member_id, display_name=display_name, status="active",
+    )
+    contract_id = await queries.insert_contract(
+        workflow_db,
+        season_id=season.id, tier_id=tier.id,
+        driver_id=driver_id, team_id=team_id,
+        contract_value=Decimal(contract_value),
+        signing_bonus=Decimal("0"), max_incentives=Decimal("0"),
+        term_seasons=1, contract_type="standard", state="active",
+        value_at_signing=None, approved_by=None,
+    )
+    return {
+        "season_id": season.id, "tier_id": tier.id,
+        "team_id": team_id, "driver_id": driver_id,
+        "contract_id": contract_id,
+    }
+
+
+async def test_list_drivers_in_season_joins_team_and_contract(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+    # A second driver with no contract to prove the join tolerates it.
+    await workflow.enrol_driver(
+        guild_id=GUILD, actor_id=1, tier_code="t1",
+        member_id=200, display_name="Sainz", status="active",
+    )
+
+    drivers = {d.driver_id: d for d in await workflow.list_drivers_in_season(GUILD)}
+
+    d = drivers[ids["driver_id"]]
+    assert d.tier_code == "t1"
+    assert d.active_team_name == "Mercedes"
+    assert d.contract_value == Decimal("10.00")
+    assert d.active_contract_id == ids["contract_id"]
+
+    reserve = next(x for x in drivers.values() if x.display_name == "Sainz")
+    assert reserve.active_contract_id is None
+    assert reserve.active_team_name is None
+    assert reserve.contract_value is None
+
+
+async def test_fetch_driver_detail_rejects_unknown_id(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="No driver"):
+        await workflow.fetch_driver_detail(GUILD, driver_id=99999)
+
+
+async def test_void_active_contract_flips_state_and_logs(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+
+    await workflow.void_active_contract(
+        guild_id=GUILD, actor_id=42,
+        driver_id=ids["driver_id"], note="testing",
+    )
+
+    contract = await queries.fetch_contract_by_id(workflow_db, ids["contract_id"])
+    assert contract.state == "voided"
+    kinds = await workflow_db.fetch(
+        "SELECT kind FROM contract_ledger WHERE contract_id = $1 "
+        "ORDER BY created_at DESC",
+        ids["contract_id"],
+    )
+    assert kinds[0]["kind"] == "contract_voided"
+
+
+async def test_void_active_contract_raises_when_none_active(workflow_db):
+    await _seeded_season(workflow_db)
+    # Driver with no contract at all.
+    await workflow.enrol_driver(
+        guild_id=GUILD, actor_id=1, tier_code="t1",
+        member_id=101, display_name="Rookie", status="active",
+    )
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    tier = await queries.fetch_tier(workflow_db, season.id, "t1")
+    driver = await queries.fetch_driver(workflow_db, season.id, tier.id, 101)
+
+    with pytest.raises(workflow.WorkflowError, match="no active contract"):
+        await workflow.void_active_contract(
+            guild_id=GUILD, actor_id=42, driver_id=driver.id, note=None,
+        )
+
+
+async def test_set_driver_status_writes_status_and_ledger(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+
+    await workflow.set_driver_status(
+        guild_id=GUILD, actor_id=42,
+        driver_id=ids["driver_id"], status="suspended",
+    )
+
+    driver = await queries.fetch_driver_by_id(workflow_db, ids["driver_id"])
+    assert driver.status == "suspended"
+    row = await workflow_db.fetchrow(
+        "SELECT kind, detail FROM contract_ledger WHERE driver_id = $1 "
+        "AND kind = 'status_change' ORDER BY created_at DESC LIMIT 1",
+        ids["driver_id"],
+    )
+    assert row["kind"] == "status_change"
+    # asyncpg returns JSONB as text unless a codec is registered — the
+    # rest of the codebase parses when it needs a dict.
+    assert "suspended" in row["detail"]
+
+
+async def test_set_driver_status_is_a_noop_when_unchanged(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+
+    await workflow.set_driver_status(
+        guild_id=GUILD, actor_id=42,
+        driver_id=ids["driver_id"], status="active",  # already active
+    )
+
+    ledger_count = await workflow_db.fetchval(
+        "SELECT count(*) FROM contract_ledger WHERE driver_id = $1 "
+        "AND kind = 'status_change'",
+        ids["driver_id"],
+    )
+    assert ledger_count == 0, (
+        "no-op status changes must not spam the ledger"
+    )
+
+
+async def test_set_driver_status_rejects_bogus_status(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+
+    with pytest.raises(workflow.WorkflowError, match="status"):
+        await workflow.set_driver_status(
+            guild_id=GUILD, actor_id=1,
+            driver_id=ids["driver_id"], status="not-a-real-status",
+        )
+
+
+async def test_move_driver_to_tier_moves_driver_and_contract(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+
+    await workflow.move_driver_to_tier(
+        guild_id=GUILD, actor_id=42,
+        driver_id=ids["driver_id"], new_tier_code="t2", note="promoted",
+    )
+
+    driver = await queries.fetch_driver_by_id(workflow_db, ids["driver_id"])
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    t2 = await queries.fetch_tier(workflow_db, season.id, "t2")
+    assert driver.tier_id == t2.id
+    contract = await queries.fetch_contract_by_id(workflow_db, ids["contract_id"])
+    assert contract.tier_id == t2.id
+
+
+async def test_move_driver_to_tier_rejects_same_tier(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db, tier_code="t1")
+
+    with pytest.raises(workflow.WorkflowError, match="already"):
+        await workflow.move_driver_to_tier(
+            guild_id=GUILD, actor_id=1,
+            driver_id=ids["driver_id"], new_tier_code="t1", note=None,
+        )
+
+
+async def test_move_driver_to_tier_rejects_unknown_tier(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+
+    with pytest.raises(workflow.WorkflowError, match="No tier"):
+        await workflow.move_driver_to_tier(
+            guild_id=GUILD, actor_id=1,
+            driver_id=ids["driver_id"], new_tier_code="does-not-exist",
+            note=None,
+        )

@@ -375,6 +375,31 @@ def driver_summary(code="t1", *, label=None, drivers=0, role_id=None):
     )
 
 
+def driver_detail(
+    driver_id=1,
+    *,
+    display_name="Alonso",
+    tier_code="t1",
+    tier_label=None,
+    status="active",
+    team="Mercedes",
+    contract_value="10.00",
+    market_value="12.00",
+):
+    return workflow.DriverForPanel(
+        driver_id=driver_id,
+        member_id=driver_id * 100,
+        display_name=display_name,
+        tier_code=tier_code,
+        tier_label=tier_label or f"Tier {tier_code[-1]}",
+        status=status,
+        active_contract_id=driver_id * 1000 if contract_value else None,
+        active_team_name=team,
+        contract_value=Decimal(contract_value) if contract_value else None,
+        market_value=Decimal(market_value) if market_value else None,
+    )
+
+
 def test_drivers_empty_state_points_at_setup():
     embed = drivers_screen.build_drivers_embed([])
 
@@ -534,6 +559,157 @@ def test_sync_line_shows_the_counts_when_a_sync_ran():
     assert "17" in line
 
 
+# ── driver detail (per-driver admin actions) ─────────────────────────
+
+
+def test_detail_embed_shows_value_status_and_pl_when_contracted():
+    embed = drivers_screen.build_driver_detail_embed(driver_detail())
+    blob = embed.description + "".join(f.value for f in embed.fields)
+
+    assert "Mercedes" in blob
+    assert "active" in blob
+    assert "$12.00M" in blob  # market
+    assert "$10.00M" in blob  # contract
+    assert "$2.00M" in blob or "+$2.00M" in blob  # P/L
+    assert_embed_within_limits(embed)
+
+
+def test_detail_embed_degrades_when_driver_has_no_contract():
+    embed = drivers_screen.build_driver_detail_embed(
+        driver_detail(team=None, contract_value="")
+    )
+    blob = embed.description + "".join(f.value for f in embed.fields)
+
+    assert "free agent" in blob.lower()
+    assert "no active contract" in blob.lower()
+    assert "P/L" not in "".join(f.name for f in embed.fields), (
+        "showing $0.00 P/L for a driver with no contract implies a zero "
+        "value where there is no value at all"
+    )
+
+
+def test_detail_embed_stays_useful_before_any_valuation_run():
+    embed = drivers_screen.build_driver_detail_embed(
+        driver_detail(market_value="", contract_value="")
+    )
+
+    assert any("no published run" in f.value for f in embed.fields)
+
+
+def test_picker_labels_carry_tier_and_team():
+    view = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail(display_name="Verstappen", team="Red Bull")],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    picker = next(
+        c for c in view.children
+        if isinstance(c, drivers_screen._DriverPickerSelect)
+    )
+
+    assert picker.options[0].label == "Verstappen · t1 · Red Bull"
+
+
+def test_picker_caps_and_reports_overflow():
+    many = [driver_detail(driver_id=i, display_name=f"D{i}") for i in range(40)]
+    view = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=many,
+        opener_id=1,
+        on_back=noop_back,
+    )
+    picker = next(
+        c for c in view.children
+        if isinstance(c, drivers_screen._DriverPickerSelect)
+    )
+
+    assert len(picker.options) <= SELECT_MAX_OPTIONS
+    assert "40" in picker.placeholder, (
+        "if the picker is showing only the top 25 the count must say so"
+    )
+
+
+def test_drivers_view_without_drivers_shows_no_picker():
+    view = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[],
+        opener_id=1,
+        on_back=noop_back,
+    )
+
+    assert not any(
+        isinstance(c, drivers_screen._DriverPickerSelect) for c in view.children
+    )
+    assert_view_within_limits(view)
+
+
+def test_drivers_view_stays_inside_row_limit_with_picker_and_sync():
+    view = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail()],
+        opener_id=1,
+        on_back=noop_back,
+    )
+
+    assert_view_within_limits(view)
+
+
+def test_detail_view_offers_the_four_actions_and_back():
+    parent = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail()],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    detail = drivers_screen._DriverDetailView(
+        detail=driver_detail(), opener_id=1, parent=parent
+    )
+    labels = {c.label for c in detail.children if getattr(c, "label", None)}
+
+    assert {"Void contract", "Set status", "Promote", "Relegate"} <= labels
+    assert any("Back" in label for label in labels)
+    assert_view_within_limits(detail)
+
+
+def test_detail_view_disables_void_when_there_is_no_active_contract():
+    parent = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail()],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    free_agent = driver_detail(team=None, contract_value="")
+    detail = drivers_screen._DriverDetailView(
+        detail=free_agent, opener_id=1, parent=parent
+    )
+    void = next(
+        c for c in detail.children if getattr(c, "label", "") == "Void contract"
+    )
+
+    assert void.disabled, (
+        "voiding a nonexistent contract can only fail; disable at the "
+        "button rather than raise on submit"
+    )
+
+
+def test_status_select_marks_the_current_status_as_default():
+    parent = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        drivers=[driver_detail()],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    detail = drivers_screen._DriverDetailView(
+        detail=driver_detail(status="reserve"), opener_id=1, parent=parent
+    )
+    select = drivers_screen._StatusSelect(detail)
+
+    defaults = [o for o in select.options if o.default]
+    assert len(defaults) == 1
+    assert defaults[0].value == "reserve"
+
+
 # ── setup screen ─────────────────────────────────────────────────────
 
 
@@ -665,6 +841,16 @@ def test_tier_modal_suggests_the_next_rank_order():
             summaries=[driver_summary("t1", role_id=100)],
             opener_id=1,
             on_back=noop_back,
+        ),
+        lambda: drivers_screen._DriverDetailView(
+            detail=driver_detail(),
+            opener_id=1,
+            parent=drivers_screen.DriversView(
+                summaries=[driver_summary("t1", role_id=100)],
+                drivers=[driver_detail()],
+                opener_id=1,
+                on_back=noop_back,
+            ),
         ),
         lambda: setup_screen.SetupView(
             status=league_status(), opener_id=1, on_back=noop_back

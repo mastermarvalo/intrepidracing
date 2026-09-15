@@ -576,6 +576,13 @@ async def fetch_drivers_in_tier(
     return [_row_to_driver(r) for r in rows]
 
 
+async def fetch_driver_by_id(
+    conn: asyncpg.Connection, driver_id: int
+) -> Driver | None:
+    row = await conn.fetchrow("SELECT * FROM drivers WHERE id = $1", driver_id)
+    return _row_to_driver(row) if row else None
+
+
 async def set_driver_status(
     conn: asyncpg.Connection, driver_id: int, status: str
 ) -> None:

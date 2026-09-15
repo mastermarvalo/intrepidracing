@@ -25,6 +25,7 @@ from datetime import date
 from decimal import Decimal
 
 from bot import db, queries, results_ingest, sheets
+from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
 from bot.market import driver_ops
 from bot.market import results as results_engine
@@ -983,6 +984,216 @@ async def sync_drivers_all_tiers(
                 )
             )
     return reports
+
+
+# ── Per-driver admin actions ─────────────────────────────────────────
+#
+# Backs the /league Drivers screen's driver-detail flow and mirrors
+# `/market-admin void|set-status|promote|relegate`. Every mutation
+# raises `WorkflowError` with user-facing text; the underlying transitions
+# live in `bot/contracts/service.py`.
+
+
+@dataclass(frozen=True)
+class DriverForPanel:
+    """Rich driver info the Drivers picker + detail view render off."""
+
+    driver_id: int
+    member_id: int
+    display_name: str
+    tier_code: str
+    tier_label: str
+    status: str
+    active_contract_id: int | None
+    active_team_name: str | None
+    contract_value: Decimal | None
+    market_value: Decimal | None
+
+    @property
+    def pl(self) -> Decimal | None:
+        if self.market_value is None or self.contract_value is None:
+            return None
+        return self.market_value - self.contract_value
+
+
+async def _driver_for_panel(conn, driver, tier) -> DriverForPanel:
+    """Assemble a DriverForPanel row given already-fetched driver + tier."""
+    contract = await queries.fetch_active_contract_for_driver(conn, driver.id)
+    team_name: str | None = None
+    if contract is not None:
+        team = await queries.fetch_team_by_id(conn, contract.team_id)
+        team_name = team.name if team else None
+    market_value = await queries.fetch_latest_published_valuation(conn, driver.id)
+    return DriverForPanel(
+        driver_id=driver.id,
+        member_id=driver.member_id,
+        display_name=driver.display_name,
+        tier_code=tier.code,
+        tier_label=tier.label,
+        status=driver.status,
+        active_contract_id=contract.id if contract else None,
+        active_team_name=team_name,
+        contract_value=contract.contract_value if contract else None,
+        market_value=market_value,
+    )
+
+
+async def list_drivers_in_season(guild_id: int) -> list[DriverForPanel]:
+    """
+    Every enrolled driver in the active season, richest first.
+
+    Sorted by (tier rank, contract value desc, display_name) so the
+    picker's top options are the highest-visibility drivers.
+    """
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            return []
+        tiers = await queries.fetch_all_tiers(conn, season.id)
+        out: list[DriverForPanel] = []
+        for t in tiers:
+            drivers = await queries.fetch_drivers_in_tier(conn, t.id)
+            for d in drivers:
+                out.append(await _driver_for_panel(conn, d, t))
+    out.sort(
+        key=lambda d: (
+            d.tier_code,
+            -(d.contract_value or Decimal("0")),
+            d.display_name.casefold(),
+        )
+    )
+    return out
+
+
+async def fetch_driver_detail(guild_id: int, driver_id: int) -> DriverForPanel:
+    """Single-driver refresh for the detail view."""
+    async with db.connect() as conn:
+        driver = await queries.fetch_driver_by_id(conn, driver_id)
+        if driver is None:
+            raise WorkflowError(f"No driver with id `{driver_id}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None or season.id != driver.season_id:
+            raise WorkflowError(
+                "That driver isn't in the currently active season."
+            )
+        tier = await queries.fetch_tier_by_id(conn, driver.tier_id)
+        if tier is None:
+            raise WorkflowError(
+                f"Driver {driver_id}'s tier row is missing."
+            )
+        return await _driver_for_panel(conn, driver, tier)
+
+
+async def void_active_contract(
+    *,
+    guild_id: int,
+    actor_id: int,
+    driver_id: int,
+    note: str | None,
+) -> None:
+    """
+    Void a driver's active contract. Raises WorkflowError if the driver
+    has no active contract in the current season.
+    """
+    async with db.connect() as conn:
+        driver = await queries.fetch_driver_by_id(conn, driver_id)
+        if driver is None:
+            raise WorkflowError(f"No driver with id `{driver_id}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None or season.id != driver.season_id:
+            raise WorkflowError(
+                "That driver isn't in the currently active season."
+            )
+        contract = await queries.fetch_active_contract_for_driver(conn, driver_id)
+        if contract is None:
+            raise WorkflowError(
+                f"{driver.display_name} has no active contract to void."
+            )
+        try:
+            await contracts_service.void_contract(
+                conn, contract.id, actor_id=actor_id, note=note
+            )
+        except contracts_service.TransitionError as exc:
+            raise WorkflowError(str(exc)) from exc
+
+
+async def set_driver_status(
+    *,
+    guild_id: int,
+    actor_id: int,
+    driver_id: int,
+    status: str,
+) -> None:
+    """
+    Change a driver's status and append a `status_change` ledger row.
+
+    Mirrors `/market-admin set-status`: the ledger detail records
+    `{"from": old, "to": new}` so the audit trail is complete.
+    """
+    if status not in {code for code, _ in DRIVER_STATUS_CHOICES}:
+        raise WorkflowError(f"Unknown driver status `{status}`.")
+    async with db.connect() as conn:
+        driver = await queries.fetch_driver_by_id(conn, driver_id)
+        if driver is None:
+            raise WorkflowError(f"No driver with id `{driver_id}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None or season.id != driver.season_id:
+            raise WorkflowError(
+                "That driver isn't in the currently active season."
+            )
+        prior = driver.status
+        if prior == status:
+            return
+        await queries.set_driver_status(conn, driver_id, status)
+        await queries.append_ledger(
+            conn,
+            season_id=driver.season_id,
+            tier_id=driver.tier_id,
+            driver_id=driver_id,
+            kind="status_change",
+            detail={"from": prior, "to": status},
+            actor_id=actor_id,
+        )
+
+
+async def move_driver_to_tier(
+    *,
+    guild_id: int,
+    actor_id: int,
+    driver_id: int,
+    new_tier_code: str,
+    note: str | None,
+) -> None:
+    """
+    Promote or relegate a driver. Direction is derived from the target
+    tier's `rank_order` — the caller doesn't need to know which is which.
+
+    The driver's active contract (if any) moves with them; the underlying
+    service layer handles the transfer.
+    """
+    async with db.connect() as conn:
+        driver = await queries.fetch_driver_by_id(conn, driver_id)
+        if driver is None:
+            raise WorkflowError(f"No driver with id `{driver_id}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None or season.id != driver.season_id:
+            raise WorkflowError(
+                "That driver isn't in the currently active season."
+            )
+        new_tier = await queries.fetch_tier(conn, season.id, new_tier_code)
+        if new_tier is None:
+            raise WorkflowError(
+                f"No tier `{new_tier_code}` in **{season.name}**."
+            )
+        try:
+            await contracts_service.move_driver_between_tiers(
+                conn, driver_id,
+                new_tier_id=new_tier.id,
+                actor_id=actor_id,
+                note=note,
+            )
+        except contracts_service.TransitionError as exc:
+            raise WorkflowError(str(exc)) from exc
 
 
 async def list_tier_choices(guild_id: int) -> list[tuple[str, str]]:

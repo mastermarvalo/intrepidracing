@@ -1,10 +1,11 @@
 """
-Driver enrolment as an interactive screen.
+Driver enrolment + per-driver admin actions.
 
-`/market-admin driver add|sync|sync-all` are the underlying commands.
-This screen is the guided front for them: it lists tiers with their
-current driver counts, then offers three actions:
+`/market-admin driver add|sync|sync-all` back the enrolment surface;
+`/market-admin void|set-status|promote|relegate` back the per-driver
+actions. This screen is the guided front for both.
 
+The list surface offers:
   * **Enrol member** — a three-step wizard (tier → member → status) so a
     single sign-up never means typing a slash command with an @mention
     and remembering the tier code.
@@ -12,6 +13,11 @@ current driver counts, then offers three actions:
     as `active`; the workflow helper is idempotent, so re-running is a
     no-op for already-registered members.
   * **Sync all** — same, walked across every tier that has a role set.
+
+The picker at the top opens a driver-detail view whose four buttons
+mirror the /market-admin per-driver commands (void / set-status /
+promote / relegate). Cap-adjust is team-scoped, not driver-scoped, so
+it isn't here — Stage 4 gives it a proper home.
 
 All persistence goes through `bot/workflow.py`. This module walks Discord
 role members to build the enrolment seeds, because the workflow layer
@@ -24,6 +30,7 @@ import discord
 
 from bot import workflow
 from bot.market import driver_ops
+from bot.market.money import format_money, format_pl
 from bot.ui.base import (
     COLOR_INFO,
     COLOR_OK,
@@ -220,6 +227,8 @@ class _SyncTierSelect(discord.ui.Select):
         self,
         parent: DriversView,
         eligible: list[workflow.TierDriverSummary],
+        *,
+        row: int | None = None,
     ) -> None:
         super().__init__(
             placeholder="Sync which tier?",
@@ -232,6 +241,7 @@ class _SyncTierSelect(discord.ui.Select):
                 for s in eligible[:SELECT_MAX_OPTIONS]
             ],
             disabled=not eligible,
+            row=row,
         )
         self._parent = parent
         self._by_code = {s.code: s for s in eligible}
@@ -333,35 +343,49 @@ def _format_sync_line(report: workflow.TierSyncReport) -> str:
 
 
 class DriversView(AdminOwnedView):
-    """List, enrol, sync one tier, or sync every tier."""
+    """List, enrol, sync, and drill into a driver for per-driver actions."""
 
     def __init__(
         self,
         *,
         summaries: list[workflow.TierDriverSummary],
+        drivers: list[workflow.DriverForPanel] | None = None,
         opener_id: int,
         on_back: BackCallback,
     ) -> None:
         super().__init__(opener_id=opener_id)
         self._on_back = on_back
         self.summaries = summaries
+        self.drivers = drivers or []
+
+        # Rows stack top-down: picker (if any), sync select (if any), buttons.
+        # Discord caps a view at 5 rows; two selects + one button row = 3.
+        row = 0
+        if self.drivers:
+            self.add_item(_DriverPickerSelect(self, self.drivers, row=row))
+            row += 1
 
         eligible = [s for s in summaries if s.tier_role_id is not None]
         if eligible:
-            self.add_item(_SyncTierSelect(self, eligible))
+            self.add_item(_SyncTierSelect(self, eligible, row=row))
+            row += 1
 
         if summaries:
-            self.add_item(_EnrolMemberButton(row=1))
+            self.add_item(_EnrolMemberButton(row=row))
         if eligible:
-            self.add_item(_SyncAllButton(row=1))
-        self.add_item(BackButton(on_back, row=1))
+            self.add_item(_SyncAllButton(row=row))
+        self.add_item(BackButton(on_back, row=row))
 
     async def reload(
         self, interaction: discord.Interaction, *, note: str | None = None
     ) -> None:
         summaries = await workflow.list_driver_summary(interaction.guild_id)
+        drivers = await workflow.list_drivers_in_season(interaction.guild_id)
         view = DriversView(
-            summaries=summaries, opener_id=self.opener_id, on_back=self._on_back
+            summaries=summaries,
+            drivers=drivers,
+            opener_id=self.opener_id,
+            on_back=self._on_back,
         )
         embed = build_drivers_embed(summaries)
         if interaction.response.is_done():
@@ -404,12 +428,380 @@ def _seeds_from_role(role: discord.Role) -> list[driver_ops.DriverSeed]:
     ]
 
 
+# ── Driver picker + detail view ──────────────────────────────────────
+
+
+def build_driver_detail_embed(detail: workflow.DriverForPanel) -> discord.Embed:
+    """
+    One embed summarising the driver: team, status, money, P/L.
+
+    Degrades cleanly when the driver has no active contract — the money
+    lines drop rather than showing zeros that look like real values.
+    """
+    team = detail.active_team_name or "free agent"
+    embed = discord.Embed(
+        title=f"👤 {detail.display_name}",
+        description=(
+            f"Tier `{detail.tier_code}` — {detail.tier_label} · "
+            f"team **{team}** · status `{detail.status}`"
+        ),
+        color=COLOR_INFO,
+    )
+    if detail.market_value is not None:
+        embed.add_field(
+            name="Market value", value=format_money(detail.market_value), inline=True
+        )
+    else:
+        embed.add_field(
+            name="Market value",
+            value="— (no published run yet)",
+            inline=True,
+        )
+    if detail.contract_value is not None:
+        embed.add_field(
+            name="Contract value",
+            value=format_money(detail.contract_value),
+            inline=True,
+        )
+        pl = detail.pl
+        assert pl is not None  # both market and contract are populated
+        embed.add_field(name="P/L", value=format_pl(pl), inline=True)
+    else:
+        embed.add_field(
+            name="Contract",
+            value="— (no active contract)",
+            inline=True,
+        )
+    embed.set_footer(
+        text=(
+            "Void / Set status / Promote / Relegate go through the same "
+            "workflow the /market-admin commands use."
+        )
+    )
+    return embed
+
+
+def _picker_label(d: workflow.DriverForPanel) -> str:
+    team = d.active_team_name or "FA"
+    return f"{d.display_name} · {d.tier_code} · {team}"[:100]
+
+
+def _picker_description(d: workflow.DriverForPanel) -> str:
+    value = format_money(d.market_value) if d.market_value is not None else "—"
+    return f"{d.status} · market {value}"[:100]
+
+
+class _DriverPickerSelect(discord.ui.Select):
+    """
+    Pick a driver to act on. Capped at Discord's 25-option limit; the
+    workflow layer already sorts by (tier, contract value desc), so the
+    highest-visibility drivers are the top 25.
+    """
+
+    def __init__(
+        self,
+        parent: DriversView,
+        drivers: list[workflow.DriverForPanel],
+        *,
+        row: int | None = None,
+    ) -> None:
+        shown = drivers[:SELECT_MAX_OPTIONS]
+        overflow = len(drivers) - len(shown)
+        placeholder = "Pick a driver…"
+        if overflow > 0:
+            placeholder = (
+                f"Pick a driver… (showing top {len(shown)} of {len(drivers)})"
+            )
+        super().__init__(
+            placeholder=placeholder,
+            options=[
+                discord.SelectOption(
+                    label=_picker_label(d),
+                    value=str(d.driver_id),
+                    description=_picker_description(d),
+                )
+                for d in shown
+            ],
+            disabled=not shown,
+            row=row,
+        )
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        driver_id = int(self.values[0])
+        try:
+            detail = await workflow.fetch_driver_detail(
+                interaction.guild_id, driver_id
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        view = _DriverDetailView(
+            detail=detail,
+            opener_id=self._parent.opener_id,
+            parent=self._parent,
+        )
+        await interaction.edit_original_response(
+            embed=build_driver_detail_embed(detail), view=view
+        )
+
+
+class _DriverDetailView(AdminOwnedView):
+    """One-driver detail with the four /market-admin actions + Back."""
+
+    def __init__(
+        self,
+        *,
+        detail: workflow.DriverForPanel,
+        opener_id: int,
+        parent: DriversView,
+    ) -> None:
+        super().__init__(opener_id=opener_id)
+        self.detail = detail
+        self.parent = parent
+
+        self.add_item(_VoidButton(disabled=detail.active_contract_id is None))
+        self.add_item(_SetStatusButton())
+        self.add_item(_MoveTierButton(label="Promote", direction="promote"))
+        self.add_item(_MoveTierButton(label="Relegate", direction="relegate"))
+        self.add_item(BackButton(self._back, row=1))
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await self.parent.reload(interaction)
+
+    async def refresh(
+        self, interaction: discord.Interaction, *, note: str | None = None
+    ) -> None:
+        """Re-fetch the driver and redraw the detail view in place."""
+        try:
+            detail = await workflow.fetch_driver_detail(
+                interaction.guild_id, self.detail.driver_id
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        view = _DriverDetailView(
+            detail=detail, opener_id=self.opener_id, parent=self.parent
+        )
+        embed = build_driver_detail_embed(detail)
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=view)
+        if note:
+            await interaction.followup.send(note, ephemeral=True)
+
+
+class _VoidButton(discord.ui.Button):
+    def __init__(self, *, disabled: bool) -> None:
+        super().__init__(
+            label="Void contract",
+            style=discord.ButtonStyle.danger,
+            disabled=disabled,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, _DriverDetailView)
+        await interaction.response.send_modal(_VoidNoteModal(view))
+
+
+class _VoidNoteModal(discord.ui.Modal, title="Void contract"):
+    def __init__(self, parent: _DriverDetailView) -> None:
+        super().__init__()
+        self.parent = parent
+        self.note = discord.ui.TextInput(
+            label="Reason (goes to the audit ledger)",
+            placeholder="e.g. driver inactive, contract dispute…",
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.note)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        note = str(self.note.value).strip() or None
+        try:
+            await workflow.void_active_contract(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                driver_id=self.parent.detail.driver_id,
+                note=note,
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        await self.parent.refresh(
+            interaction,
+            note=f"✅ Voided **{self.parent.detail.display_name}**'s contract.",
+        )
+
+
+class _SetStatusButton(discord.ui.Button):
+    def __init__(self) -> None:
+        super().__init__(
+            label="Set status", style=discord.ButtonStyle.secondary, row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, _DriverDetailView)
+        # Swap the button row for a status select; back stays on row 1.
+        picker_view = _StatusPickerView(parent=view)
+        await interaction.response.edit_message(view=picker_view)
+
+
+class _StatusPickerView(AdminOwnedView):
+    """Ephemeral pick-a-status swap of the detail view's button row."""
+
+    def __init__(self, *, parent: _DriverDetailView) -> None:
+        super().__init__(opener_id=parent.opener_id)
+        self.parent = parent
+        self.add_item(_StatusSelect(parent))
+        self.add_item(BackButton(self._back, label="Cancel", row=1))
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await self.parent.refresh(interaction)
+
+
+class _StatusSelect(discord.ui.Select):
+    def __init__(self, parent: _DriverDetailView) -> None:
+        super().__init__(
+            placeholder=f"New status (currently `{parent.detail.status}`)",
+            options=[
+                discord.SelectOption(
+                    label=label,
+                    value=code,
+                    default=(code == parent.detail.status),
+                )
+                for code, label in workflow.DRIVER_STATUS_CHOICES
+            ],
+        )
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        chosen = self.values[0]
+        try:
+            await workflow.set_driver_status(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                driver_id=self._parent.detail.driver_id,
+                status=chosen,
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        note = (
+            f"✅ **{self._parent.detail.display_name}**: "
+            f"`{self._parent.detail.status}` → `{chosen}`."
+            if chosen != self._parent.detail.status
+            else f"ℹ️ Status was already `{chosen}` — no change."
+        )
+        await self._parent.refresh(interaction, note=note)
+
+
+class _MoveTierButton(discord.ui.Button):
+    """
+    Promote or Relegate. Both open the same tier picker; the workflow
+    layer figures out the direction from the target tier's rank.
+    """
+
+    def __init__(self, *, label: str, direction: str) -> None:
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary,
+            row=0,
+        )
+        self.direction = direction
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, _DriverDetailView)
+        tiers = await workflow.list_tier_choices(interaction.guild_id)
+        tiers = [(c, label) for c, label in tiers if c != view.detail.tier_code]
+        if not tiers:
+            await report_error(
+                interaction,
+                "No other tier to move this driver to.",
+            )
+            return
+        picker_view = _MoveTierPickerView(
+            parent=view, direction=self.direction, tiers=tiers
+        )
+        await interaction.response.edit_message(view=picker_view)
+
+
+class _MoveTierPickerView(AdminOwnedView):
+    def __init__(
+        self,
+        *,
+        parent: _DriverDetailView,
+        direction: str,
+        tiers: list[tuple[str, str]],
+    ) -> None:
+        super().__init__(opener_id=parent.opener_id)
+        self.parent = parent
+        self.add_item(_MoveTierSelect(parent, direction, tiers))
+        self.add_item(BackButton(self._back, label="Cancel", row=1))
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        await self.parent.refresh(interaction)
+
+
+class _MoveTierSelect(discord.ui.Select):
+    def __init__(
+        self,
+        parent: _DriverDetailView,
+        direction: str,
+        tiers: list[tuple[str, str]],
+    ) -> None:
+        super().__init__(
+            placeholder=f"{direction.capitalize()} to which tier?",
+            options=[
+                discord.SelectOption(label=label[:100], value=code)
+                for code, label in tiers[:SELECT_MAX_OPTIONS]
+            ],
+        )
+        self._parent = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        target = self.values[0]
+        try:
+            await workflow.move_driver_to_tier(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                driver_id=self._parent.detail.driver_id,
+                new_tier_code=target,
+                note=None,
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        await self._parent.refresh(
+            interaction,
+            note=(
+                f"✅ Moved **{self._parent.detail.display_name}** to tier "
+                f"`{target}`. Their active contract (if any) moved with them."
+            ),
+        )
+
+
 async def open_drivers(
     interaction: discord.Interaction, *, opener_id: int, on_back: BackCallback
 ) -> None:
     """Entry point used by the /league home screen's Drivers button."""
     summaries = await workflow.list_driver_summary(interaction.guild_id)
-    view = DriversView(summaries=summaries, opener_id=opener_id, on_back=on_back)
+    drivers = await workflow.list_drivers_in_season(interaction.guild_id)
+    view = DriversView(
+        summaries=summaries,
+        drivers=drivers,
+        opener_id=opener_id,
+        on_back=on_back,
+    )
     await interaction.response.edit_message(
         embed=build_drivers_embed(summaries), view=view
     )

@@ -25,7 +25,7 @@ ab25adc  Phase 6: race-results ingestion and normalization
 d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
-- **479 tests passing**, 27 test modules.
+- **500 tests passing**, 27 test modules.
 - **77 slash commands** across 7 groups.
 - **11 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
@@ -79,7 +79,7 @@ roster-bot/
     db.py              75   asyncpg pool, connect() context manager (auto transaction),
                             _run_migrations() applies migrations/*.sql in sorted filename order
     models.py         235   dataclasses: Team, TeamSlot, GuildConfig, StatBoard, LeagueConfig, …
-    queries.py       2360   ALL SQL. Functions take an open asyncpg.Connection
+    queries.py       2367   ALL SQL. Functions take an open asyncpg.Connection
     limits.py          53   Discord protocol limits + render widths (deliberately outside
                             the magic-number guard — protocol facts, not league policy)
     roster_ops.py     106   sign_to_team / drop_from_team — the ONLY role-mutation path
@@ -89,7 +89,7 @@ roster-bot/
     sheets.py         245   Google Sheets fetch/format
     results_ingest.py 293   CSV/Sheets → parsed race results, Discord-free
     approvals.py      341   Discord-AWARE approval orchestration
-    workflow.py      1000   Discord-FREE shared layer behind the panel and the cogs
+    workflow.py      1211   Discord-FREE shared layer behind the panel and the cogs
     panel_help.py     214   /help catalog, built from live tree.walk_commands()
 
     market/
@@ -114,7 +114,7 @@ roster-bot/
       setup_screen.py 681   guided setup checklist + season/tier/role/channel flows
       approvals_screen.py 359  approval queue browser with detail + reject modal
       boards_screen.py 325  board add/remove wizard
-      drivers_screen.py 415  enrol + sync driver enrolment surface
+      drivers_screen.py 807  enrol + sync + per-driver detail (void, set-status, promote, relegate)
       config_modal.py 460   league config editors (money limits / contract rules)
 
     cogs/
@@ -370,7 +370,8 @@ a guided flow; it **adds** a layer and removes nothing.
 /league
 ├── ⚙️  Setup      → guided checklist (season → tiers → rules → roles → channels → boards)
 ├── 🏁 Race Night  → import results → preview valuation → publish   (needs tiers)
-├── 👥 Drivers     → enrol one, sync one tier's role, or sync all tiers (needs tiers)
+├── 👥 Drivers     → enrol / sync + click a driver for per-driver admin actions (needs tiers)
+│                    (detail view drives void, set-status, promote, relegate)
 ├── 📋 Approvals   → pending offer + trade queue with detail view    (needs season)
 └── 📊 Boards      → add / remove / refresh market boards            (needs tiers)
 ```
