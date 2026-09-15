@@ -345,6 +345,97 @@ each side); the schema is multi-item ready.
 
 `/roster edit <name>` reopens the same flow pre-filled with existing values.
 
+## Google Sheets access
+
+Two features read Google Sheets: the `/sheets` stat boards and `/market-admin results import`.
+Neither works until the bot has credentials. Set up a **service account** — it is the only
+option that works with a private sheet, and your results sheet should be private.
+
+### 1. Create the service account
+
+1. Open the [Google Cloud console](https://console.cloud.google.com/) and create a project
+   (or reuse one).
+2. Enable the Google Sheets API:
+   **APIs & Services → Library → "Google Sheets API" → Enable**.
+3. **APIs & Services → Credentials → Create credentials → Service account**.
+   Give it a name like `roster-bot-sheets`. No project roles are needed — the account gets
+   its access from the sheet share in section 3 below, not from IAM.
+4. Open the new service account → **Keys → Add key → Create new key → JSON**. A `.json`
+   file downloads. This is a secret; treat it like the bot token.
+5. Copy the service account's email address from the **Details** tab. It looks like
+   `roster-bot-sheets@your-project.iam.gserviceaccount.com`.
+
+### 2. Point the bot at the key
+
+In `.env`, either give a path to the file:
+
+```bash
+GOOGLE_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
+```
+
+or paste the whole JSON as a single line, which is easier on hosts that only offer
+environment-variable secrets:
+
+```bash
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"...","private_key":"..."}
+```
+
+The bot accepts both and detects which it was given.
+
+> **Docker: a host path will not resolve inside the container.**
+> `docker-compose.yml` passes `.env` through with `env_file`, but the container has its own
+> filesystem. If you use the path form, uncomment the `volumes` block on the `roster-bot`
+> service to mount the key read-only, and set the variable to the **container** path:
+>
+> ```yaml
+> volumes:
+>   - ./service-account.json:/run/secrets/service-account.json:ro
+> ```
+> ```bash
+> GOOGLE_SERVICE_ACCOUNT_JSON=/run/secrets/service-account.json
+> ```
+>
+> Pasting the raw JSON instead avoids the mount entirely.
+
+Add the key file to `.gitignore` if you keep it in the repo directory.
+
+### 3. Share each sheet with the service account
+
+The service account is a separate Google identity. It cannot see anything until you share it in.
+
+Open the spreadsheet → **Share** → paste the service account email → **Viewer** → Send.
+Untick "Notify people"; the address cannot receive mail.
+
+Viewer is sufficient and correct. The bot only ever reads — results are pulled into Postgres
+and all valuation happens there, so nothing is written back.
+
+Repeat for every sheet the bot reads, including each tier's results sheet.
+
+### Alternative: API key
+
+```bash
+GOOGLE_SHEETS_API_KEY=AIza...
+```
+
+Simpler, but it only works on sheets published to anyone with the link. That means your
+results sheet is world-readable, and anyone who finds the URL can see it before you import.
+Acceptable for public stat boards, a poor fit for results. If both variables are set, the
+service account wins.
+
+### Verifying it works
+
+Run a `/sheets` board or a results import. Failures name the cause:
+
+| Message | Cause |
+|---|---|
+| `No Google Sheets credentials configured` | Neither variable is set, or the container never received `.env` |
+| `Access denied (403)` | The sheet is not shared with the service account email, or the API key is being used on a private sheet |
+| `Sheet or range not found (404)` | Bad spreadsheet ID, or a `tab` name that does not exist — check spelling and spaces |
+| `Network error fetching sheet` | Egress blocked, or the Sheets API is not enabled on the project |
+
+A 403 immediately after setup is almost always a missed section 3 — the key is valid, the
+sheet just was not shared with it.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -353,6 +444,8 @@ each side); the schema is multi-item ready.
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `DATABASE_URL` | `postgresql://roster:roster@postgres:5432/roster` (set by compose) | Postgres connection string |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `roster` | Postgres credentials (compose only) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | *(unset)* | Path to the service account JSON key, **or** the raw JSON itself. Required for `/sheets` and `results import`. See [Google Sheets access](#google-sheets-access). |
+| `GOOGLE_SHEETS_API_KEY` | *(unset)* | Fallback for publicly shared sheets only. Ignored when a service account is set. |
 
 ## Architecture notes
 

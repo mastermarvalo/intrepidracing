@@ -27,6 +27,14 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-roster}:${POSTGRES_PASSWORD:-roster}@postgres:5432/${POSTGRES_DB:-roster}
+    # Google Sheets service account key.
+    # env_file passes GOOGLE_SERVICE_ACCOUNT_JSON through, but if you set it to a
+    # *path* that path must exist inside the container, not on the host. Uncomment
+    # this to mount the key read-only, then set:
+    #   GOOGLE_SERVICE_ACCOUNT_JSON=/run/secrets/service-account.json
+    # Not needed if you paste the raw JSON into the variable instead.
+    # volumes:
+    #   - ./service-account.json:/run/secrets/service-account.json:ro
     depends_on:
       postgres:
         condition: service_healthy
