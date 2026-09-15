@@ -26,7 +26,7 @@ d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
 - **460 tests passing**, 27 test modules.
-- **74 slash commands** across 7 groups.
+- **77 slash commands** across 7 groups.
 - **11 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
 
@@ -122,7 +122,7 @@ roster-bot/
       market.py       385   /market (7)
       contracts.py   1082   /contract (9)
       trades.py       393   /trade (5)
-      admin_market.py 1574  /market-admin (31)
+      admin_market.py 1769  /market-admin (34)
       panel.py        738   /league + /help (2)
 
   migrations/               001–012, forward-only
@@ -333,7 +333,7 @@ layer on top; every command remains available for power users.
 /trade propose | accept | decline | withdraw | status
 ```
 
-### `/market-admin` (31, commissioner)
+### `/market-admin` (34, commissioner)
 
 ```
 season create | activate | list
@@ -342,6 +342,7 @@ config edit | show | channel | role | free-agency
 valuation run | preview | publish | list
 results import | list | show
 board add | remove | refresh | list
+driver add | sync | sync-all
 approve | reject | approve-trade | reject-trade
 void | set-status | adjust-cap | promote | relegate
 ```

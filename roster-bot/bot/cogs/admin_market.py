@@ -26,6 +26,11 @@ Phase 6 surface:
   /market-admin results list [tier:<code>]
   /market-admin results show tier:<code> round:<label>
 
+Driver enrolment surface:
+  /market-admin driver add member:<@user> tier:<code> status:<status>
+  /market-admin driver sync tier:<code>          (enrol every member of the tier role)
+  /market-admin driver sync-all                  (every tier that has a role set)
+
 Phase 4 surface:
   /market-admin approve offer_id:<id>
   /market-admin reject offer_id:<id> [note]
@@ -58,6 +63,7 @@ from discord.ext import commands
 
 from bot import approvals, db, queries, sheets, workflow
 from bot.contracts import service as contracts_service
+from bot.market import driver_ops
 from bot.market import results as results_engine
 from bot.market.money import format_money, format_pl
 from bot.ui.config_modal import ConfigSectionView, build_config_embed
@@ -133,6 +139,11 @@ class AdminMarketCog(commands.Cog):
     )
     results = app_commands.Group(
         name="results", description="Import and inspect race results", parent=admin
+    )
+    driver = app_commands.Group(
+        name="driver",
+        description="Enrol members into a tier's market",
+        parent=admin,
     )
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -893,6 +904,169 @@ class AdminMarketCog(commands.Cog):
             )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+    # ── /market-admin driver enrolment ────────────────────────────────────
+
+    @driver.command(
+        name="add",
+        description="Enrol one member into a tier's market",
+    )
+    @app_commands.describe(
+        member="Discord member to enrol",
+        tier="Tier code (e.g. t1)",
+        status="Initial driver status",
+    )
+    @app_commands.choices(status=[
+        app_commands.Choice(name="Active", value="active"),
+        app_commands.Choice(name="Reserve", value="reserve"),
+        app_commands.Choice(name="Free agent", value="free_agent"),
+        app_commands.Choice(name="Restricted FA", value="restricted_fa"),
+        app_commands.Choice(name="Inactive", value="inactive"),
+        app_commands.Choice(name="Suspended", value="suspended"),
+    ])
+    async def driver_add(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        tier: str,
+        status: app_commands.Choice[str],
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        if member.bot:
+            await interaction.response.send_message(
+                f"{member.display_name} is a bot; bots cannot be drivers.",
+                ephemeral=True,
+            )
+            return
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.response.send_message(
+                    "No active season.", ephemeral=True
+                )
+                return
+            tier_row = await queries.fetch_tier(conn, season.id, tier.lower())
+            if tier_row is None:
+                await interaction.response.send_message(
+                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                )
+                return
+            result = await driver_ops.enrol_driver(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                seed=driver_ops.DriverSeed(
+                    member_id=member.id,
+                    display_name=member.display_name,
+                ),
+                status=status.value,
+                actor_id=interaction.user.id,
+            )
+        if result.created:
+            await interaction.response.send_message(
+                f"✅ Enrolled **{member.display_name}** in tier "
+                f"`{tier_row.code}` as `{status.value}`.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"ℹ️ **{member.display_name}** is already enrolled in tier "
+                f"`{tier_row.code}`. Use `/market-admin set-status` to change "
+                "their status.",
+                ephemeral=True,
+            )
+
+    @driver.command(
+        name="sync",
+        description="Enrol every member with a tier's Discord role as active",
+    )
+    @app_commands.describe(tier="Tier code (e.g. t1)")
+    async def driver_sync(
+        self, interaction: discord.Interaction, tier: str
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild is not None and interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send("No active season.", ephemeral=True)
+                return
+            tier_row = await queries.fetch_tier(conn, season.id, tier.lower())
+            if tier_row is None:
+                await interaction.followup.send(
+                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                )
+                return
+            reason = _tier_role_unavailable(interaction.guild, tier_row)
+            if reason is not None:
+                await interaction.followup.send(reason, ephemeral=True)
+                return
+            role = interaction.guild.get_role(tier_row.tier_role_id)  # type: ignore[arg-type]
+            assert role is not None
+            seeds = _seeds_from_role(role)
+            results = await driver_ops.sync_tier(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                seeds=seeds,
+                status="active",
+                actor_id=interaction.user.id,
+            )
+        created = sum(1 for r in results if r.created)
+        skipped = len(results) - created
+        await interaction.followup.send(
+            f"✅ Tier `{tier_row.code}` sync: enrolled **{created}**, "
+            f"already-registered **{skipped}**.",
+            ephemeral=True,
+        )
+
+    @driver.command(
+        name="sync-all",
+        description="Sync every tier that has a Discord role set",
+    )
+    async def driver_sync_all(self, interaction: discord.Interaction) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild is not None and interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+        lines: list[str] = []
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send("No active season.", ephemeral=True)
+                return
+            tiers = await queries.fetch_all_tiers(conn, season.id)
+            for tier_row in tiers:
+                reason = _tier_role_unavailable(interaction.guild, tier_row)
+                if reason is not None:
+                    lines.append(f"• `{tier_row.code}`: {reason}")
+                    continue
+                role = interaction.guild.get_role(tier_row.tier_role_id)  # type: ignore[arg-type]
+                assert role is not None
+                seeds = _seeds_from_role(role)
+                results = await driver_ops.sync_tier(
+                    conn,
+                    season_id=season.id,
+                    tier_id=tier_row.id,
+                    seeds=seeds,
+                    status="active",
+                    actor_id=interaction.user.id,
+                )
+                created = sum(1 for r in results if r.created)
+                skipped = len(results) - created
+                lines.append(
+                    f"• `{tier_row.code}`: enrolled **{created}**, "
+                    f"already-registered **{skipped}**"
+                )
+        body = "\n".join(lines) if lines else "No tiers found."
+        await interaction.followup.send(
+            f"✅ Sync-all for **{season.name}**:\n{body}",
+            ephemeral=True,
+        )
+
     # ── /market-admin approvals + void + status + adjust-cap ──────────────
 
     @admin.command(
@@ -1464,6 +1638,30 @@ async def _resolve_tier_id(conn, season_id: int, code: str | None) -> int | None
         return None
     tier = await queries.fetch_tier(conn, season_id, code)
     return tier.id if tier else None
+
+
+def _tier_role_unavailable(guild: discord.Guild, tier) -> str | None:
+    """Human-facing reason a tier can't be sync'd, or None if it's usable."""
+    if tier.tier_role_id is None:
+        return (
+            f"tier `{tier.code}` has no Discord role set — "
+            "assign one via `/market-admin tier edit`"
+        )
+    if guild.get_role(tier.tier_role_id) is None:
+        return (
+            f"tier `{tier.code}`'s role id {tier.tier_role_id} "
+            "isn't in this guild"
+        )
+    return None
+
+
+def _seeds_from_role(role: discord.Role) -> list[driver_ops.DriverSeed]:
+    """Non-bot members of the role, as enrolment seeds."""
+    return [
+        driver_ops.DriverSeed(member_id=m.id, display_name=m.display_name)
+        for m in role.members
+        if not m.bot
+    ]
 
 
 def _delta_arrow(delta: Decimal) -> str:
