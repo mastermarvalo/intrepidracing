@@ -48,6 +48,9 @@ async def test_fresh_db_all_migrations_apply(pg_conn):
     # Phase 5 additions
     assert {"trades", "trade_items", "dead_money", "trade_states"} <= tables
     assert "009_trades_and_dead_money.sql" in applied
+    # Phase 6 additions
+    assert {"position_scores", "results_config", "race_rounds", "race_results"} <= tables
+    assert "010_race_results_and_normalization.sql" in applied
 
 
 async def test_phase2_migration_upgrades_a_phase1_db(pg_conn):
@@ -212,3 +215,127 @@ async def test_league_config_partial_uniqueness(pg_conn_migrated):
 def _list_migrations():
     from tests.conftest import MIGRATIONS_DIR
     return sorted(MIGRATIONS_DIR.glob("*.sql"))
+
+
+async def test_phase6_recalibrates_only_untouched_weights(pg_conn):
+    """
+    Migration 010 fixes the Phase 2 factor weights (race_finish was
+    positively weighted against a raw finishing position, so P20 scored
+    twenty times a win). It must not clobber weights a commissioner has
+    already tuned by hand.
+    """
+    await apply_migrations(pg_conn, up_to="009_trades_and_dead_money.sql")
+
+    await pg_conn.execute(
+        "INSERT INTO seasons (guild_id, name, is_active) VALUES (1, 'S1', TRUE)"
+    )
+    season_id = await pg_conn.fetchval("SELECT id FROM seasons WHERE name = 'S1'")
+    # One factor left at its Phase 2 default, one deliberately retuned.
+    await pg_conn.execute(
+        """
+        INSERT INTO valuation_factors
+            (season_id, code, label, weight, max_contribution, sort_order)
+        VALUES ($1, 'race_finish', 'Race finish', 1.0000, 0.60, 1),
+               ($1, 'dnf', 'DNF', -0.9999, 0.99, 2)
+        """,
+        season_id,
+    )
+
+    await _apply_010(pg_conn)
+
+    rows = {
+        r["code"]: (r["weight"], r["max_contribution"])
+        for r in await pg_conn.fetch(
+            "SELECT code, weight, max_contribution FROM valuation_factors "
+            "WHERE season_id = $1",
+            season_id,
+        )
+    }
+    # Default weight was recalibrated...
+    assert rows["race_finish"][0] == Decimal("0.4500")
+    # ...and the hand-tuned one was left exactly as the commissioner set it.
+    assert rows["dnf"] == (Decimal("-0.9999"), Decimal("0.99"))
+    # The new factor arrived for the existing season.
+    assert rows["driver_of_day"][0] == Decimal("0.0600")
+
+
+async def test_phase6_backfills_curve_and_tuning_for_existing_seasons(pg_conn):
+    await apply_migrations(pg_conn, up_to="009_trades_and_dead_money.sql")
+    await pg_conn.execute(
+        "INSERT INTO seasons (guild_id, name, is_active) VALUES (1, 'S1', TRUE)"
+    )
+    season_id = await pg_conn.fetchval("SELECT id FROM seasons WHERE name = 'S1'")
+
+    await _apply_010(pg_conn)
+
+    count = await pg_conn.fetchval(
+        "SELECT COUNT(*) FROM position_scores WHERE season_id = $1", season_id
+    )
+    assert count == 22
+
+    p1 = await pg_conn.fetchrow(
+        "SELECT * FROM position_scores WHERE season_id = $1 AND position = 1",
+        season_id,
+    )
+    assert p1["race_score"] == Decimal("1.0000")
+    assert p1["is_win"] and p1["is_pole"] and p1["is_podium"]
+
+    # Scores must decrease monotonically — the curve is the whole reason
+    # a win is worth more than a points finish.
+    scores = [
+        r["race_score"]
+        for r in await pg_conn.fetch(
+            "SELECT race_score FROM position_scores WHERE season_id = $1 "
+            "ORDER BY position",
+            season_id,
+        )
+    ]
+    assert scores == sorted(scores, reverse=True)
+
+    tuning = await pg_conn.fetchrow(
+        "SELECT * FROM results_config WHERE season_id = $1 AND tier_id IS NULL",
+        season_id,
+    )
+    assert tuning["form_window_rounds"] == 5
+    assert tuning["max_incident_points"] == Decimal("6.00")
+
+
+async def test_phase6_is_idempotent(pg_conn):
+    """Re-running 010 must not duplicate curve rows or factors."""
+    await apply_migrations(pg_conn, up_to="009_trades_and_dead_money.sql")
+    await pg_conn.execute(
+        "INSERT INTO seasons (guild_id, name, is_active) VALUES (1, 'S1', TRUE)"
+    )
+    season_id = await pg_conn.fetchval("SELECT id FROM seasons WHERE name = 'S1'")
+    # The driver_of_day backfill is scoped to seasons that already have
+    # factors seeded; a season with none gets the full set from the preset
+    # instead, so give this one a factor row to stand in for that.
+    await pg_conn.execute(
+        """
+        INSERT INTO valuation_factors
+            (season_id, code, label, weight, max_contribution, sort_order)
+        VALUES ($1, 'race_finish', 'Race finish', 1.0000, 0.60, 1)
+        """,
+        season_id,
+    )
+    await _apply_010(pg_conn)
+    await _apply_010(pg_conn)  # second application must be a no-op
+
+    assert await pg_conn.fetchval("SELECT COUNT(*) FROM position_scores") == 22
+    assert await pg_conn.fetchval(
+        "SELECT COUNT(*) FROM valuation_factors WHERE code = 'driver_of_day'"
+    ) == 1
+    assert await pg_conn.fetchval("SELECT COUNT(*) FROM results_config") == 1
+
+
+async def _apply_010(conn) -> None:
+    """
+    Apply only migration 010. 001_init.sql is not re-runnable, so tests
+    that build a partial schema then upgrade must apply the single new
+    file rather than replaying the whole directory.
+    """
+    path = next(
+        p for p in _list_migrations()
+        if p.name == "010_race_results_and_normalization.sql"
+    )
+    await conn.execute(path.read_text())

@@ -123,6 +123,11 @@ phases.
 - **Phase 4** — contracts: offer → negotiate → approve cycle with cap
   enforcement, per-driver P/L, offer expiry, and an append-only ledger
   (`bot/contracts/{rules,service,render}.py`).
+- **Phase 6** — race-results ingestion and normalization: results
+  imported from a Google Sheet into `race_results`, normalized through
+  the season's `position_scores` curve
+  (`bot/market/results.py`, `bot/results_ingest.py`), then fed to the
+  Phase 2 engine. This is what makes the market actually move.
 - **Phase 5** — trades (1-for-1 contract swaps with two-party
   approval), release (frozen P/L in ledger), buyout (dead-money row
   that counts against the effective cap), extension (updates the
@@ -171,9 +176,66 @@ driver mathematically cannot influence a Tier-1 value.
 | `/market-admin valuation publish <run_id>` | Flip a dry-run to published — makes it the live market value |
 | `/market-admin valuation list [tier]` | 20 most recent runs |
 
-Phase 2 runs use empty factor observations (all zeros) — the plumbing
-and audit trail are in place; ingest of real per-race performance data
-lands with the /market surfaces in a future phase.
+A run now prices the round whose `round_label` you pass, if results for
+that label have been imported (see **Race results** below). With no
+matching round the run falls back to empty observations and produces no
+movement — which is how you create a pre-season baseline.
+
+**Race results (Phase 6)**
+
+| Command | Description |
+|---|---|
+| `/market-admin results import <tier> <round_label> <sheet> [tab] [held_on]` | Import a round's results from a Google Sheet |
+| `/market-admin results list [tier]` | Imported rounds, per tier, in calendar order |
+| `/market-admin results show <tier> <round_label>` | Raw results plus the normalized observation each one produced |
+
+The sheet needs a header row. Column names are matched
+case-insensitively against a set of aliases, so `Pos`, `Position` and
+`Finishing Position` are all understood:
+
+| Column | Required | Accepts |
+|---|---|---|
+| `Driver` | yes | Must match the driver's Discord display name in that tier |
+| `Pos` | yes | `4`, `P4`, `4th`, or `DNF` / `Ret` / `DSQ` / `DNS`; blank means did not start |
+| `Grid` | no | Same formats; drives the qualifying and pole factors |
+| `DNF` | no | `Y` / `yes` / `true` / `1` / `x`. Overrides a recorded position |
+| `DNS` | no | Same truthy values |
+| `FL` | no | Fastest lap |
+| `DOTD` | no | Driver of the Day |
+| `Incidents` | no | Incident or penalty points, scaled against `results_config.max_incident_points` |
+| `Notes` | no | Free text, stored with the row |
+
+Imports are **all-or-nothing**. If any row has an unreadable position,
+a duplicated driver, two drivers in the same finishing position, or a
+name that does not match anyone in the tier, the command reports every
+problem and writes nothing. A partial import would mean a driver
+silently receives no market movement for the round, which is far harder
+to spot later than a failed command now.
+
+Re-importing the same `round_label` **corrects that round in place**
+rather than creating a second one — so a stewards' decision after
+publication is a one-command fix. Results are facts, not money, so
+correcting them is not a ledger event; re-run the valuation afterwards
+to reprice.
+
+Normalization turns raw facts into observations in `[0, 1]` before they
+reach the engine. This is not cosmetic:
+
+- Finishing position is looked up in `position_scores`, where P1 carries
+  the highest score. Fed raw against a positive weight, a P20 scored
+  twenty times a win.
+- Championship points are expressed as a share of the maximum award, so
+  a win and a midfield points finish stay distinguishable instead of
+  both clipping to the same per-factor cap.
+- `form_trend` and `consistency` are derived over the windows in
+  `results_config` from stored history, bounded by `round_order` so
+  re-running an earlier round reproduces exactly what it originally saw.
+- Pole + win + fastest lap in one round flags the drive as exceptional
+  and unlocks the wider `exceptional_move_cap`.
+
+The curve itself is data. Edit `position_scores` to reshape how steeply
+the league rewards the front of the field; nothing in
+`bot/market/results.py` hard-codes a threshold (ADR-001).
 
 **Boards (Phase 3)**
 

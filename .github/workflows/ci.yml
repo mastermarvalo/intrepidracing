@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+defaults:
+  run:
+    working-directory: roster-bot
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The DB-backed tests (contract lifecycle, migrations, trades,
+    # release/buyout) skip silently when TEST_DATABASE_URL is unset. CI
+    # always provides one so they can never quietly stop running.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: roster
+          POSTGRES_PASSWORD: roster
+          POSTGRES_DB: roster
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U roster"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check bot/
+
+      - name: ADR-001 magic-number guard
+        run: uv run python scripts/check_magic_numbers.py
+
+      - name: Tests
+        env:
+          TEST_DATABASE_URL: postgresql://roster:roster@127.0.0.1:5432/roster
+        run: uv run pytest -q
+
+      - name: Assert DB-backed tests actually ran
+        env:
+          TEST_DATABASE_URL: postgresql://roster:roster@127.0.0.1:5432/roster
+        # A skipped DB suite is the failure mode this job exists to catch:
+        # without this step a broken service container would look green.
+        run: |
+          skipped=$(uv run pytest -q 2>&1 | grep -oE '[0-9]+ skipped' || true)
+          if [ -n "$skipped" ]; then
+            echo "::error::DB-backed tests were skipped in CI: $skipped"
+            exit 1
+          fi
+          echo "No skipped tests — DB suite ran."

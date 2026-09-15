@@ -94,7 +94,7 @@ def test_non_team_members_excluded():
     team = make_team(slots=[slot])
     # Has the slot role but NOT the team role — should not appear
     embed = build_embed(team, [member(1, DRIVER_ROLE_1)])
-    assert "<@1>" not in (driver_text(embed) or "")
+    assert "Member1" not in (driver_text(embed) or "")
 
 
 def test_team_members_without_slot_role_excluded_from_slot():
@@ -102,21 +102,21 @@ def test_team_members_without_slot_role_excluded_from_slot():
     team = make_team(slots=[slot])
     # On the team but doesn't hold the slot role
     embed = build_embed(team, [member(1, TEAM_ROLE)])
-    assert "<@1>" not in (driver_text(embed) or "")
+    assert "Member1" not in (driver_text(embed) or "")
     assert "Spot Open" in (driver_text(embed) or "")
 
 
 # ── normal fill ───────────────────────────────────────────────────────────────
 
 
-def test_filled_slot_shows_mention():
+def test_filled_slot_shows_member_names():
     slot = make_slot(slot_role_id=DRIVER_ROLE_1, quantity=2)
     team = make_team(slots=[slot])
     members = [member(10, TEAM_ROLE, DRIVER_ROLE_1), member(11, TEAM_ROLE, DRIVER_ROLE_1)]
     embed = build_embed(team, members)
     value = driver_text(embed) or ""
-    assert "<@10>" in value
-    assert "<@11>" in value
+    assert "Member10" in value
+    assert "Member11" in value
     assert "Spot Open" not in value
 
 
@@ -125,7 +125,7 @@ def test_partial_fill_pads_with_open_spots():
     team = make_team(slots=[slot])
     embed = build_embed(team, [member(10, TEAM_ROLE, DRIVER_ROLE_1)])
     value = driver_text(embed) or ""
-    assert "<@10>" in value
+    assert "Member10" in value
     assert value.count("Spot Open") == 2
 
 
@@ -134,7 +134,7 @@ def test_empty_slot_all_open():
     team = make_team(slots=[slot])
     value = driver_text(build_embed(team, [])) or ""
     assert value.count("Spot Open") == 2
-    assert "<@" not in value
+    assert "Member" not in value
 
 
 # ── slot labels ───────────────────────────────────────────────────────────────
@@ -171,5 +171,5 @@ def test_multiple_slots_combined_in_one_section():
     # Only one Drivers section heading
     assert desc.count("## __Drivers__") == 1
     value = driver_text(embed) or ""
-    assert "<@10>" in value
-    assert "<@11>" in value
+    assert "Member10" in value
+    assert "Member11" in value

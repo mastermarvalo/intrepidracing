@@ -21,6 +21,11 @@ Phase 3 surface:
   /market-admin board refresh [board_id:<id>]
   /market-admin board list
 
+Phase 6 surface:
+  /market-admin results import tier:<code> round:<label> sheet:<url> [tab] [held_on]
+  /market-admin results list [tier:<code>]
+  /market-admin results show tier:<code> round:<label>
+
 Phase 4 surface:
   /market-admin approve offer_id:<id>
   /market-admin reject offer_id:<id> [note]
@@ -45,21 +50,43 @@ permission model until the contract flow needs the split.
 """
 
 import logging
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import db, queries, roster_ops
+from bot import db, queries, results_ingest, roster_ops, sheets
 from bot.contracts import render as contract_render
 from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
+from bot.market import results as results_engine
 from bot.market import valuation as valuation_engine
 from bot.market.money import format_money, format_pl
 from bot.presets import f1 as f1_preset
 
 log = logging.getLogger(__name__)
+
+
+# Default sheet range for a results import: a generous window over the
+# first tab, so a commissioner can paste just the sheet URL.
+_DEFAULT_RESULTS_RANGE = "A1:Z100"
+
+# Discord message limits — these govern rendering only, never league maths.
+_DISCORD_MSG_LIMIT = 1900
+_MAX_LISTED_NAMES = 8
+_MAX_LISTED_ROUNDS = 25
+_MAX_LISTED_RESULTS = 22
+_MAX_LISTED_ERRORS = 12
+
+
+def _render_import_errors(headline: str, errors: list[str]) -> str:
+    shown = errors[:_MAX_LISTED_ERRORS]
+    body = "\n".join(f"• {e}" for e in shown)
+    if len(errors) > _MAX_LISTED_ERRORS:
+        body += f"\n• …and {len(errors) - _MAX_LISTED_ERRORS} more."
+    return f"❌ {headline}\n{body}"[:_DISCORD_MSG_LIMIT]
 
 
 def _is_admin(interaction: discord.Interaction) -> bool:
@@ -107,6 +134,9 @@ class AdminMarketCog(commands.Cog):
     )
     board = app_commands.Group(
         name="board", description="Self-updating market boards", parent=admin
+    )
+    results = app_commands.Group(
+        name="results", description="Import and inspect race results", parent=admin
     )
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -666,12 +696,47 @@ class AdminMarketCog(commands.Cog):
                 )
                 for row in factor_rows
             ]
+            # Pull this round's imported results, if any, and normalize
+            # them into factor observations. With no imported round this
+            # stays a baseline run -- empty observations, no movement --
+            # which is the Phase 2 behaviour and how a pre-season
+            # baseline is still created.
+            round_row = await queries.fetch_race_round(
+                conn, season.id, tier_row.id, round_label
+            )
+            observations: dict[int, results_engine.DriverObservations] = {}
+            if round_row is not None:
+                current = await queries.fetch_results_for_round(conn, round_row["id"])
+                tuning = await queries.fetch_results_tuning(conn, season.id, tier_row.id)
+                scores = await queries.fetch_position_scores(conn, season.id)
+                if current and tuning is not None and scores:
+                    history = await queries.fetch_results_history(
+                        conn,
+                        season_id=season.id,
+                        tier_id=tier_row.id,
+                        through_round_order=round_row["round_order"],
+                    )
+                    for obs in results_engine.build_observations(
+                        current=current,
+                        history=history,
+                        position_scores=scores,
+                        tuning=tuning,
+                    ):
+                        observations[obs.driver_id] = obs
+
             engine_inputs = [
                 valuation_engine.DriverInput(
                     driver_id=d.id,
                     display_name=d.display_name,
                     previous_value=prev_values.get(d.id, cfg.min_salary),
-                    factor_values={},
+                    factor_values=(
+                        observations[d.id].factor_values if d.id in observations else {}
+                    ),
+                    exceptional=(
+                        observations[d.id].exceptional
+                        if d.id in observations
+                        else False
+                    ),
                 )
                 for d in drivers
             ]
@@ -689,6 +754,10 @@ class AdminMarketCog(commands.Cog):
                 created_by=interaction.user.id,
                 published=False,
             )
+            # Record which round the run priced, so a published value can
+            # always be traced back to the results behind it.
+            if round_row is not None:
+                await queries.set_valuation_run_round(conn, run_id, round_row["id"])
             rows = [
                 {
                     "driver_id": v.driver_id,
@@ -1481,6 +1550,281 @@ class AdminMarketCog(commands.Cog):
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+
+    # ── /market-admin results ────────────────────────────────────────────
+
+    @results.command(
+        name="import",
+        description="Import a round's race results from a Google Sheet",
+    )
+    @app_commands.describe(
+        tier="Tier code (e.g. t1)",
+        round_label="Round label, e.g. 'R14 Abu Dhabi'. Re-importing this label updates it.",
+        sheet="Google Sheet URL or spreadsheet ID",
+        tab="Sheet tab and range, e.g. 'Abu Dhabi!A1:I25'. Defaults to the first tab.",
+        held_on="Race date as YYYY-MM-DD (optional)",
+    )
+    async def results_import(
+        self,
+        interaction: discord.Interaction,
+        tier: str,
+        round_label: str,
+        sheet: str,
+        tab: str | None = None,
+        held_on: str | None = None,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+
+        sheet_id = sheets.parse_sheet_id(sheet) or sheet.strip()
+        sheet_range = tab or _DEFAULT_RESULTS_RANGE
+
+        race_date = None
+        if held_on:
+            try:
+                race_date = date.fromisoformat(held_on.strip())
+            except ValueError:
+                await interaction.followup.send(
+                    f"Couldn't read `{held_on}` as a date. Use YYYY-MM-DD.",
+                    ephemeral=True,
+                )
+                return
+
+        try:
+            values = await sheets.fetch_values(sheet_id, sheet_range)
+        except sheets.SheetsError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+
+        outcome = results_ingest.parse_results(values)
+        if not outcome.rows:
+            await interaction.followup.send(
+                _render_import_errors("Nothing was imported.", outcome.errors),
+                ephemeral=True,
+            )
+            return
+
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send("No active season.", ephemeral=True)
+                return
+            tier_row = await queries.fetch_tier(conn, season.id, tier)
+            if tier_row is None:
+                await interaction.followup.send(
+                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                )
+                return
+
+            drivers = await queries.fetch_drivers_in_tier(conn, tier_row.id)
+            if not drivers:
+                await interaction.followup.send(
+                    f"No drivers registered in tier `{tier}` yet.", ephemeral=True
+                )
+                return
+            roster = {d.display_name.casefold(): d.id for d in drivers}
+
+            resolved, resolve_errors = results_ingest.resolve_drivers(
+                outcome.rows, roster
+            )
+            all_errors = outcome.errors + resolve_errors
+
+            # Refuse a partial import. In a money economy a missing row is
+            # a driver who silently gets no movement for the round, which
+            # is far harder to notice later than a failed command now.
+            if all_errors:
+                await interaction.followup.send(
+                    _render_import_errors(
+                        f"Import aborted — {len(all_errors)} problem(s) found. "
+                        "Nothing was written.",
+                        all_errors,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            round_row = await queries.upsert_race_round(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                round_label=round_label,
+                held_on=race_date,
+                imported_by=interaction.user.id,
+                source=f"sheet:{sheet_id}/{sheet_range}",
+            )
+            written = await queries.upsert_race_results(
+                conn, round_id=round_row["id"], rows=resolved
+            )
+
+            missing = [
+                d.display_name for d in drivers if d.id not in {r["driver_id"] for r in resolved}
+            ]
+
+        lines = [
+            f"✅ Imported **{written}** result(s) for `{tier}` — **{round_label}** "
+            f"(round {round_row['round_order']}).",
+        ]
+        if missing:
+            lines.append(
+                f"⚠ No row for {len(missing)} roster driver(s): "
+                + ", ".join(missing[:_MAX_LISTED_NAMES])
+                + ("…" if len(missing) > _MAX_LISTED_NAMES else "")
+                + ". They will score nothing for this round."
+            )
+        lines.append(
+            f"Next: `/market-admin valuation run tier: {tier} "
+            f"round_label: {round_label}` to price it (dry-run)."
+        )
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    @results.command(name="list", description="List imported rounds")
+    @app_commands.describe(tier="Optional tier code to filter by")
+    async def results_list(
+        self, interaction: discord.Interaction, tier: str | None = None
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send("No active season.", ephemeral=True)
+                return
+            tier_id = None
+            if tier is not None:
+                tier_row = await queries.fetch_tier(conn, season.id, tier)
+                if tier_row is None:
+                    await interaction.followup.send(
+                        f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                    )
+                    return
+                tier_id = tier_row.id
+            rounds = await queries.list_race_rounds(conn, season.id, tier_id)
+
+        if not rounds:
+            await interaction.followup.send(
+                "No rounds imported yet. Use `/market-admin results import`.",
+                ephemeral=True,
+            )
+            return
+
+        lines = [f"**Imported rounds — {season.name}**"]
+        for r in rounds[:_MAX_LISTED_ROUNDS]:
+            held = r["held_on"].isoformat() if r["held_on"] else "date not set"
+            lines.append(
+                f"`{r['tier_code']}` R{r['round_order']} — **{r['round_label']}** "
+                f"· {r['result_count']} result(s) · {held}"
+            )
+        if len(rounds) > _MAX_LISTED_ROUNDS:
+            lines.append(f"…and {len(rounds) - _MAX_LISTED_ROUNDS} more.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    @results.command(
+        name="show",
+        description="Show the imported results and normalized scores for a round",
+    )
+    @app_commands.describe(tier="Tier code", round_label="Round label as imported")
+    async def results_show(
+        self, interaction: discord.Interaction, tier: str, round_label: str
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        await interaction.response.defer(ephemeral=True)
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season is None:
+                await interaction.followup.send("No active season.", ephemeral=True)
+                return
+            tier_row = await queries.fetch_tier(conn, season.id, tier)
+            if tier_row is None:
+                await interaction.followup.send(
+                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
+                )
+                return
+            round_row = await queries.fetch_race_round(
+                conn, season.id, tier_row.id, round_label
+            )
+            if round_row is None:
+                await interaction.followup.send(
+                    f"No round `{round_label}` imported for `{tier}`.", ephemeral=True
+                )
+                return
+            current = await queries.fetch_results_for_round(conn, round_row["id"])
+            scores = await queries.fetch_position_scores(conn, season.id)
+            tuning = await queries.fetch_results_tuning(conn, season.id, tier_row.id)
+            history = await queries.fetch_results_history(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                through_round_order=round_row["round_order"],
+            )
+            drivers = await queries.fetch_drivers_in_tier(conn, tier_row.id)
+
+        names = {d.id: d.display_name for d in drivers}
+        observations = {}
+        if current and tuning is not None and scores:
+            observations = {
+                o.driver_id: o
+                for o in results_engine.build_observations(
+                    current=current,
+                    history=history,
+                    position_scores=scores,
+                    tuning=tuning,
+                )
+            }
+
+        lines = [
+            f"**{round_label}** · `{tier}` · round {round_row['round_order']} "
+            f"· {len(current)} result(s)"
+        ]
+        ordered = sorted(
+            current,
+            key=lambda r: (
+                r.finish_position is None,
+                r.finish_position or 0,
+            ),
+        )
+        for r in ordered[:_MAX_LISTED_RESULTS]:
+            name = names.get(r.driver_id, f"driver {r.driver_id}")
+            if r.dns:
+                pos = "DNS"
+            elif r.dnf:
+                pos = "DNF"
+            else:
+                pos = f"P{r.finish_position}"
+            flags = []
+            if r.grid_position:
+                flags.append(f"grid P{r.grid_position}")
+            if r.fastest_lap:
+                flags.append("FL")
+            if r.driver_of_day:
+                flags.append("DOTD")
+            if r.incident_points:
+                flags.append(f"{r.incident_points} inc")
+            obs = observations.get(r.driver_id)
+            if obs is not None and obs.exceptional:
+                flags.append("⭐ exceptional")
+            suffix = f" · {', '.join(flags)}" if flags else ""
+            lines.append(f"{pos} — **{name}**{suffix}")
+            if obs is not None:
+                shown = ", ".join(
+                    f"{code} {value:+.3f}"
+                    for code, value in sorted(obs.factor_values.items())
+                    if value
+                )
+                if shown:
+                    lines.append(f"    ↳ {shown}")
+        if len(ordered) > _MAX_LISTED_RESULTS:
+            lines.append(f"…and {len(ordered) - _MAX_LISTED_RESULTS} more.")
+        await interaction.followup.send("\n".join(lines)[:_DISCORD_MSG_LIMIT], ephemeral=True)
 
 
 def _parse_color(raw: str | None) -> int | None:

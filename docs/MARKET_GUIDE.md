@@ -336,12 +336,85 @@ Every run records a per-driver breakdown (per-factor contribution +
 clip flags) in `driver_valuations.breakdown` so any value is fully
 explainable months later.
 
-> **Note (Phase 2 MVP):** valuation runs currently take zero factor
-> observations for every driver — the plumbing, movement caps, and
-> audit trail all work, but real per-race data ingest hasn't landed
-> yet. Every driver's values stays baselined at their previous number.
-> When the data ingest lands, the same publish flow will surface real
-> movement.
+A run prices whichever round you name in `round_label`, provided you
+have imported results under that exact label first. If no round matches,
+the run still works but produces no movement — that is how you set a
+pre-season baseline.
+
+### Importing race results
+
+This is the step that makes values actually move. The weekly rhythm is:
+
+```
+/market-admin results import tier: t1 round_label: "R14 Abu Dhabi" sheet: <sheet URL>
+/market-admin results show   tier: t1 round_label: "R14 Abu Dhabi"      # check it
+/market-admin valuation run  tier: t1 round_label: "R14 Abu Dhabi"      # dry-run
+/market-admin valuation publish run_id: <id>                            # go live
+```
+
+Your sheet holds **raw facts only** — who finished where, who started
+where, who retired, fastest lap, Driver of the Day, incident points. It
+never holds money. The bot does the money, every time, from the same
+weights, so any value can be explained months later from the stored
+breakdown.
+
+Put a header row at the top. These column names are all understood, in
+any capitalisation:
+
+| Column | Required | Notes |
+|---|---|---|
+| `Driver` | yes | Must match the driver's display name in that tier |
+| `Pos` | yes | `4`, `P4`, `4th`, or `DNF` / `Ret` / `DSQ` / `DNS` |
+| `Grid` | no | Feeds the qualifying and pole factors |
+| `DNF` / `DNS` | no | `Y`, `yes`, `true`, `1`, `x` |
+| `FL` | no | Fastest lap |
+| `DOTD` | no | Driver of the Day |
+| `Incidents` | no | Incident or penalty points |
+| `Notes` | no | Free text, kept with the row |
+
+The import is all-or-nothing. A misspelled driver name, two drivers in
+the same finishing position, or an unreadable cell aborts the whole
+thing and tells you which sheet row to fix. Nothing is written until
+every row is clean — a half-imported round means someone silently gets
+no movement that week.
+
+**Got a stewards' decision after the fact?** Fix the sheet and re-import
+the same `round_label`. That corrects the round in place instead of
+creating a phantom second race, then re-run and re-publish the
+valuation.
+
+### Why a win is worth more than a P2
+
+Raw finishing positions are not fed to the engine directly. Each
+position is looked up in a per-season **score curve** which maps P1 to
+the highest score and last place to zero. The curve is intentionally
+non-linear, so P1 can be worth disproportionately more than P2 — and
+because it is stored data, you can reshape how steeply your league
+rewards the front of the field without touching code.
+
+Three factors are derived rather than read off the sheet:
+
+- **Form trend** — recent-window average pace minus everything before
+  it. A driver's first rounds read as neutral, not as a collapse.
+- **Consistency** — how little a driver's results vary across the
+  window. A single race scores zero here rather than a free perfect
+  mark.
+- **Exceptional weekend** — pole, win, and fastest lap in one round.
+  That drive unlocks the wider `exceptional_move_cap` instead of the
+  normal weekly one.
+
+Because history is bounded by round order, re-running an earlier round
+reproduces exactly the numbers it originally saw. A later race can never
+leak backwards into an earlier valuation.
+
+### Should an AI set the values?
+
+No — and the split matters. An AI is genuinely useful for reading a
+results screenshot into your sheet, judging how serious an incident was,
+or writing the market commentary. It should never write driver values or
+ledger rows directly. Money needs to be reproducible on demand when
+someone disputes a contract, and the bot's stored per-factor breakdown
+is that receipt. A value an AI produced once cannot be recomputed.
 
 ### Approving contracts
 
@@ -403,6 +476,7 @@ driver. Next valuation run recalibrates their rank in the new tier.
 /market-admin season create|activate|list
 /market-admin tier add|edit|list
 /market-admin config show|edit|channel|role|free-agency
+/market-admin results import|list|show
 /market-admin valuation run|preview|publish|list
 /market-admin board add|remove|refresh|list
 /market-admin approve|reject|void|set-status|adjust-cap

@@ -44,10 +44,23 @@ class FakeAvatar:
 
 @dataclass
 class FakeMember:
+    """
+    A stand-in for discord.Member.
+
+    `display_name` defaults to a per-id value (`Member10`, `Member11`, ...)
+    so render assertions can tell two members apart. The renderer emits
+    display names rather than `<@id>` mentions (see `render._slot_block`),
+    so a shared constant default would make those assertions vacuous.
+    """
+
     id: int
     roles: list[FakeRole] = field(default_factory=list)
-    display_name: str = "TestMember"
+    display_name: str = ""
     display_avatar: FakeAvatar = field(default_factory=FakeAvatar)
+
+    def __post_init__(self) -> None:
+        if not self.display_name:
+            self.display_name = f"Member{self.id}"
 
 
 def make_team(

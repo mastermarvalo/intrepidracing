@@ -1,3 +1,83 @@
+# Upgrade notes
+
+## Migration 010 — race results and normalization (Phase 6)
+
+Apply as usual; the runner picks up `010_race_results_and_normalization.sql`
+on the next bot start. Migrations are forward-only and this one is safe to
+re-apply.
+
+**What it adds**
+
+- `position_scores` — the per-season normalization curve. One row per
+  finishing position carrying `race_score`, `quali_score`, `points`, and
+  the `is_win` / `is_podium` / `is_pole` flags.
+- `results_config` — form and consistency window lengths plus the
+  incident-point scale, season default with optional per-tier override.
+- `race_rounds` / `race_results` — durable, re-importable raw facts.
+- `valuation_runs.round_id` — nullable link from a run to the round it
+  priced. Existing runs keep `NULL`.
+
+**What it changes in existing data**
+
+This migration **recalibrates the Phase 2 valuation factor weights**, and
+that is a behavioural change, not just a schema one. It is deliberate:
+`race_finish` shipped at `+1.0000` against a *raw* finishing position, and
+because the engine computes `contribution = weight * raw_value`, a P20
+scored twenty times a win. Separately, `points_scored` had weight `0.60`
+against raw championship points while its `max_contribution` was `0.50`, so
+a 25-point win and a 10-point P5 both clipped to the same value and the
+factor carried no information.
+
+The new weights assume observations arrive normalized to `[0, 1]`, which is
+what `bot/market/results.py` now guarantees.
+
+| Factor | Weight | Max contribution |
+|---|---:|---:|
+| `race_finish` | 0.4500 | 0.60 |
+| `points_scored` | 0.2000 | 0.30 |
+| `wins` | 0.1800 | 0.25 |
+| `form_trend` | 0.1500 | 0.25 |
+| `quali_finish` | 0.1200 | 0.20 |
+| `podiums` | 0.1000 | 0.15 |
+| `consistency` | 0.1000 | 0.15 |
+| `poles` | 0.0800 | 0.12 |
+| `driver_of_day` *(new)* | 0.0600 | 0.10 |
+| `fastest_laps` | 0.0500 | 0.10 |
+| `dnf` | −0.3500 | 0.40 |
+| `incidents` | −0.2000 | 0.30 |
+
+**Commissioner tuning is preserved.** The recalibration only rewrites a
+weight that still holds its exact Phase 2 default. If you had already
+retuned a factor by hand, your value is left alone — and you should
+re-check it against the new `[0, 1]` observation scale, because a weight
+chosen for raw inputs will no longer mean what you intended.
+
+The migration also backfills `position_scores` and a default
+`results_config` row for every existing season, and adds the new
+`driver_of_day` factor to every season that already has factors seeded.
+F1 25/26 is currently the only preset, so the backfilled curve matches
+what a new season would get from `bot/presets/f1.py`.
+
+**Published values are not touched.** No existing `driver_valuations`,
+`contracts`, or `contract_ledger` rows change. The new weights apply from
+the next valuation run onward.
+
+**Suggested rollout**
+
+1. Apply the migration.
+2. `/market-admin results import` the most recent round.
+3. `/market-admin results show` it and sanity-check the observations.
+4. `/market-admin valuation run` — this is a **dry run**, nothing publishes.
+5. Compare the preview against expectations, adjust weights via
+   `valuation_factors` or reshape `position_scores` if the movement feels
+   wrong, and re-run.
+6. `/market-admin valuation publish` only once the preview looks right.
+
+Because a run is bounded by `round_order`, steps 2–5 are repeatable with
+no side effects on the live market.
+
+---
+
 # Upgrade & migration notes
 
 ## Phase 5 (Trades, releases, buyouts)
