@@ -82,7 +82,52 @@ uv run ruff check bot/
    - Manage Messages (to delete roster messages on `/roster remove`)
 4. Make sure the bot's role sits **above all team roles** in Server Settings → Roles, otherwise it won't be able to assign them
 
+## The control panel — start here
+
+Two commands cover everything an admin actually needs day to day:
+
+| Command | What it does |
+|---|---|
+| `/league` | Guided control panel: shows what's set up, what's missing, and the single next step. Buttons for Setup, Race Night, Approvals and Boards. |
+| `/help` | Browsable command reference, grouped by job. Built from the live command list, so it's never out of date. |
+
+`/league` opens on a status screen that answers the two questions admins
+actually have — *what state is my league in*, and *what do I do next*:
+
+```text
+🏁 League Control
+Active season: Season 7
+
+Tiers
+t1 · 20 driver(s) · last import: R14 Abu Dhabi · ⏳ run #38 unpublished
+t2 · 18 driver(s) · last import: R14 Abu Dhabi · no published market yet
+t3 · 16 driver(s) · no results imported
+
+⚠ Waiting on you
+3 contract offer(s) and 1 trade(s) awaiting approval.
+
+Next step
+Run #38 for t1 is priced but not published. Review and publish it → Race Night
+
+[ Setup ]  [ Race Night ]  [ Approvals (4) ]  [ Help ]
+```
+
+**Race Night** is the weekly loop in the order it happens: pick a tier →
+paste the sheet URL in a popup → import → price → review the movers →
+publish. The panel remembers each tier's sheet URL for the rest of the
+session, so a three-tier race night means pasting three URLs once, not
+re-typing them at each step.
+
+Everything the panel does is also still a slash command, and the panel
+calls the same code as the commands — nothing was removed or renamed.
+The panel is a shortcut, not a replacement. Buttons are usable only by
+the person who opened the panel, and admin-only actions still check
+Manage Server.
+
 ## Commands
+
+Full reference below, or run `/help` in Discord for the same thing
+grouped by job.
 
 ### Admin commands (require Manage Server)
 
@@ -107,6 +152,8 @@ uv run ruff check bot/
 |---|---|
 | `/roster view <name>` | Show a team's current roster embed |
 | `/roster freeagents` | List members who have the Free Agent role and at least one Tier role |
+| `/league` | Guided control panel (admin actions inside it still require Manage Server) |
+| `/help` | Browsable command reference |
 
 ## Market & Contracts
 
@@ -312,6 +359,12 @@ each side); the schema is multi-item ready.
 
 ### Quick start for a new league
 
+The short version: run `/league`, press **Setup**, and follow the next
+step it gives you. It walks the same sequence below and tells you which
+piece is missing at each stage.
+
+The equivalent commands, if you'd rather type them:
+
 ```text
 /market-admin season create name: "F1 2026 Season" preset: F1 25/26
 /market-admin season activate name: "F1 2026 Season"
@@ -330,6 +383,24 @@ each side); the schema is multi-item ready.
 /market-admin board add kind: Movers channel: #market tier: t1
 /market-admin board add kind: Cross-tier dashboard channel: #market
 ```
+
+### The weekly race-night loop
+
+```text
+/league  →  Race Night  →  pick tier  →  paste sheet URL  →  Publish
+```
+
+Or by command, per tier:
+
+```text
+/market-admin results import tier: t1 round_label: "R14 Abu Dhabi" sheet: <url>
+/market-admin valuation run tier: t1 round_label: "R14 Abu Dhabi"
+/market-admin valuation publish run_id: <printed above>
+```
+
+Both routes run identical code — the panel calls the same workflow
+functions the commands do, so a race night imported through the panel is
+indistinguishable from one imported by hand.
 
 ## Team setup flow
 

@@ -50,19 +50,17 @@ permission model until the contract flow needs the split.
 """
 
 import logging
-from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import db, queries, results_ingest, roster_ops, sheets
+from bot import db, queries, roster_ops, sheets, workflow
 from bot.contracts import render as contract_render
 from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
 from bot.market import results as results_engine
-from bot.market import valuation as valuation_engine
 from bot.market.money import format_money, format_pl
 from bot.presets import f1 as f1_preset
 
@@ -649,136 +647,24 @@ class AdminMarketCog(commands.Cog):
         assert interaction.guild_id is not None
 
         await interaction.response.defer(ephemeral=True)
-        async with db.connect() as conn:
-            season = await queries.fetch_active_season(conn, interaction.guild_id)
-            if season is None:
-                await interaction.followup.send(
-                    "No active season.", ephemeral=True
-                )
-                return
-            tier_row = await queries.fetch_tier(conn, season.id, tier)
-            if tier_row is None:
-                await interaction.followup.send(
-                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
-                )
-                return
-            cfg = await queries.fetch_league_config_row(conn, season.id, tier_row.id)
-            if cfg is None:
-                cfg = await queries.fetch_league_config_row(conn, season.id, None)
-            if cfg is None:
-                await interaction.followup.send(
-                    "No league_config for that scope. Seed one with the F1 preset first.",
-                    ephemeral=True,
-                )
-                return
-
-            factor_rows = await queries.fetch_valuation_factors(conn, season.id)
-            drivers = await queries.fetch_drivers_in_tier(conn, tier_row.id)
-            if not drivers:
-                await interaction.followup.send(
-                    f"No drivers in tier `{tier}` yet. Add drivers before running a valuation.",
-                    ephemeral=True,
-                )
-                return
-
-            # Build previous-value map from the latest published run per driver.
-            prev_values: dict[int, Decimal] = {}
-            for d in drivers:
-                latest = await queries.fetch_latest_published_valuation(conn, d.id)
-                if latest is not None:
-                    prev_values[d.id] = latest
-
-            factors = [
-                valuation_engine.FactorWeight(
-                    code=row["code"],
-                    weight=row["weight"],
-                    max_contribution=row["max_contribution"],
-                )
-                for row in factor_rows
-            ]
-            # Pull this round's imported results, if any, and normalize
-            # them into factor observations. With no imported round this
-            # stays a baseline run -- empty observations, no movement --
-            # which is the Phase 2 behaviour and how a pre-season
-            # baseline is still created.
-            round_row = await queries.fetch_race_round(
-                conn, season.id, tier_row.id, round_label
-            )
-            observations: dict[int, results_engine.DriverObservations] = {}
-            if round_row is not None:
-                current = await queries.fetch_results_for_round(conn, round_row["id"])
-                tuning = await queries.fetch_results_tuning(conn, season.id, tier_row.id)
-                scores = await queries.fetch_position_scores(conn, season.id)
-                if current and tuning is not None and scores:
-                    history = await queries.fetch_results_history(
-                        conn,
-                        season_id=season.id,
-                        tier_id=tier_row.id,
-                        through_round_order=round_row["round_order"],
-                    )
-                    for obs in results_engine.build_observations(
-                        current=current,
-                        history=history,
-                        position_scores=scores,
-                        tuning=tuning,
-                    ):
-                        observations[obs.driver_id] = obs
-
-            engine_inputs = [
-                valuation_engine.DriverInput(
-                    driver_id=d.id,
-                    display_name=d.display_name,
-                    previous_value=prev_values.get(d.id, cfg.min_salary),
-                    factor_values=(
-                        observations[d.id].factor_values if d.id in observations else {}
-                    ),
-                    exceptional=(
-                        observations[d.id].exceptional
-                        if d.id in observations
-                        else False
-                    ),
-                )
-                for d in drivers
-            ]
-            caps = valuation_engine.MovementCaps(
-                weekly=cfg.weekly_move_cap,
-                exceptional=cfg.exceptional_move_cap,
-            )
-
-            outcomes = valuation_engine.compute_run(factors, engine_inputs, caps)
-            run_id = await queries.insert_valuation_run(
-                conn,
-                season_id=season.id,
-                tier_id=tier_row.id,
+        try:
+            result = await workflow.run_valuation(
+                guild_id=interaction.guild_id,
+                user_id=interaction.user.id,
+                tier=tier,
                 round_label=round_label,
-                created_by=interaction.user.id,
-                published=False,
             )
-            # Record which round the run priced, so a published value can
-            # always be traced back to the results behind it.
-            if round_row is not None:
-                await queries.set_valuation_run_round(conn, run_id, round_row["id"])
-            rows = [
-                {
-                    "driver_id": v.driver_id,
-                    "market_value": v.market_value,
-                    "previous_value": v.previous_value,
-                    "delta": v.delta,
-                    "rank_in_tier": v.rank_in_tier,
-                    "capped": v.capped,
-                    "breakdown": valuation_engine.breakdown_to_json(v.breakdown),
-                }
-                for v in outcomes
-            ]
-            await queries.insert_driver_valuations(conn, run_id, rows)
+        except workflow.WorkflowError as exc:
+            await interaction.followup.send(f"\u274c {exc}", ephemeral=True)
+            return
 
         await interaction.followup.send(
             _render_valuation_preview(
-                run_id=run_id,
+                run_id=result.run_id,
                 tier_code=tier,
                 round_label=round_label,
                 published=False,
-                outcomes=outcomes,
+                outcomes=result.outcomes,
             ),
             ephemeral=True,
         )
@@ -823,42 +709,28 @@ class AdminMarketCog(commands.Cog):
             return
         assert interaction.guild_id is not None
 
-        async with db.connect() as conn:
-            run = await queries.fetch_valuation_run(conn, run_id)
-            if run is None:
-                await interaction.response.send_message(
-                    f"No valuation run with id `{run_id}`.", ephemeral=True
-                )
-                return
-            if run["published"]:
-                await interaction.response.send_message(
-                    f"Run `{run_id}` was already published.", ephemeral=True
-                )
-                return
-            await queries.publish_valuation_run(conn, run_id)
-            season_id = run["season_id"]
-            tier_id = run["tier_id"]
-
-        # Refresh every market/movers board scoped to this tier plus
-        # every cross-tier dashboard so a publish is visible to
-        # everyone without waiting for the 15-minute safety poll.
+        await interaction.response.defer(ephemeral=True)
         try:
-            await market_boards.refresh_boards_for_tier(
-                self.bot,
-                guild_id=interaction.guild_id,
-                season_id=season_id,
-                tier_id=tier_id,
+            outcome = await workflow.publish_valuation(
+                self.bot, guild_id=interaction.guild_id, run_id=run_id
             )
-        except Exception:
-            log.exception(
-                "Post-publish board refresh failed for run %s (values are "
-                "published; boards will heal on the next poll)", run_id,
-            )
+        except workflow.WorkflowError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
 
-        await interaction.response.send_message(
-            f"✅ Published run `{run_id}` — market values are now live.",
-            ephemeral=True,
-        )
+        if outcome.already_published:
+            await interaction.followup.send(
+                f"Run `{run_id}` was already published.", ephemeral=True
+            )
+            return
+
+        msg = f"\u2705 Published run `{run_id}` \u2014 market values are now live."
+        if not outcome.boards_refreshed:
+            msg += (
+                "\n\u26a0 Board refresh failed; the boards will catch up on the "
+                "next automatic poll."
+            )
+        await interaction.followup.send(msg, ephemeral=True)
 
     @valuation.command(name="list", description="List recent valuation runs")
     @app_commands.describe(tier="Filter to a single tier (leave unset for all tiers)")
@@ -1580,99 +1452,35 @@ class AdminMarketCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        sheet_id = sheets.parse_sheet_id(sheet) or sheet.strip()
-        sheet_range = tab or _DEFAULT_RESULTS_RANGE
-
-        race_date = None
-        if held_on:
-            try:
-                race_date = date.fromisoformat(held_on.strip())
-            except ValueError:
-                await interaction.followup.send(
-                    f"Couldn't read `{held_on}` as a date. Use YYYY-MM-DD.",
-                    ephemeral=True,
-                )
-                return
-
         try:
-            values = await sheets.fetch_values(sheet_id, sheet_range)
-        except sheets.SheetsError as exc:
-            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
-            return
-
-        outcome = results_ingest.parse_results(values)
-        if not outcome.rows:
-            await interaction.followup.send(
-                _render_import_errors("Nothing was imported.", outcome.errors),
-                ephemeral=True,
-            )
-            return
-
-        async with db.connect() as conn:
-            season = await queries.fetch_active_season(conn, interaction.guild_id)
-            if season is None:
-                await interaction.followup.send("No active season.", ephemeral=True)
-                return
-            tier_row = await queries.fetch_tier(conn, season.id, tier)
-            if tier_row is None:
-                await interaction.followup.send(
-                    f"No tier `{tier}` in **{season.name}**.", ephemeral=True
-                )
-                return
-
-            drivers = await queries.fetch_drivers_in_tier(conn, tier_row.id)
-            if not drivers:
-                await interaction.followup.send(
-                    f"No drivers registered in tier `{tier}` yet.", ephemeral=True
-                )
-                return
-            roster = {d.display_name.casefold(): d.id for d in drivers}
-
-            resolved, resolve_errors = results_ingest.resolve_drivers(
-                outcome.rows, roster
-            )
-            all_errors = outcome.errors + resolve_errors
-
-            # Refuse a partial import. In a money economy a missing row is
-            # a driver who silently gets no movement for the round, which
-            # is far harder to notice later than a failed command now.
-            if all_errors:
-                await interaction.followup.send(
-                    _render_import_errors(
-                        f"Import aborted — {len(all_errors)} problem(s) found. "
-                        "Nothing was written.",
-                        all_errors,
-                    ),
-                    ephemeral=True,
-                )
-                return
-
-            round_row = await queries.upsert_race_round(
-                conn,
-                season_id=season.id,
-                tier_id=tier_row.id,
+            outcome = await workflow.import_round(
+                guild_id=interaction.guild_id,
+                user_id=interaction.user.id,
+                tier=tier,
                 round_label=round_label,
-                held_on=race_date,
-                imported_by=interaction.user.id,
-                source=f"sheet:{sheet_id}/{sheet_range}",
+                sheet=sheet,
+                sheet_range=tab or _DEFAULT_RESULTS_RANGE,
+                held_on=held_on,
             )
-            written = await queries.upsert_race_results(
-                conn, round_id=round_row["id"], rows=resolved
+        except workflow.ImportAborted as exc:
+            await interaction.followup.send(
+                _render_import_errors(str(exc), exc.errors), ephemeral=True
             )
-
-            missing = [
-                d.display_name for d in drivers if d.id not in {r["driver_id"] for r in resolved}
-            ]
+            return
+        except (workflow.WorkflowError, sheets.SheetsError) as exc:
+            await interaction.followup.send(f"\u274c {exc}", ephemeral=True)
+            return
 
         lines = [
-            f"✅ Imported **{written}** result(s) for `{tier}` — **{round_label}** "
-            f"(round {round_row['round_order']}).",
+            f"\u2705 Imported **{outcome.written}** result(s) for `{tier}` \u2014 "
+            f"**{round_label}** (round {outcome.round_order}).",
         ]
-        if missing:
+        if outcome.missing_drivers:
+            missing = outcome.missing_drivers
             lines.append(
-                f"⚠ No row for {len(missing)} roster driver(s): "
+                f"\u26a0 No row for {len(missing)} roster driver(s): "
                 + ", ".join(missing[:_MAX_LISTED_NAMES])
-                + ("…" if len(missing) > _MAX_LISTED_NAMES else "")
+                + ("\u2026" if len(missing) > _MAX_LISTED_NAMES else "")
                 + ". They will score nothing for this round."
             )
         lines.append(

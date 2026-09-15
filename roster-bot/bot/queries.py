@@ -2218,3 +2218,71 @@ async def set_valuation_run_round(
     await conn.execute(
         "UPDATE valuation_runs SET round_id = $2 WHERE id = $1", run_id, round_id
     )
+
+
+# ── Guided-panel status reads ────────────────────────────────────────
+# Small aggregate reads backing the /league home panel. They exist here
+# rather than in the panel cog because the queries layer is the only
+# place SQL lives.
+
+
+async def fetch_latest_unpublished_run_id(
+    conn: asyncpg.Connection, season_id: int, tier_id: int
+) -> int | None:
+    """Most recent dry-run awaiting publication for a tier, if any."""
+    return await conn.fetchval(
+        """
+        SELECT id
+          FROM valuation_runs
+         WHERE season_id = $1
+           AND tier_id   = $2
+           AND published = FALSE
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        season_id,
+        tier_id,
+    )
+
+
+async def tier_has_published_valuation(conn: asyncpg.Connection, tier_id: int) -> bool:
+    """Whether a tier has ever published a run (i.e. has a live market)."""
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM valuation_runs
+                 WHERE tier_id = $1 AND published = TRUE
+            )
+            """,
+            tier_id,
+        )
+    )
+
+
+async def count_offers_awaiting_approval(conn: asyncpg.Connection, season_id: int) -> int:
+    """Contract offers sitting in the commissioner's queue."""
+    return (
+        await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM contract_offers
+             WHERE season_id = $1 AND state = 'pending_approval'
+            """,
+            season_id,
+        )
+        or 0
+    )
+
+
+async def count_trades_awaiting_approval(conn: asyncpg.Connection, season_id: int) -> int:
+    """Trades sitting in the commissioner's queue."""
+    return (
+        await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM trades
+             WHERE season_id = $1 AND state = 'pending_approval'
+            """,
+            season_id,
+        )
+        or 0
+    )
