@@ -46,6 +46,7 @@ from discord.ext import commands
 from bot import db, queries
 from bot.contracts import render as contract_render
 from bot.contracts import rules, service
+from bot.market import budget_ops
 
 log = logging.getLogger(__name__)
 
@@ -682,6 +683,10 @@ class _OfferModal(discord.ui.Modal):
             payroll_before = await queries.fetch_team_effective_payroll(
                 conn, self._team.id, self._season_id,
             )
+            budget_snap = await budget_ops.snapshot(
+                conn, season_id=self._season_id, tier_id=self._tier.id,
+                team_id=self._team.id, actor_id=interaction.user.id,
+            )
             slots_used = await queries.fetch_team_active_slot_count(conn, self._team.id)
             existing_contract = await queries.fetch_active_contract_for_driver(
                 conn, self._driver_row.id
@@ -715,6 +720,7 @@ class _OfferModal(discord.ui.Modal):
             max_incentive_pct=cfg.max_incentive_pct,
             team_payroll_before=payroll_before,
             salary_cap=cfg.salary_cap,
+            team_budget=budget_snap.balance if budget_snap else None,
             active_slots_used=slots_used,
             active_slots_max=cfg.active_driver_slots,
             has_linked_release=False,
@@ -741,6 +747,7 @@ class _OfferModal(discord.ui.Modal):
             salary_cap=cfg.salary_cap,
             current_market_value=market_value,
             validation=validation,
+            team_budget=budget_snap.balance if budget_snap else None,
         )
         view = _ReviewSubmitView(
             team=self._team,
@@ -918,6 +925,10 @@ class _CounterModal(discord.ui.Modal):
             payroll_before = await queries.fetch_team_effective_payroll(
                 conn, self._parent.team_id, self._parent.season_id,
             )
+            budget_snap = await budget_ops.snapshot(
+                conn, season_id=self._parent.season_id, tier_id=self._parent.tier_id,
+                team_id=self._parent.team_id, actor_id=interaction.user.id,
+            )
             slots_used = await queries.fetch_team_active_slot_count(
                 conn, self._parent.team_id
             )
@@ -945,6 +956,7 @@ class _CounterModal(discord.ui.Modal):
                 max_incentive_pct=cfg.max_incentive_pct,
                 team_payroll_before=payroll_before,
                 salary_cap=cfg.salary_cap,
+                team_budget=budget_snap.balance if budget_snap else None,
                 active_slots_used=slots_used,
                 active_slots_max=cfg.active_driver_slots,
                 has_linked_release=False,

@@ -25,6 +25,7 @@ from discord.ext import commands
 
 from bot import db, limits, queries
 from bot.contracts import render as contract_render
+from bot.market import budget_ops
 from bot.market import render as market_render
 
 
@@ -189,6 +190,9 @@ class MarketCog(commands.Cog):
             dead_money_rows = await queries.fetch_dead_money_for_team(
                 conn, team_row.id, season.id
             )
+            budget_snap = await budget_ops.snapshot(
+                conn, season_id=season.id, tier_id=None, team_id=team_row.id,
+            )
 
         embed = contract_render.render_cap_sheet(
             team_name=team_row.name,
@@ -203,6 +207,7 @@ class MarketCog(commands.Cog):
                 {"amount": r.amount, "note": r.note}
                 for r in dead_money_rows
             ],
+            budget_balance=budget_snap.balance if budget_snap else None,
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 

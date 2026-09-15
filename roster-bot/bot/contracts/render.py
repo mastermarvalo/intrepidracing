@@ -38,10 +38,16 @@ def render_review_panel(
     salary_cap: Decimal,
     current_market_value: Decimal | None,
     validation: OfferValidation,
+    team_budget: Decimal | None = None,
 ) -> discord.Embed:
     """
     TP's pre-submit review. Shows the arithmetic so nobody submits an
     over-cap offer by accident.
+
+    `team_budget` is the team's budget BALANCE when budgets are enforced
+    for the season; None hides the budget block entirely. The cap is the
+    league's ceiling, the budget is this team's money — both are shown
+    because both must clear.
     """
     payroll_after = payroll_before + salary + signing_bonus
     cap_space_before = salary_cap - payroll_before
@@ -85,6 +91,16 @@ def render_review_panel(
         ]),
         inline=False,
     )
+    if team_budget is not None:
+        embed.add_field(
+            name="Budget impact",
+            value=_bound_lines([
+                f"Team budget: {format_money(team_budget)}",
+                f"Available before: {format_money(team_budget - payroll_before)}",
+                f"Available after:  {format_money(team_budget - payroll_after)}",
+            ]),
+            inline=False,
+        )
     if message:
         embed.add_field(name="Note to driver", value=_clip_field(message), inline=False)
     embed.add_field(
@@ -219,6 +235,7 @@ def render_cap_sheet(
     active_slots_max: int,
     dead_money: Decimal = Decimal("0"),
     dead_money_rows: Sequence[Mapping] = (),
+    budget_balance: Decimal | None = None,
 ) -> discord.Embed:
     """
     /market team output. Two-line-per-driver layout with contract vs
@@ -249,6 +266,19 @@ def render_cap_sheet(
         value=_bound_lines(cap_lines),
         inline=False,
     )
+    if budget_balance is not None:
+        # The budget is the team's own money; the cap is the league's
+        # ceiling. Spending is bounded by whichever is smaller.
+        available = budget_balance - effective_payroll
+        embed.add_field(
+            name="Team budget",
+            value=_bound_lines([
+                f"Budget: {format_money(budget_balance)}",
+                f"Available to spend: {format_money(available)}",
+                f"Binding limit: {'budget' if available < cap_space else 'cap'}",
+            ]),
+            inline=False,
+        )
     if not contracts_with_market:
         embed.add_field(
             name="Roster",
@@ -308,6 +338,8 @@ def render_trade_review(
     payroll_before_other: Decimal,
     payroll_after_other: Decimal,
     salary_cap_other: Decimal,
+    budget_proposing: Decimal | None = None,
+    budget_other: Decimal | None = None,
 ) -> discord.Embed:
     """
     Trade proposal review shown to the proposing TP (before submit)
@@ -337,28 +369,37 @@ def render_trade_review(
     )
     embed.add_field(
         name=f"{proposing_team_name} cap impact",
-        value=_bound_lines([
-            f"Payroll before: {format_money(payroll_before_proposing)}",
-            f"Payroll after:  {format_money(payroll_after_proposing)}",
-            f"Cap space after: "
-            f"{format_money(salary_cap_proposing - payroll_after_proposing)}",
-        ]),
+        value=_bound_lines(_trade_cap_lines(
+            payroll_before_proposing, payroll_after_proposing,
+            salary_cap_proposing, budget_proposing,
+        )),
         inline=False,
     )
     embed.add_field(
         name=f"{other_team_name} cap impact",
-        value=_bound_lines([
-            f"Payroll before: {format_money(payroll_before_other)}",
-            f"Payroll after:  {format_money(payroll_after_other)}",
-            f"Cap space after: "
-            f"{format_money(salary_cap_other - payroll_after_other)}",
-        ]),
+        value=_bound_lines(_trade_cap_lines(
+            payroll_before_other, payroll_after_other,
+            salary_cap_other, budget_other,
+        )),
         inline=False,
     )
     if message:
         embed.add_field(name="Note", value=_clip_field(message), inline=False)
     _enforce_total(embed)
     return embed
+
+
+def _trade_cap_lines(
+    before: Decimal, after: Decimal, cap: Decimal, budget: Decimal | None
+) -> list[str]:
+    lines = [
+        f"Payroll before: {format_money(before)}",
+        f"Payroll after:  {format_money(after)}",
+        f"Cap space after: {format_money(cap - after)}",
+    ]
+    if budget is not None:
+        lines.append(f"Budget available after: {format_money(budget - after)}")
+    return lines
 
 
 def _trade_items_block(rows: Sequence[Mapping]) -> str:

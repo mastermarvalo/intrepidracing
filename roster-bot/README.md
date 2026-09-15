@@ -307,6 +307,12 @@ phases.
   that counts against the effective cap), extension (updates the
   existing active contract per CLAUDE.md §2 rule 6), and
   promotion/relegation (moves driver + active contract across tiers).
+- **Phase 7** — team budgets: each team owns a season balance in an
+  append-only `team_budget_ledger`, separate from the league-wide
+  spending cap. Race results credit earnings per point and debit DNFs,
+  no-shows, and incident points; commissioners award prize money;
+  unspent budget rolls over between seasons
+  (`bot/market/budget.py`, `bot/market/budget_ops.py`).
 
 **For a league-member walkthrough of the whole thing (setup,
 offering, trading, releasing, buyouts, promotion/relegation), see
@@ -458,7 +464,7 @@ in Phase 3 + 4: `market`, `movers`, `dashboard`, `surplus`,
 | `/market-admin reject <offer_id> [note]` | Reject an offer in `pending_approval` |
 | `/market-admin void <contract_id> [note]` | End an active contract |
 | `/market-admin set-status <@driver> <status>` | Change a driver's status (writes a `status_change` ledger entry) |
-| `/market-admin adjust-cap <team> <delta_m> <note>` | Log a cap adjustment in the ledger (audit trail only — enforcement is deferred) |
+| `/market-admin adjust-cap <team> <delta_m> <note>` | Log a cap adjustment in the ledger (audit trail only — it does not move money; use `/market-admin budget adjust` for that) |
 | `/market-admin approve-trade <trade_id>` | Execute an accepted trade — transfers each item's contract to the receiving team, drops/re-adds Discord roles via the shared helper, writes ledger rows for both sides |
 | `/market-admin reject-trade <trade_id> [note]` | Reject an accepted trade |
 | `/market-admin promote <@driver> <new_tier> [note]` | Move a driver + their active contract to a higher tier |
@@ -510,6 +516,72 @@ The equivalent commands, if you'd rather type them:
 /market-admin board add kind: Movers channel: #market tier: t1
 /market-admin board add kind: Cross-tier dashboard channel: #market
 ```
+
+### Spending cap vs. team budget (Phase 7)
+
+Two different numbers gate every signing and trade:
+
+| | Spending cap | Team budget |
+|---|---|---|
+| What it is | League rule: the most payroll any team may commit | The team's own money for the season |
+| Where it lives | `league_config.salary_cap` (F1 preset: $145M) | `SUM(team_budget_ledger.amount)` per team per season |
+| Same for every team? | Yes | No — it moves with results, prize money, and rollover |
+| Can a team exceed it? | Never (payroll ≤ cap) | A team may *hold* more than the cap; it may only *spend* up to the cap |
+| Failure code on an offer | `cap_exceeded` | `budget_exceeded` |
+
+Rule of thumb: **budget is how much you have, cap is how much you are
+allowed to spend.** A team with $300M in the bank and a $145M cap can
+still only commit $145M of payroll. A team with $40M in the bank and a
+$145M cap can only commit $40M.
+
+**How a budget moves.** Every change is a ledger row with a kind and an
+actor; nothing is overwritten.
+
+| Kind | Sign | Written by |
+|---|---|---|
+| `opening_balance` | credit | automatically, once per team per season, the first time the budget is touched |
+| `rollover` | either | `/market-admin budget rollover` — last season's balance minus committed payroll |
+| `prize_money` | credit | `/market-admin budget award` |
+| `race_earnings` | credit | results import — championship points × `per_point_m` |
+| `dnf_penalty` | debit | results import — one per DNF |
+| `dns_penalty` | debit | results import — one per no-show |
+| `incident_penalty` | debit | results import — incident points × `per_incident_pt_m` |
+| `adjustment` | either | `/market-admin budget adjust` |
+
+Charges land on the team the driver is **contracted to at import time**.
+A free agent's DNF is reported in the import receipt but charges nobody.
+Re-importing a round is safe: the bot compares what the round *should*
+have charged against what it *did* charge and writes only the difference
+as flagged correction rows, so a stewards' revision never double-bills.
+
+**Commands** (Manage Server):
+
+| Command | Description |
+|---|---|
+| `/market-admin budget show <team>` | Balance, committed payroll, available-to-spend, and which limit (cap or budget) currently binds, plus the last 8 ledger rows |
+| `/market-admin budget award <team> <amount_m> <note>` | Credit prize money (positive only, note required) |
+| `/market-admin budget adjust <team> <delta_m> <note>` | Manual correction, either sign, note required |
+| `/market-admin budget rollover <from_season>` | Carry every team's unspent budget from a past season into the active season; idempotent — a second run is a no-op |
+| `/market-admin budget config [tier] [enforce] [rollover] [opening_m] [per_point_m] [dnf_m] [dns_m] [per_incident_pt_m]` | Show the active season's rules, or set them; passing `tier` writes a per-tier override that falls back to the season default for anything you leave blank |
+
+**Starting Season 8 with unequal budgets.** Every team opens at the
+configured `opening_m` (default equals the cap, so day-one behaviour is
+unchanged). To reward last season's standings, award prize money before
+free agency opens:
+
+```text
+/market-admin budget award team: mclaren amount_m: 25 note: "S7 constructors P1"
+/market-admin budget award team: haas    amount_m: 5  note: "S7 constructors P10"
+```
+
+**Turning it off.** `/market-admin budget config enforce: false` keeps
+the ledger but stops budgets from blocking signings and trades and stops
+results imports from writing charges. A season with no `budget_config`
+row at all behaves exactly as before Phase 7.
+
+> The preset rates (`per_point_m` 0.05, `dnf_m` 0.50, `dns_m` 1.00,
+> `per_incident_pt_m` 0.25) are starting points, not tuned values. Check
+> them against a full season of your results before relying on them.
 
 ### The weekly race-night loop
 

@@ -233,3 +233,22 @@ class LeagueConfig:
     transactions_channel_id: int | None = None
     approvals_channel_id: int | None = None
     commissioner_role_id: int | None = None
+
+
+@dataclass
+class BudgetEntry:
+    """One append-only row of `team_budget_ledger`. `amount` is signed."""
+
+    id: int
+    season_id: int
+    team_id: int
+    kind: str
+    amount: Decimal
+    race_result_id: int | None = None
+    round_id: int | None = None
+    from_season_id: int | None = None
+    note: str | None = None
+    detail: dict = field(default_factory=dict)
+    is_correction: bool = False
+    actor_id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

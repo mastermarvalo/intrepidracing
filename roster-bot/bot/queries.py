@@ -12,8 +12,10 @@ from typing import Any, Sequence
 
 import asyncpg
 
+from bot.market import budget as budget_engine
 from bot.market import results as results_engine
 from bot.models import (
+    BudgetEntry,
     Contract,
     ContractOffer,
     DeadMoneyEntry,
@@ -2403,3 +2405,316 @@ async def fetch_trades_awaiting_approval(
         season_id,
         limit,
     )
+
+
+# ── Team budgets (Phase 7) ───────────────────────────────────────────────
+# The budget is a per-team, per-season BALANCE distinct from the
+# league-wide spending cap. There is no stored balance column: balance
+# is SUM(amount) over `team_budget_ledger`, so every dollar is explained
+# by an append-only row. See migrations/013_team_budgets.sql.
+
+
+def _row_to_budget_config(row: asyncpg.Record) -> budget_engine.BudgetConfig:
+    return budget_engine.BudgetConfig(
+        id=row["id"],
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        enforce_budget=row["enforce_budget"],
+        rollover_enabled=row["rollover_enabled"],
+        opening_budget=row["opening_budget"],
+        earnings_per_point=row["earnings_per_point"],
+        dnf_penalty=row["dnf_penalty"],
+        dns_penalty=row["dns_penalty"],
+        penalty_per_incident_pt=row["penalty_per_incident_pt"],
+    )
+
+
+async def fetch_budget_config(
+    conn: asyncpg.Connection, season_id: int, tier_id: int | None
+) -> budget_engine.BudgetConfig | None:
+    """
+    Resolved budget_config for (season, tier): the tier override if one
+    exists, otherwise the season default. None means budgets are not
+    configured for the season — callers treat that as "not enforced".
+    """
+    row = None
+    if tier_id is not None:
+        row = await conn.fetchrow(
+            "SELECT * FROM budget_config WHERE season_id = $1 AND tier_id = $2",
+            season_id, tier_id,
+        )
+    if row is None:
+        row = await conn.fetchrow(
+            "SELECT * FROM budget_config WHERE season_id = $1 AND tier_id IS NULL",
+            season_id,
+        )
+    return _row_to_budget_config(row) if row else None
+
+
+async def fetch_budget_config_exact(
+    conn: asyncpg.Connection, season_id: int, tier_id: int | None
+) -> budget_engine.BudgetConfig | None:
+    """The row for exactly this scope, with no fallback — for editing."""
+    if tier_id is None:
+        row = await conn.fetchrow(
+            "SELECT * FROM budget_config WHERE season_id = $1 AND tier_id IS NULL",
+            season_id,
+        )
+    else:
+        row = await conn.fetchrow(
+            "SELECT * FROM budget_config WHERE season_id = $1 AND tier_id = $2",
+            season_id, tier_id,
+        )
+    return _row_to_budget_config(row) if row else None
+
+
+async def upsert_budget_config(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int | None,
+    enforce_budget: bool,
+    rollover_enabled: bool,
+    opening_budget: Decimal,
+    earnings_per_point: Decimal,
+    dnf_penalty: Decimal,
+    dns_penalty: Decimal,
+    penalty_per_incident_pt: Decimal,
+) -> budget_engine.BudgetConfig:
+    existing = await fetch_budget_config_exact(conn, season_id, tier_id)
+    if existing is None:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO budget_config
+                (season_id, tier_id, enforce_budget, rollover_enabled,
+                 opening_budget, earnings_per_point, dnf_penalty, dns_penalty,
+                 penalty_per_incident_pt)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING *
+            """,
+            season_id, tier_id, enforce_budget, rollover_enabled,
+            opening_budget, earnings_per_point, dnf_penalty, dns_penalty,
+            penalty_per_incident_pt,
+        )
+    else:
+        row = await conn.fetchrow(
+            """
+            UPDATE budget_config
+               SET enforce_budget = $2, rollover_enabled = $3,
+                   opening_budget = $4, earnings_per_point = $5,
+                   dnf_penalty = $6, dns_penalty = $7,
+                   penalty_per_incident_pt = $8
+             WHERE id = $1
+            RETURNING *
+            """,
+            existing.id, enforce_budget, rollover_enabled,
+            opening_budget, earnings_per_point, dnf_penalty, dns_penalty,
+            penalty_per_incident_pt,
+        )
+    return _row_to_budget_config(row)
+
+
+def _row_to_budget_entry(row: asyncpg.Record) -> BudgetEntry:
+    detail = row["detail"]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    return BudgetEntry(
+        id=row["id"],
+        season_id=row["season_id"],
+        team_id=row["team_id"],
+        kind=row["kind"],
+        amount=row["amount"],
+        race_result_id=row["race_result_id"],
+        round_id=row["round_id"],
+        from_season_id=row["from_season_id"],
+        note=row["note"],
+        detail=detail or {},
+        is_correction=row["is_correction"],
+        actor_id=row["actor_id"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_budget_entry(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    team_id: int,
+    kind: str,
+    amount: Decimal,
+    detail: dict | None = None,
+    race_result_id: int | None = None,
+    round_id: int | None = None,
+    from_season_id: int | None = None,
+    note: str | None = None,
+    actor_id: int | None = None,
+    is_correction: bool = False,
+) -> int:
+    """
+    Append one signed budget row. The DB trigger enforces sign-by-kind
+    unless `is_correction` — a correction reverses an earlier automatic
+    charge and so legitimately points the other way.
+    """
+    return await conn.fetchval(
+        """
+        INSERT INTO team_budget_ledger
+            (season_id, team_id, kind, amount, race_result_id, round_id,
+             from_season_id, note, detail, actor_id, is_correction)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+        RETURNING id
+        """,
+        season_id, team_id, kind, amount, race_result_id, round_id,
+        from_season_id, note, json.dumps(detail or {}), actor_id, is_correction,
+    )
+
+
+async def fetch_budget_balance(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> Decimal:
+    """Sum of the team's budget ledger for the season. Zero if no rows."""
+    total = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+          FROM team_budget_ledger
+         WHERE team_id = $1 AND season_id = $2
+        """,
+        team_id, season_id,
+    )
+    return Decimal(total)
+
+
+async def fetch_budget_balances_for_season(
+    conn: asyncpg.Connection, season_id: int
+) -> dict[int, Decimal]:
+    """team_id → balance for every team with at least one row this season."""
+    rows = await conn.fetch(
+        """
+        SELECT team_id, SUM(amount) AS balance
+          FROM team_budget_ledger
+         WHERE season_id = $1
+         GROUP BY team_id
+        """,
+        season_id,
+    )
+    return {r["team_id"]: Decimal(r["balance"]) for r in rows}
+
+
+async def fetch_budget_entries(
+    conn: asyncpg.Connection, team_id: int, season_id: int, limit: int
+) -> list[BudgetEntry]:
+    rows = await conn.fetch(
+        """
+        SELECT * FROM team_budget_ledger
+         WHERE team_id = $1 AND season_id = $2
+         ORDER BY created_at DESC, id DESC
+         LIMIT $3
+        """,
+        team_id, season_id, limit,
+    )
+    return [_row_to_budget_entry(r) for r in rows]
+
+
+async def fetch_budget_totals_by_kind(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> dict[str, Decimal]:
+    """kind → signed total, so a cap sheet can show where the money went."""
+    rows = await conn.fetch(
+        """
+        SELECT kind, SUM(amount) AS total
+          FROM team_budget_ledger
+         WHERE team_id = $1 AND season_id = $2
+         GROUP BY kind
+        """,
+        team_id, season_id,
+    )
+    return {r["kind"]: Decimal(r["total"]) for r in rows}
+
+
+async def budget_entry_exists(
+    conn: asyncpg.Connection, team_id: int, season_id: int, kind: str
+) -> bool:
+    return await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM team_budget_ledger
+             WHERE team_id = $1 AND season_id = $2 AND kind = $3
+        )
+        """,
+        team_id, season_id, kind,
+    )
+
+
+async def fetch_result_charge_net(
+    conn: asyncpg.Connection, round_id: int
+) -> dict[tuple[int, int, str], Decimal]:
+    """
+    (race_result_id, team_id, kind) → net amount already in the ledger
+    for a round, corrections included. The ingest path diffs the
+    engine's desired charges against this and writes only the delta, so
+    re-importing a round never double-bills and a revised result
+    produces exactly the change.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT race_result_id, team_id, kind, SUM(amount) AS net
+          FROM team_budget_ledger
+         WHERE round_id = $1 AND race_result_id IS NOT NULL
+         GROUP BY race_result_id, team_id, kind
+        """,
+        round_id,
+    )
+    return {
+        (r["race_result_id"], r["team_id"], r["kind"]): Decimal(r["net"])
+        for r in rows
+    }
+
+
+async def fetch_result_facts_for_round(
+    conn: asyncpg.Connection, round_id: int
+) -> list[budget_engine.ResultFacts]:
+    """
+    Each result in the round joined to the driver's ACTIVE contract, so
+    the budget engine knows which team to charge. team_id is NULL for a
+    driver with no active contract — the engine reports those rather
+    than charging nobody silently.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT rr.id            AS race_result_id,
+               rr.driver_id,
+               c.team_id,
+               rr.finish_position,
+               rr.dnf,
+               rr.dns,
+               rr.incident_points
+          FROM race_results rr
+          LEFT JOIN contracts c
+                 ON c.driver_id = rr.driver_id
+                AND c.state = 'active'
+         WHERE rr.round_id = $1
+         ORDER BY rr.driver_id
+        """,
+        round_id,
+    )
+    return [
+        budget_engine.ResultFacts(
+            race_result_id=r["race_result_id"],
+            driver_id=r["driver_id"],
+            team_id=r["team_id"],
+            finish_position=r["finish_position"],
+            dnf=r["dnf"],
+            dns=r["dns"],
+            incident_points=Decimal(r["incident_points"]),
+        )
+        for r in rows
+    ]
+
+
+async def fetch_team_ids_with_budget_rows(
+    conn: asyncpg.Connection, season_id: int
+) -> list[int]:
+    rows = await conn.fetch(
+        "SELECT DISTINCT team_id FROM team_budget_ledger WHERE season_id = $1 ORDER BY team_id",
+        season_id,
+    )
+    return [r["team_id"] for r in rows]

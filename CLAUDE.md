@@ -14,9 +14,11 @@ is marked BINDING, violating it is grounds for rejecting the change.
 
 ## 1. Status
 
-Phases 1–6 are shipped. Git history:
+Phases 1–7 are shipped. Git history:
 
 ```
+(feature/team-budgets)  Phase 7: team budgets separate from the spending cap
+64cfcf0  main after PR #1 (driver sync, migration 012)
 fda8506  Make contract length bounds commissioner-editable
 95a41fb  Interactive Setup, Approvals and Boards screens
 01a4ee3  Add /league control panel and /help browser
@@ -25,9 +27,9 @@ ab25adc  Phase 6: race-results ingestion and normalization
 d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
-- **533 tests passing**, 27 test modules.
-- **77 slash commands** across 7 groups.
-- **11 migrations** (005 is deliberately absent — see §5).
+- **561 tests passing**, 28 test modules.
+- **82 slash commands** across 7 groups.
+- **12 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
 
 > **Unverified:** at the time of writing, these commits were **local only
@@ -98,6 +100,8 @@ roster-bot/
       render.py       377   market tables, movers, cap sheets, driver cards, dashboard
       boards.py       238   self-updating market board embeds
       results.py      346   race results → normalized valuation observations
+      budget.py       232   pure: round charges, available-to-spend, rollover arithmetic
+      budget_ops.py   400   conn-level: opening balance, award, round charges, rollover
 
     contracts/
       rules.py        425   validation predicates; pure functions over plain data
@@ -127,10 +131,10 @@ roster-bot/
       admin_market.py 1769  /market-admin (34)
       panel.py        783   /league + /help (2)
 
-  migrations/               001–012, forward-only
+  migrations/               001–013, forward-only
   scripts/check_magic_numbers.py  125  the ADR-001 CI guard
   docs/results_template.csv       race-results import template
-  tests/                          27 modules, 479 tests
+  tests/                          28 modules, 561 tests
 docs/
   ADR-001-f1-with-generic-future.md   BINDING architecture decision
   MARKET_GUIDE.md                     league-member walkthrough
@@ -193,6 +197,28 @@ docs/
    Tests must use `Decimal` equality, never float tolerance.
 8. **Role assignment goes through `roster_ops.sign_to_team` /
    `drop_from_team`.** Never mutate team roles anywhere else.
+9. **Spending cap and team budget are two different numbers.** The cap
+   (`league_config.salary_cap`) is the league ceiling on committed
+   payroll and is identical for every team. The budget
+   (`SUM(team_budget_ledger.amount)` per team per season) is the team's
+   own money and differs by team. A team may **hold** more than the cap
+   but may never **spend** above it; a team below the cap may still be
+   blocked by its budget. Every signing and trade approval must clear
+   **both**: `payroll_after ≤ salary_cap` **and** `payroll_after ≤
+   budget_balance`. Payroll is *compared against* the budget, never
+   debited from it — the ledger records earnings, penalties, prizes,
+   and rollover, not salaries.
+10. **`team_budget_ledger` is append-only, like `contract_ledger`.**
+    Re-importing a round never deletes or updates rows; it writes
+    net-delta rows flagged `is_correction` so a stewards' revision is
+    auditable. Every kind has a fixed sign (`budget_entry_kinds.
+    direction`), enforced by a DB trigger; only corrections may
+    disagree with it.
+11. **Budgets are opt-in per season.** No `budget_config` row, or
+    `enforce_budget = FALSE`, means offers, trades, and imports behave
+    exactly as they did before Phase 7. The F1 preset seeds a row with
+    `opening_budget = salary_cap`, so a fresh season is unchanged on day
+    one and diverges only as results come in.
 
 ---
 
@@ -248,6 +274,7 @@ runner already wraps each file in a transaction.
 | `010_race_results_and_normalization.sql` | `position_scores`, `results_config`, `race_rounds`, `race_results`; alters `valuation_runs` |
 | `011_min_contract_term.sql` | adds `league_config.min_term_seasons` + CHECK constraints |
 | `012_driver_registered_kind.sql` | seeds the `driver_registered` transaction kind for `/market-admin driver` enrolment |
+| `013_team_budgets.sql` | `budget_entry_kinds`, `team_budget_ledger` (+ sign trigger, one `opening_balance` and one `rollover` per team-season), `budget_config` (season default + per-tier override) |
 
 ### The `drivers` exception
 
@@ -277,7 +304,8 @@ meaningful.
 
 | Layer | May import | Must NOT import |
 |---|---|---|
-| `bot/market/valuation.py`, `bot/market/money.py`, `bot/contracts/rules.py` | stdlib, `Decimal` | `discord`, DB, `bot/presets/` |
+| `bot/market/valuation.py`, `bot/market/money.py`, `bot/market/budget.py`, `bot/contracts/rules.py` | stdlib, `Decimal` | `discord`, DB, `bot/presets/` |
+| `bot/market/budget_ops.py` | DB, queries, `bot/market/budget.py` | `discord`, `bot/presets/` |
 | `bot/results_ingest.py`, `bot/workflow.py` | DB, queries | `discord` |
 | `bot/contracts/service.py` | DB, queries, rules | `discord` where avoidable |
 | `bot/approvals.py`, `bot/ui/*`, `bot/cogs/*` | everything | raw SQL strings |
@@ -290,7 +318,7 @@ implement it twice.
 
 ---
 
-## 7. Command surface — 74 commands
+## 7. Command surface — 82 commands
 
 **Nothing here may be removed or renamed.** The panel (§8) is an additive
 layer on top; every command remains available for power users.
@@ -335,7 +363,7 @@ layer on top; every command remains available for power users.
 /trade propose | accept | decline | withdraw | status
 ```
 
-### `/market-admin` (34, commissioner)
+### `/market-admin` (39, commissioner)
 
 ```
 season create | activate | list
@@ -347,7 +375,11 @@ board add | remove | refresh | list
 driver add | sync | sync-all
 approve | reject | approve-trade | reject-trade
 void | set-status | adjust-cap | promote | relegate
+budget show | award | adjust | rollover | config
 ```
+
+`adjust-cap` is unchanged: it writes a `cap_adjustment` ledger note and
+moves no money. `budget adjust` is the command that changes a balance.
 
 ### `/roster` (16) and `/sheets` (4)
 
@@ -492,6 +524,7 @@ reachable — **adding a rule requires adding a scenario there.**
 | Salary ≥ `min_salary` | `salary_below_min` | reject |
 | Salary ≤ `max_salary` (if set) | `salary_above_max` | reject |
 | Payroll + salary + bonus ≤ `salary_cap` | `cap_exceeded` | reject, show the arithmetic |
+| Payroll + salary + bonus ≤ team budget balance (when enforced) | `budget_exceeded` | reject, show the shortfall; passes with a note when budgets are off |
 | Team has a free `active_driver_slots` seat | `no_seat_available` | reject or require a linked release |
 | Term ≥ 1 season | `term_too_short` | reject — absolute floor, a nonsense value |
 | Term ≥ `min_term_seasons` | `term_below_minimum` | reject — league policy |
@@ -507,7 +540,8 @@ Principal needs to know which one they hit.
 
 The review panel must display, before submission: the driver's current
 market value, current contract and P/L, the offering team's payroll
-before and after, cap space remaining, and every warning. **A TP should
+before and after, cap space remaining, budget impact (when enforced),
+and every warning. **A TP should
 never be able to submit an invalid offer by accident.**
 
 ---
@@ -582,6 +616,28 @@ CSV / Google Sheet → results_ingest.parse_results → race_results rows
   value.
 - Always **preview before publish**.
 
+### Results → budgets (Phase 7)
+
+`workflow.import_round` calls `budget_ops.apply_round_charges` in the
+**same transaction** as the results upsert. Per `race_results` row it
+credits `race_earnings` (`position_scores.points × earnings_per_point`)
+and debits `dnf_penalty`, `dns_penalty`, and `incident_penalty`
+(`incident_points × penalty_per_incident_pt`) to the team the driver is
+**contracted to at import time** (active contract in that season). A
+row with no contracted team is returned as `unattributed`, shown in the
+import receipt, and charges nobody. A rate of `0` switches that charge
+off. The step is a no-op when budgets are not enforced for that tier.
+
+Idempotency is by net delta: `queries.fetch_result_charge_net` sums what
+each `(race_result_id, team_id, kind)` has already been charged; the
+engine recomputes what it *should* be; only the difference is written,
+flagged `is_correction`. Re-importing identical results writes nothing.
+
+`budget_ops.rollover` carries `balance − effective_payroll` from one
+season into the next as a single `rollover` row per team (negative if
+the team is underwater), requires `rollover_enabled` on the **target**
+season, and is idempotent via the partial unique index.
+
 ### Import template
 
 `roster-bot/docs/results_template.csv` holds the required headers. A live
@@ -617,6 +673,12 @@ Required coverage per area:
   negative and zero P/L formatting.
 - **`test_contract_rules.py`** — one test per validation-matrix row, both
   paths, asserting the stable failure code, plus the code-drift guard.
+- **`test_team_budgets.py`** — engine charges per kind and zero-rate
+  switch-off; opening balance credited once; manual-kind guards; DB sign
+  trigger; round charges land on the contracted team; identical
+  re-import writes nothing; revised re-import writes only corrections;
+  rollover amount, idempotency, disabled target; trade approval blocked
+  by budget and by cap independently.
 - **`test_contract_lifecycle.py`** — every legal transition succeeds,
   every illegal one raises; accepted terms cannot be mutated; expiry.
 - **`test_market_render.py` / `test_overflow.py`** — line-width bounds,
@@ -690,7 +752,22 @@ Required coverage per area:
 - **Phase 5 scope partially open.** Trades, releases, buyouts, and
   promotion/relegation exist (`009`, `test_trades.py`,
   `test_release_and_buyout.py`, `test_extension_and_promotion.py`).
-  Season rollover is not built.
+  **Budget** rollover is built (Phase 7); **contract** carry-over across
+  seasons (multi-season deals surviving a season change) is not.
+- **Budget preset rates are untuned.** `earnings_per_point 0.05`,
+  `dnf_penalty 0.50`, `dns_penalty 1.00`, `penalty_per_incident_pt 0.25`
+  are placeholders sized so a season moves a budget by single-digit
+  millions against a $145M cap. Calibrate against real Season 7 data.
+- **Incentives do not debit the budget.** `max_incentives` is validated
+  against `max_incentive_pct` but nothing pays it out. Whether earned
+  incentives should be a budget debit is an open league-rules question.
+- **Trade approval cap gate is new in Phase 7** and closes a
+  pre-existing hole: `commissioner_approve_trade` previously moved
+  contracts with no cap check at all.
+- **Pre-existing embedded SQL** in `bot/cogs/contracts.py` (`SELECT
+  status FROM drivers`, ~line 928) violates the "SQL only in
+  `queries.py`" rule; untouched by Phase 7, should move to a query
+  helper.
 - **`MIGRATION.md` upgrade notes** were specified in the original brief
   and do not exist.
 - **`bot/flow.py` (1254 lines)** predates the `bot/ui/` layer and uses
