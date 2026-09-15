@@ -25,7 +25,7 @@ ab25adc  Phase 6: race-results ingestion and normalization
 d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
-- **460 tests passing**, 27 test modules.
+- **479 tests passing**, 27 test modules.
 - **77 slash commands** across 7 groups.
 - **11 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
@@ -89,7 +89,7 @@ roster-bot/
     sheets.py         245   Google Sheets fetch/format
     results_ingest.py 293   CSV/Sheets → parsed race results, Discord-free
     approvals.py      341   Discord-AWARE approval orchestration
-    workflow.py       813   Discord-FREE shared layer behind the panel and the cogs
+    workflow.py      1000   Discord-FREE shared layer behind the panel and the cogs
     panel_help.py     214   /help catalog, built from live tree.walk_commands()
 
     market/
@@ -114,6 +114,7 @@ roster-bot/
       setup_screen.py 681   guided setup checklist + season/tier/role/channel flows
       approvals_screen.py 359  approval queue browser with detail + reject modal
       boards_screen.py 325  board add/remove wizard
+      drivers_screen.py 415  enrol + sync driver enrolment surface
       config_modal.py 460   league config editors (money limits / contract rules)
 
     cogs/
@@ -123,12 +124,12 @@ roster-bot/
       contracts.py   1082   /contract (9)
       trades.py       393   /trade (5)
       admin_market.py 1769  /market-admin (34)
-      panel.py        738   /league + /help (2)
+      panel.py        765   /league + /help (2)
 
   migrations/               001–012, forward-only
   scripts/check_magic_numbers.py  125  the ADR-001 CI guard
   docs/results_template.csv       race-results import template
-  tests/                          27 modules, 460 tests
+  tests/                          27 modules, 479 tests
 docs/
   ADR-001-f1-with-generic-future.md   BINDING architecture decision
   MARKET_GUIDE.md                     league-member walkthrough
@@ -369,6 +370,7 @@ a guided flow; it **adds** a layer and removes nothing.
 /league
 ├── ⚙️  Setup      → guided checklist (season → tiers → rules → roles → channels → boards)
 ├── 🏁 Race Night  → import results → preview valuation → publish   (needs tiers)
+├── 👥 Drivers     → enrol one, sync one tier's role, or sync all tiers (needs tiers)
 ├── 📋 Approvals   → pending offer + trade queue with detail view    (needs season)
 └── 📊 Boards      → add / remove / refresh market boards            (needs tiers)
 ```

@@ -440,3 +440,103 @@ async def test_preset_seeds_three_tiers(workflow_db):
 
     assert len(tiers) == 3
     assert f1_preset is not None
+
+
+# ── driver enrolment workflow ────────────────────────────────────────
+
+
+async def test_list_driver_summary_reports_role_and_count(workflow_db):
+    await _seeded_season(workflow_db)
+    await workflow.set_tier_role(guild_id=GUILD, tier_code="t1", role_id=42)
+    await workflow.enrol_driver(
+        guild_id=GUILD, actor_id=1, tier_code="t1",
+        member_id=100, display_name="Alonso", status="active",
+    )
+
+    summaries = {s.code: s for s in await workflow.list_driver_summary(GUILD)}
+
+    assert summaries["t1"].tier_role_id == 42
+    assert summaries["t1"].driver_count == 1
+    assert summaries["t2"].tier_role_id is None
+    assert summaries["t2"].driver_count == 0
+
+
+async def test_enrol_driver_rejects_unknown_status(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="status"):
+        await workflow.enrol_driver(
+            guild_id=GUILD, actor_id=1, tier_code="t1",
+            member_id=100, display_name="A", status="bogus",
+        )
+
+
+async def test_enrol_driver_rejects_unknown_tier(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="tier"):
+        await workflow.enrol_driver(
+            guild_id=GUILD, actor_id=1, tier_code="does-not-exist",
+            member_id=100, display_name="A", status="active",
+        )
+
+
+async def test_enrol_driver_is_idempotent_and_reports_it(workflow_db):
+    from bot.market import driver_ops
+
+    await _seeded_season(workflow_db)
+    first = await workflow.enrol_driver(
+        guild_id=GUILD, actor_id=1, tier_code="t1",
+        member_id=100, display_name="A", status="active",
+    )
+    second = await workflow.enrol_driver(
+        guild_id=GUILD, actor_id=1, tier_code="t1",
+        member_id=100, display_name="A", status="active",
+    )
+
+    assert first.created is True
+    assert second.created is False
+    assert driver_ops is not None
+
+
+async def test_sync_drivers_in_tier_enrols_missing_only(workflow_db):
+    from bot.market import driver_ops
+
+    await _seeded_season(workflow_db)
+    await workflow.enrol_driver(
+        guild_id=GUILD, actor_id=1, tier_code="t1",
+        member_id=1, display_name="A", status="active",
+    )
+
+    report = await workflow.sync_drivers_in_tier(
+        guild_id=GUILD, actor_id=1, tier_code="t1",
+        seeds=[
+            driver_ops.DriverSeed(member_id=1, display_name="A"),
+            driver_ops.DriverSeed(member_id=2, display_name="B"),
+            driver_ops.DriverSeed(member_id=3, display_name="C"),
+        ],
+    )
+
+    assert report.tier_code == "t1"
+    assert report.created == 2
+    assert report.already_registered == 1
+
+
+async def test_sync_all_tiers_records_skipped_alongside_synced(workflow_db):
+    from bot.market import driver_ops
+
+    await _seeded_season(workflow_db)
+
+    reports = {
+        r.tier_code: r
+        for r in await workflow.sync_drivers_all_tiers(
+            guild_id=GUILD, actor_id=1,
+            seeds_by_tier_code={
+                "t1": [driver_ops.DriverSeed(member_id=1, display_name="A")],
+            },
+            skipped_by_tier_code={"t2": "no role set", "t3": "no role set"},
+        )
+    }
+
+    assert reports["t1"].created == 1
+    assert reports["t1"].skipped_reason is None
+    assert reports["t2"].skipped_reason == "no role set"
+    assert reports["t3"].skipped_reason == "no role set"

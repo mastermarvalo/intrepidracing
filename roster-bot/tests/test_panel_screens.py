@@ -14,7 +14,7 @@ import discord
 import pytest
 
 from bot import approvals, workflow
-from bot.ui import approvals_screen, boards_screen, setup_screen
+from bot.ui import approvals_screen, boards_screen, drivers_screen, setup_screen
 from bot.ui.base import EMBED_FIELD_LIMIT, SELECT_MAX_OPTIONS
 
 # Discord platform limits, asserted rather than assumed.
@@ -363,6 +363,177 @@ def test_kind_options_say_whether_a_tier_is_needed():
     assert "every tier" in by_value["dashboard"].lower()
 
 
+# ── drivers screen ───────────────────────────────────────────────────
+
+
+def driver_summary(code="t1", *, label=None, drivers=0, role_id=None):
+    return workflow.TierDriverSummary(
+        code=code,
+        label=label or f"Tier {code[-1]}",
+        tier_role_id=role_id,
+        driver_count=drivers,
+    )
+
+
+def test_drivers_empty_state_points_at_setup():
+    embed = drivers_screen.build_drivers_embed([])
+
+    assert "setup" in embed.description.lower()
+    assert_embed_within_limits(embed)
+
+
+def test_drivers_lists_each_tier_with_its_count():
+    embed = drivers_screen.build_drivers_embed(
+        [driver_summary("t1", drivers=20, role_id=100),
+         driver_summary("t2", drivers=5, role_id=101)]
+    )
+
+    assert "t1" in embed.description
+    assert "20 driver" in embed.description
+    assert "t2" in embed.description
+    assert not any("no role" in f.name.lower() for f in embed.fields)
+
+
+def test_drivers_flags_tiers_missing_a_discord_role():
+    embed = drivers_screen.build_drivers_embed(
+        [driver_summary("t1", drivers=10, role_id=100),
+         driver_summary("t2", drivers=0, role_id=None)]
+    )
+
+    warning = next(
+        (f for f in embed.fields if "no Discord role" in f.name), None
+    )
+    assert warning is not None, "unset roles must be surfaced, not hidden"
+    assert "t2" in warning.value
+    assert "t1" not in warning.value
+
+
+def test_a_long_tier_list_stays_inside_the_description_limit():
+    embed = drivers_screen.build_drivers_embed(
+        [driver_summary(f"t{i}", drivers=i, role_id=1000 + i) for i in range(60)]
+    )
+
+    assert_embed_within_limits(embed)
+
+
+def test_drivers_view_hides_sync_when_no_tier_has_a_role():
+    view = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=None)],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    labels = {c.label for c in view.children if getattr(c, "label", None)}
+
+    assert "Sync all tiers" not in labels, "nothing to sync without a role"
+    assert not any(
+        isinstance(c, drivers_screen._SyncTierSelect) for c in view.children
+    )
+    assert "Enrol member" in labels, "enrol-by-mention still works without a role"
+    assert_view_within_limits(view)
+
+
+def test_drivers_view_offers_sync_once_a_tier_has_a_role():
+    view = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    labels = {c.label for c in view.children if getattr(c, "label", None)}
+
+    assert "Enrol member" in labels
+    assert "Sync all tiers" in labels
+    assert any(
+        isinstance(c, drivers_screen._SyncTierSelect) for c in view.children
+    )
+    assert_view_within_limits(view)
+
+
+def test_sync_select_only_offers_tiers_that_have_a_role():
+    view = drivers_screen.DriversView(
+        summaries=[
+            driver_summary("t1", role_id=100),
+            driver_summary("t2", role_id=None),
+        ],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    select = next(
+        c for c in view.children if isinstance(c, drivers_screen._SyncTierSelect)
+    )
+
+    assert {o.value for o in select.options} == {"t1"}, (
+        "offering a tier whose role isn't set would then fail on click"
+    )
+
+
+def test_sync_select_caps_its_options():
+    view = drivers_screen.DriversView(
+        summaries=[
+            driver_summary(f"t{i}", role_id=100 + i) for i in range(40)
+        ],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    select = next(
+        c for c in view.children if isinstance(c, drivers_screen._SyncTierSelect)
+    )
+
+    assert len(select.options) <= SELECT_MAX_OPTIONS
+    assert_view_within_limits(view)
+
+
+def test_enrol_flow_starts_on_the_tier_step():
+    parent = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    flow = drivers_screen._EnrolMemberFlow(opener_id=1, parent=parent)
+
+    assert flow.tier_code is None
+    assert flow.member_id is None
+
+
+def test_status_select_covers_every_workflow_status():
+    parent = drivers_screen.DriversView(
+        summaries=[driver_summary("t1", role_id=100)],
+        opener_id=1,
+        on_back=noop_back,
+    )
+    flow = drivers_screen._EnrolMemberFlow(opener_id=1, parent=parent)
+    flow.tier_code = "t1"
+    flow.member_id = 555
+    flow.member_display_name = "Alonso"
+    select = drivers_screen._EnrolStatusSelect(flow)
+
+    assert {o.value for o in select.options} == {
+        code for code, _ in workflow.DRIVER_STATUS_CHOICES
+    }
+
+
+def test_sync_line_shows_the_reason_a_tier_was_skipped():
+    line = drivers_screen._format_sync_line(
+        workflow.TierSyncReport(
+            tier_code="t3", created=0, already_registered=0,
+            skipped_reason="no Discord role set",
+        )
+    )
+
+    assert "skipped" in line
+    assert "no Discord role set" in line
+
+
+def test_sync_line_shows_the_counts_when_a_sync_ran():
+    line = drivers_screen._format_sync_line(
+        workflow.TierSyncReport(
+            tier_code="t1", created=3, already_registered=17,
+        )
+    )
+
+    assert "3" in line
+    assert "17" in line
+
+
 # ── setup screen ─────────────────────────────────────────────────────
 
 
@@ -489,6 +660,11 @@ def test_tier_modal_suggests_the_next_rank_order():
         ),
         lambda: boards_screen.BoardsView(
             boards=[board(1)], opener_id=1, on_back=noop_back
+        ),
+        lambda: drivers_screen.DriversView(
+            summaries=[driver_summary("t1", role_id=100)],
+            opener_id=1,
+            on_back=noop_back,
         ),
         lambda: setup_screen.SetupView(
             status=league_status(), opener_id=1, on_back=noop_back

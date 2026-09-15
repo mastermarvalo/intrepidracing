@@ -35,6 +35,7 @@ from bot import workflow
 from bot.panel_help import COMMAND_CATALOG, build_help_embed, help_category_options
 from bot.ui.approvals_screen import open_approvals
 from bot.ui.boards_screen import open_boards
+from bot.ui.drivers_screen import open_drivers
 from bot.ui.setup_screen import open_setup
 
 log = logging.getLogger(__name__)
@@ -138,11 +139,7 @@ def _next_step_text(status: workflow.LeagueStatus) -> str:
     if not status.has_config:
         return "Set the cap, minimum salary and movement caps → **Setup**"
     if not status.has_drivers:
-        # Deliberately a command, not a button: registering drivers is a
-        # per-person action better suited to autocomplete than a panel,
-        # and naming a button that does not exist is worse than naming
-        # the command that does.
-        return "Register drivers with `/roster add`, then reopen `/league`"
+        return "Enrol drivers → **Drivers**"
 
     unpublished = [t for t in status.tiers if t.unpublished_run_id is not None]
     if unpublished:
@@ -545,6 +542,8 @@ class HomeView(_OwnedView):
             self.add_item(_SetupButton())
             if status.has_tiers:
                 self.add_item(_RaceNightButton())
+            if status.has_tiers:
+                self.add_item(_DriversButton(status))
             # Shown even when empty: "nothing is waiting on you" is a
             # useful answer, and a button that appears and disappears is
             # harder to learn than one that is always in the same place.
@@ -597,6 +596,34 @@ class _RaceNightButton(discord.ui.Button):
         await interaction.response.edit_message(
             embed=embed,
             view=RaceNightView(status=status, opener_id=interaction.user.id),
+        )
+
+
+class _DriversButton(discord.ui.Button):
+    """
+    Reachable from home once tiers exist.
+
+    Label carries the enrolled-driver count so an admin can see whether
+    a sync is due without opening anything, matching the pattern used by
+    Approvals and Boards.
+    """
+
+    def __init__(self, status: workflow.LeagueStatus) -> None:
+        total = sum(t.driver_count for t in status.tiers)
+        label = f"Drivers ({total})" if total else "Drivers (none yet)"
+        super().__init__(
+            label=label,
+            style=(
+                discord.ButtonStyle.secondary
+                if total
+                else discord.ButtonStyle.primary
+            ),
+            emoji="👥",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_drivers(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
         )
 
 

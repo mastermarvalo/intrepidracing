@@ -26,6 +26,7 @@ from decimal import Decimal
 
 from bot import db, queries, results_ingest, sheets
 from bot.market import boards as market_boards
+from bot.market import driver_ops
 from bot.market import results as results_engine
 from bot.market import valuation as valuation_engine
 
@@ -796,6 +797,192 @@ async def fetch_config_for_edit(*, guild_id: int, tier_code: str | None = None):
             f"preset to seed one."
         )
     return season.id, tier_id, cfg
+
+
+# ── Driver enrolment ─────────────────────────────────────────────────
+#
+# The panel's Drivers screen and `/market-admin driver add|sync|sync-all`
+# both drive these; the underlying idempotent write lives in
+# `bot/market/driver_ops.py`. Discord-facing callers gather members from
+# tier roles themselves, then hand this layer plain `DriverSeed`s.
+
+
+DRIVER_STATUS_CHOICES: tuple[tuple[str, str], ...] = (
+    ("active", "Active"),
+    ("reserve", "Reserve"),
+    ("free_agent", "Free agent"),
+    ("restricted_fa", "Restricted FA"),
+    ("inactive", "Inactive"),
+    ("suspended", "Suspended"),
+)
+
+
+@dataclass(frozen=True)
+class TierDriverSummary:
+    """Lightweight per-tier snapshot for the Drivers screen."""
+
+    code: str
+    label: str
+    tier_role_id: int | None
+    driver_count: int
+
+
+@dataclass(frozen=True)
+class DriverEnrolmentReport:
+    tier_code: str
+    display_name: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class TierSyncReport:
+    """
+    Result of syncing one tier from its Discord role.
+
+    `skipped_reason` is populated iff the tier could not be sync'd at all
+    (no role set, or the role id is not in the guild). `created` and
+    `already_registered` are populated when the sync actually ran.
+    """
+
+    tier_code: str
+    created: int
+    already_registered: int
+    skipped_reason: str | None = None
+
+
+async def list_driver_summary(guild_id: int) -> list[TierDriverSummary]:
+    """Every tier in the active season with its current driver count."""
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            return []
+        tiers = await queries.fetch_all_tiers(conn, season.id)
+        summaries: list[TierDriverSummary] = []
+        for t in tiers:
+            drivers = await queries.fetch_drivers_in_tier(conn, t.id)
+            summaries.append(
+                TierDriverSummary(
+                    code=t.code,
+                    label=t.label,
+                    tier_role_id=t.tier_role_id,
+                    driver_count=len(drivers),
+                )
+            )
+    return summaries
+
+
+async def enrol_driver(
+    *,
+    guild_id: int,
+    actor_id: int,
+    tier_code: str,
+    member_id: int,
+    display_name: str,
+    status: str,
+) -> DriverEnrolmentReport:
+    """Enrol one member into a tier; idempotent."""
+    if status not in {code for code, _ in DRIVER_STATUS_CHOICES}:
+        raise WorkflowError(f"Unknown driver status `{status}`.")
+    async with db.connect() as conn:
+        season, tier_row = await _require_season_and_tier(conn, guild_id, tier_code)
+        result = await driver_ops.enrol_driver(
+            conn,
+            season_id=season.id,
+            tier_id=tier_row.id,
+            seed=driver_ops.DriverSeed(
+                member_id=member_id, display_name=display_name
+            ),
+            status=status,
+            actor_id=actor_id,
+        )
+    return DriverEnrolmentReport(
+        tier_code=tier_row.code,
+        display_name=display_name,
+        created=result.created,
+    )
+
+
+async def sync_drivers_in_tier(
+    *,
+    guild_id: int,
+    actor_id: int,
+    tier_code: str,
+    seeds: list[driver_ops.DriverSeed],
+) -> TierSyncReport:
+    """
+    Enrol every seed missing in the tier.
+
+    Callers built the seed list from a Discord role's members; this layer
+    stays Discord-free and just persists.
+    """
+    async with db.connect() as conn:
+        season, tier_row = await _require_season_and_tier(conn, guild_id, tier_code)
+        results = await driver_ops.sync_tier(
+            conn,
+            season_id=season.id,
+            tier_id=tier_row.id,
+            seeds=seeds,
+            status="active",
+            actor_id=actor_id,
+        )
+    created = sum(1 for r in results if r.created)
+    return TierSyncReport(
+        tier_code=tier_row.code,
+        created=created,
+        already_registered=len(results) - created,
+    )
+
+
+async def sync_drivers_all_tiers(
+    *,
+    guild_id: int,
+    actor_id: int,
+    seeds_by_tier_code: dict[str, list[driver_ops.DriverSeed]],
+    skipped_by_tier_code: dict[str, str],
+) -> list[TierSyncReport]:
+    """
+    Sync every tier in the active season.
+
+    `seeds_by_tier_code` carries the members the caller resolved from
+    Discord for the tiers whose role is available; `skipped_by_tier_code`
+    carries the human-facing reason a tier could not be sync'd, so the
+    screen can render one row per tier either way.
+    """
+    reports: list[TierSyncReport] = []
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        tiers = await queries.fetch_all_tiers(conn, season.id)
+        for tier_row in tiers:
+            if tier_row.code in skipped_by_tier_code:
+                reports.append(
+                    TierSyncReport(
+                        tier_code=tier_row.code,
+                        created=0,
+                        already_registered=0,
+                        skipped_reason=skipped_by_tier_code[tier_row.code],
+                    )
+                )
+                continue
+            seeds = seeds_by_tier_code.get(tier_row.code, [])
+            results = await driver_ops.sync_tier(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                seeds=seeds,
+                status="active",
+                actor_id=actor_id,
+            )
+            created = sum(1 for r in results if r.created)
+            reports.append(
+                TierSyncReport(
+                    tier_code=tier_row.code,
+                    created=created,
+                    already_registered=len(results) - created,
+                )
+            )
+    return reports
 
 
 async def list_tier_choices(guild_id: int) -> list[tuple[str, str]]:
