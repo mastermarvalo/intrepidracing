@@ -25,7 +25,7 @@ ab25adc  Phase 6: race-results ingestion and normalization
 d5f4ece  Add docs/MARKET_GUIDE.md
 ```
 
-- **454 tests passing**, 26 test modules.
+- **460 tests passing**, 27 test modules.
 - **74 slash commands** across 7 groups.
 - **11 migrations** (005 is deliberately absent — see §5).
 - `ruff` clean, magic-number guard clean.
@@ -125,10 +125,10 @@ roster-bot/
       admin_market.py 1574  /market-admin (31)
       panel.py        738   /league + /help (2)
 
-  migrations/               001–011, forward-only
+  migrations/               001–012, forward-only
   scripts/check_magic_numbers.py  125  the ADR-001 CI guard
   docs/results_template.csv       race-results import template
-  tests/                          26 modules, 454 tests
+  tests/                          27 modules, 460 tests
 docs/
   ADR-001-f1-with-generic-future.md   BINDING architecture decision
   MARKET_GUIDE.md                     league-member walkthrough
@@ -245,6 +245,7 @@ runner already wraps each file in a transaction.
 | `009_trades_and_dead_money.sql` | `trade_states`, `trades`, `trade_items`, `dead_money` |
 | `010_race_results_and_normalization.sql` | `position_scores`, `results_config`, `race_rounds`, `race_results`; alters `valuation_runs` |
 | `011_min_contract_term.sql` | adds `league_config.min_term_seasons` + CHECK constraints |
+| `012_driver_registered_kind.sql` | seeds the `driver_registered` transaction kind for `/market-admin driver` enrolment |
 
 ### The `drivers` exception
 
