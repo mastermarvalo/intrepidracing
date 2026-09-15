@@ -82,7 +82,179 @@ uv run ruff check bot/
    - Manage Messages (to delete roster messages on `/roster remove`)
 4. Make sure the bot's role sits **above all team roles** in Server Settings → Roles, otherwise it won't be able to assign them
 
+## The control panel — start here
+
+Two commands cover everything an admin actually needs day to day:
+
+| Command | What it does |
+|---|---|
+| `/league` | Guided control panel: shows what's set up, what's missing, and the single next step. Buttons for Setup, Race Night, Approvals and Boards. |
+| `/help` | Browsable command reference, grouped by job. Built from the live command list, so it's never out of date. |
+
+`/league` opens on a status screen that answers the two questions admins
+actually have — *what state is my league in*, and *what do I do next*:
+
+```text
+🏁 League Control
+Active season: Season 7
+
+Tiers
+t1 · 20 driver(s) · last import: R14 Abu Dhabi · ⏳ run #38 unpublished
+t2 · 18 driver(s) · last import: R14 Abu Dhabi · no published market yet
+t3 · 16 driver(s) · no results imported
+
+⚠ Waiting on you
+3 contract offer(s) and 1 trade(s) awaiting approval.
+
+Next step
+Run #38 for t1 is priced but not published. Review and publish it → Race Night
+
+[ Setup ]  [ Race Night ]  [ Approvals (4) ]  [ Boards ]  [ All commands ]
+```
+
+### Setup
+
+**Setup** is a checklist that fills itself in. Each line is either ticked
+or is the next thing to do, and each button opens the dialog for it —
+no argument names, no channel or role ids to copy.
+
+```text
+⚙️ League setup
+✅ Season — Season 7 is active
+✅ Tiers — 3 configured (t1, t2, t3)
+⬜ Drivers — none yet, add them with /roster add
+
+Tiers
+t1 Tier 1 · 0 driver(s) · 🏷 role linked
+t2 Tier 2 · 0 driver(s)
+t3 Tier 3 · 0 driver(s)
+
+[ 📅 Season ]  [ 🧱 Tier ]  [ 💰 Cap & rules ]
+[ 🏷 Tier role ]  [ 🧑‍⚖️ Commissioner role ]  [ 📣 Channels ]
+[ 📊 Boards ]  [ ◀ Back to home ]
+```
+
+| Button | Replaces |
+|---|---|
+| Season | `season create` + `season activate` |
+| Tier | `tier add` |
+| Cap & rules | `config edit` |
+| Tier role | `tier edit role:` |
+| Commissioner role | `config role` |
+| Channels | `config channel` |
+| Boards | `board add` / `remove` / `refresh` / `list` |
+
+Buttons for steps that cannot work yet are greyed out — you can't add a
+tier before a season exists. Roles and channels use Discord's own
+pickers, so ids are never typed by hand. Choosing the **f1** preset when
+creating a season seeds three tiers, the scoring table, the valuation
+factors and the default **$145.00M** salary cap in one step.
+
+#### Cap & rules
+
+Discord allows five inputs per dialog and there are ten numeric league
+settings, so **Cap & rules** first asks which half you want:
+
+```
+💰 League rules
+Editing the season default. Pick a section to change.
+
+Money limits
+Salary cap $145.00M
+Salary floor $1.00M · ceiling none
+Weekly move cap ±$0.75M
+Exceptional move cap ±$1.25M
+
+Contract rules
+Contract length 1–3 seasons
+Active driver slots 2 per team
+Max incentives 15.0% of salary
+Offers expire after 48h
+
+[ 💰 Money limits ]  [ 📝 Contract rules ]  [ ◀ Back to setup ]
+```
+
+**Contract rules** is where you set how long Team Principals may sign
+drivers for. Both ends are editable:
+
+| Setting | Meaning |
+|---|---|
+| Min contract length | Shortest deal a TP may offer, in seasons |
+| Max contract length | Longest deal a TP may offer, in seasons |
+| Active driver slots | Seats per team per tier |
+| Max incentives | Performance bonus ceiling, as a % of salary |
+| Offer expiry | Hours before an unanswered offer lapses |
+
+Setting both bounds to the same number locks the league to a single
+contract length. An offer outside the range is rejected before it ever
+reaches the driver, with a message naming the league's own limit.
+
+Impossible ranges are refused at the point of editing rather than at
+offer time — a minimum above the maximum would make every offer illegal
+while looking like the TP's mistake. The database carries the same
+constraint, so no other code path can write one either.
+
+Both bounds can be set per tier as well as league-wide:
+`/market-admin config edit tier:t2` edits the Tier 2 override only. Tiers
+without an override inherit the season default.
+
+### Race Night
+
+**Race Night** is the weekly loop in the order it happens: pick a tier →
+paste the sheet URL in a popup → import → price → review the movers →
+publish. The panel remembers each tier's sheet URL for the rest of the
+session, so a three-tier race night means pasting three URLs once, not
+re-typing them at each step.
+
+### Approvals
+
+**Approvals** is a live queue, not a list of ids to go and type. Every
+pending offer and trade is listed oldest-first with its terms; pick one
+and approve or reject it in place. Rejecting prompts for an optional
+reason, which lands in the audit log.
+
+```text
+📋 Awaiting approval
+3 contract offer(s) and 1 trade(s) in Season 7.
+
+Contract offers
+17 · ZeezinDomar → McLaren (t1) · $22.00M/season × 2
+18 · DuelExploration → Aston Martin (t2) · $6.25M/season × 1
+
+Trades
+42 · Williams ⇄ Aston Martin · 2 contract(s)
+
+[ Pick an item to review… ▼ ]
+[ ◀ Back ]
+```
+
+Approving runs exactly the same code as `/market-admin approve`: the
+money commits inside the transaction, the team role is assigned after
+it, and a role failure is reported without undoing the contract.
+
+### Boards
+
+**Boards** lists every auto-updating market embed with its id, kind,
+tier and channel, and flags any that have no message yet — almost always
+missing **Send Messages** or **Embed Links** in that channel. Adding one
+is a three-step wizard (kind → tier → channel) that refuses the invalid
+combinations: tier boards must have a tier, the cross-tier dashboard
+must not.
+
+Everything the panel does is also still a slash command, and the panel
+calls the same code as the commands — nothing was removed or renamed.
+All 74 commands are still there. Setup, Approvals and Boards route
+through `bot/workflow.py` and `bot/approvals.py`, which the
+`/market-admin` commands now call too, so there is one code path per
+operation regardless of which route you take.
+The panel is a shortcut, not a replacement. Buttons are usable only by
+the person who opened the panel, and admin-only actions still check
+Manage Server.
+
 ## Commands
+
+Full reference below, or run `/help` in Discord for the same thing
+grouped by job.
 
 ### Admin commands (require Manage Server)
 
@@ -107,6 +279,8 @@ uv run ruff check bot/
 |---|---|
 | `/roster view <name>` | Show a team's current roster embed |
 | `/roster freeagents` | List members who have the Free Agent role and at least one Tier role |
+| `/league` | Guided control panel (admin actions inside it still require Manage Server) |
+| `/help` | Browsable command reference |
 
 ## Market & Contracts
 
@@ -123,6 +297,11 @@ phases.
 - **Phase 4** — contracts: offer → negotiate → approve cycle with cap
   enforcement, per-driver P/L, offer expiry, and an append-only ledger
   (`bot/contracts/{rules,service,render}.py`).
+- **Phase 6** — race-results ingestion and normalization: results
+  imported from a Google Sheet into `race_results`, normalized through
+  the season's `position_scores` curve
+  (`bot/market/results.py`, `bot/results_ingest.py`), then fed to the
+  Phase 2 engine. This is what makes the market actually move.
 - **Phase 5** — trades (1-for-1 contract swaps with two-party
   approval), release (frozen P/L in ledger), buyout (dead-money row
   that counts against the effective cap), extension (updates the
@@ -157,7 +336,7 @@ driver mathematically cannot influence a Tier-1 value.
 | `/market-admin tier edit <code> ...` | Edit an existing tier (labels, roles, colors) |
 | `/market-admin tier list` | List tiers for the active season |
 | `/market-admin config show [tier]` | Show league config (season default or tier override) |
-| `/market-admin config edit [tier]` | Modal to edit the five most-tuned numeric values |
+| `/market-admin config edit [tier]` | Edit money limits or contract rules (incl. min/max contract length) |
 | `/market-admin config channel <kind> <#channel> [tier]` | Set market / transactions / approvals channel |
 | `/market-admin config role <@role> [tier]` | Set the commissioner role |
 | `/market-admin config free-agency <open\|closed> [tier]` | Open or close the free-agency window |
@@ -171,9 +350,66 @@ driver mathematically cannot influence a Tier-1 value.
 | `/market-admin valuation publish <run_id>` | Flip a dry-run to published — makes it the live market value |
 | `/market-admin valuation list [tier]` | 20 most recent runs |
 
-Phase 2 runs use empty factor observations (all zeros) — the plumbing
-and audit trail are in place; ingest of real per-race performance data
-lands with the /market surfaces in a future phase.
+A run now prices the round whose `round_label` you pass, if results for
+that label have been imported (see **Race results** below). With no
+matching round the run falls back to empty observations and produces no
+movement — which is how you create a pre-season baseline.
+
+**Race results (Phase 6)**
+
+| Command | Description |
+|---|---|
+| `/market-admin results import <tier> <round_label> <sheet> [tab] [held_on]` | Import a round's results from a Google Sheet |
+| `/market-admin results list [tier]` | Imported rounds, per tier, in calendar order |
+| `/market-admin results show <tier> <round_label>` | Raw results plus the normalized observation each one produced |
+
+The sheet needs a header row. Column names are matched
+case-insensitively against a set of aliases, so `Pos`, `Position` and
+`Finishing Position` are all understood:
+
+| Column | Required | Accepts |
+|---|---|---|
+| `Driver` | yes | Must match the driver's Discord display name in that tier |
+| `Pos` | yes | `4`, `P4`, `4th`, or `DNF` / `Ret` / `DSQ` / `DNS`; blank means did not start |
+| `Grid` | no | Same formats; drives the qualifying and pole factors |
+| `DNF` | no | `Y` / `yes` / `true` / `1` / `x`. Overrides a recorded position |
+| `DNS` | no | Same truthy values |
+| `FL` | no | Fastest lap |
+| `DOTD` | no | Driver of the Day |
+| `Incidents` | no | Incident or penalty points, scaled against `results_config.max_incident_points` |
+| `Notes` | no | Free text, stored with the row |
+
+Imports are **all-or-nothing**. If any row has an unreadable position,
+a duplicated driver, two drivers in the same finishing position, or a
+name that does not match anyone in the tier, the command reports every
+problem and writes nothing. A partial import would mean a driver
+silently receives no market movement for the round, which is far harder
+to spot later than a failed command now.
+
+Re-importing the same `round_label` **corrects that round in place**
+rather than creating a second one — so a stewards' decision after
+publication is a one-command fix. Results are facts, not money, so
+correcting them is not a ledger event; re-run the valuation afterwards
+to reprice.
+
+Normalization turns raw facts into observations in `[0, 1]` before they
+reach the engine. This is not cosmetic:
+
+- Finishing position is looked up in `position_scores`, where P1 carries
+  the highest score. Fed raw against a positive weight, a P20 scored
+  twenty times a win.
+- Championship points are expressed as a share of the maximum award, so
+  a win and a midfield points finish stay distinguishable instead of
+  both clipping to the same per-factor cap.
+- `form_trend` and `consistency` are derived over the windows in
+  `results_config` from stored history, bounded by `round_order` so
+  re-running an earlier round reproduces exactly what it originally saw.
+- Pole + win + fastest lap in one round flags the drive as exceptional
+  and unlocks the wider `exceptional_move_cap`.
+
+The curve itself is data. Edit `position_scores` to reshape how steeply
+the league rewards the front of the field; nothing in
+`bot/market/results.py` hard-codes a threshold (ADR-001).
 
 **Boards (Phase 3)**
 
@@ -250,6 +486,12 @@ each side); the schema is multi-item ready.
 
 ### Quick start for a new league
 
+The short version: run `/league`, press **Setup**, and follow the next
+step it gives you. It walks the same sequence below and tells you which
+piece is missing at each stage.
+
+The equivalent commands, if you'd rather type them:
+
 ```text
 /market-admin season create name: "F1 2026 Season" preset: F1 25/26
 /market-admin season activate name: "F1 2026 Season"
@@ -257,7 +499,7 @@ each side); the schema is multi-item ready.
 /market-admin tier edit code: t2 label: "Tier 2" rank_order: 2 role: @Tier-2
 /market-admin tier edit code: t3 label: "Tier 3" rank_order: 3 role: @Tier-3
 /market-admin config show
-/market-admin config edit               # tune the numeric defaults
+/market-admin config edit               # cap, salaries, contract length bounds
 
 # First valuation snapshot per tier (baselines every driver at min_salary)
 /market-admin valuation run tier: t1 round_label: "Pre-season baseline"
@@ -268,6 +510,24 @@ each side); the schema is multi-item ready.
 /market-admin board add kind: Movers channel: #market tier: t1
 /market-admin board add kind: Cross-tier dashboard channel: #market
 ```
+
+### The weekly race-night loop
+
+```text
+/league  →  Race Night  →  pick tier  →  paste sheet URL  →  Publish
+```
+
+Or by command, per tier:
+
+```text
+/market-admin results import tier: t1 round_label: "R14 Abu Dhabi" sheet: <url>
+/market-admin valuation run tier: t1 round_label: "R14 Abu Dhabi"
+/market-admin valuation publish run_id: <printed above>
+```
+
+Both routes run identical code — the panel calls the same workflow
+functions the commands do, so a race night imported through the panel is
+indistinguishable from one imported by hand.
 
 ## Team setup flow
 
@@ -283,6 +543,97 @@ each side); the schema is multi-item ready.
 
 `/roster edit <name>` reopens the same flow pre-filled with existing values.
 
+## Google Sheets access
+
+Two features read Google Sheets: the `/sheets` stat boards and `/market-admin results import`.
+Neither works until the bot has credentials. Set up a **service account** — it is the only
+option that works with a private sheet, and your results sheet should be private.
+
+### 1. Create the service account
+
+1. Open the [Google Cloud console](https://console.cloud.google.com/) and create a project
+   (or reuse one).
+2. Enable the Google Sheets API:
+   **APIs & Services → Library → "Google Sheets API" → Enable**.
+3. **APIs & Services → Credentials → Create credentials → Service account**.
+   Give it a name like `roster-bot-sheets`. No project roles are needed — the account gets
+   its access from the sheet share in section 3 below, not from IAM.
+4. Open the new service account → **Keys → Add key → Create new key → JSON**. A `.json`
+   file downloads. This is a secret; treat it like the bot token.
+5. Copy the service account's email address from the **Details** tab. It looks like
+   `roster-bot-sheets@your-project.iam.gserviceaccount.com`.
+
+### 2. Point the bot at the key
+
+In `.env`, either give a path to the file:
+
+```bash
+GOOGLE_SERVICE_ACCOUNT_JSON=/path/to/service-account.json
+```
+
+or paste the whole JSON as a single line, which is easier on hosts that only offer
+environment-variable secrets:
+
+```bash
+GOOGLE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"...","private_key":"..."}
+```
+
+The bot accepts both and detects which it was given.
+
+> **Docker: a host path will not resolve inside the container.**
+> `docker-compose.yml` passes `.env` through with `env_file`, but the container has its own
+> filesystem. If you use the path form, uncomment the `volumes` block on the `roster-bot`
+> service to mount the key read-only, and set the variable to the **container** path:
+>
+> ```yaml
+> volumes:
+>   - ./service-account.json:/run/secrets/service-account.json:ro
+> ```
+> ```bash
+> GOOGLE_SERVICE_ACCOUNT_JSON=/run/secrets/service-account.json
+> ```
+>
+> Pasting the raw JSON instead avoids the mount entirely.
+
+Add the key file to `.gitignore` if you keep it in the repo directory.
+
+### 3. Share each sheet with the service account
+
+The service account is a separate Google identity. It cannot see anything until you share it in.
+
+Open the spreadsheet → **Share** → paste the service account email → **Viewer** → Send.
+Untick "Notify people"; the address cannot receive mail.
+
+Viewer is sufficient and correct. The bot only ever reads — results are pulled into Postgres
+and all valuation happens there, so nothing is written back.
+
+Repeat for every sheet the bot reads, including each tier's results sheet.
+
+### Alternative: API key
+
+```bash
+GOOGLE_SHEETS_API_KEY=AIza...
+```
+
+Simpler, but it only works on sheets published to anyone with the link. That means your
+results sheet is world-readable, and anyone who finds the URL can see it before you import.
+Acceptable for public stat boards, a poor fit for results. If both variables are set, the
+service account wins.
+
+### Verifying it works
+
+Run a `/sheets` board or a results import. Failures name the cause:
+
+| Message | Cause |
+|---|---|
+| `No Google Sheets credentials configured` | Neither variable is set, or the container never received `.env` |
+| `Access denied (403)` | The sheet is not shared with the service account email, or the API key is being used on a private sheet |
+| `Sheet or range not found (404)` | Bad spreadsheet ID, or a `tab` name that does not exist — check spelling and spaces |
+| `Network error fetching sheet` | Egress blocked, or the Sheets API is not enabled on the project |
+
+A 403 immediately after setup is almost always a missed section 3 — the key is valid, the
+sheet just was not shared with it.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -291,6 +642,8 @@ each side); the schema is multi-item ready.
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `DATABASE_URL` | `postgresql://roster:roster@postgres:5432/roster` (set by compose) | Postgres connection string |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `roster` | Postgres credentials (compose only) |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | *(unset)* | Path to the service account JSON key, **or** the raw JSON itself. Required for `/sheets` and `results import`. See [Google Sheets access](#google-sheets-access). |
+| `GOOGLE_SHEETS_API_KEY` | *(unset)* | Fallback for publicly shared sheets only. Ignored when a service account is set. |
 
 ## Architecture notes
 

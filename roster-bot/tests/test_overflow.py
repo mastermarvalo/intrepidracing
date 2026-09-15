@@ -30,9 +30,9 @@ def test_overflow_members_all_visible():
         member(12, TEAM_ROLE, DRIVER_ROLE),  # overflow
     ]
     value = driver_value(build_embed(team, members))
-    assert "<@10>" in value
-    assert "<@11>" in value
-    assert "<@12>" in value
+    assert "Member10" in value
+    assert "Member11" in value
+    assert "Member12" in value
 
 
 def test_overflow_members_flagged():
@@ -46,9 +46,9 @@ def test_overflow_members_flagged():
     # First line after the label is member 10 (within quota)
     lines = value.splitlines()
     label_idx = next(i for i, line in enumerate(lines) if "Slot" in line)
-    assert lines[label_idx + 1] == "<@10>"
+    assert lines[label_idx + 1] == "Member10"
     assert "overflow" in lines[label_idx + 2]
-    assert "<@11>" in lines[label_idx + 2]
+    assert "Member11" in lines[label_idx + 2]
 
 
 def test_no_open_spots_when_overflowing():
@@ -79,6 +79,6 @@ def test_single_overflow():
     value = driver_value(build_embed(team, members))
     lines = value.splitlines()
     label_idx = next(i for i, line in enumerate(lines) if "Slot" in line)
-    assert lines[label_idx + 1] == "<@10>"
-    assert lines[label_idx + 2] == "<@11>"
+    assert lines[label_idx + 1] == "Member10"
+    assert lines[label_idx + 2] == "Member11"
     assert "overflow" in lines[label_idx + 3]

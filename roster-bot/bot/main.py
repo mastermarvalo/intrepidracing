@@ -34,6 +34,9 @@ class RosterBot(commands.Bot):
         await self.load_extension("bot.cogs.market")
         await self.load_extension("bot.cogs.contracts")
         await self.load_extension("bot.cogs.trades")
+        # Loaded last so /help sees every other cog's commands when it
+        # walks the tree.
+        await self.load_extension("bot.cogs.panel")
         await self.load_extension("bot.events")
         # Global sync — commands appear in all servers but propagation takes up to 1h.
         # For faster dev iteration, call tree.sync(guild=discord.Object(id=YOUR_GUILD_ID)).

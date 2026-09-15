@@ -136,6 +136,56 @@ async def _get_request_kwargs() -> tuple[dict, dict] | None:
     return None
 
 
+class SheetsError(Exception):
+    """Raised by fetch_values when a sheet cannot be read."""
+
+
+async def fetch_values(sheet_id: str, sheet_range: str) -> list[list[str]]:
+    """
+    Fetch raw cell values from a sheet range.
+
+    Unlike fetch_and_build_embed (which never raises so a broken board
+    still renders something), this raises SheetsError with a
+    user-actionable message: a results import must fail loudly rather
+    than quietly importing nothing.
+    """
+    auth = await _get_request_kwargs()
+    if auth is None:
+        raise SheetsError(
+            "No Google Sheets credentials configured. Set "
+            "`GOOGLE_SERVICE_ACCOUNT_JSON` (path to service account JSON) "
+            "or `GOOGLE_SHEETS_API_KEY` in your `.env`."
+        )
+
+    headers, params = auth
+    url = _SHEETS_API.format(id=sheet_id, range=sheet_range)
+
+    try:
+        async with aiohttp.ClientSession(timeout=_TIMEOUT) as session:
+            async with session.get(url, headers=headers, params=params) as resp:
+                if resp.status == 403:
+                    raise SheetsError(
+                        f"Access denied (403) for sheet `{sheet_id}`. Share it "
+                        "with the service account email as Viewer, or make it "
+                        "publicly readable if you are using an API key."
+                    )
+                if resp.status == 404:
+                    raise SheetsError(
+                        f"Sheet or range not found (404): `{sheet_id}` / "
+                        f"`{sheet_range}`."
+                    )
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise SheetsError(
+                        f"Sheets API returned HTTP {resp.status}: {text[:200]}"
+                    )
+                data = await resp.json()
+    except aiohttp.ClientError as exc:
+        raise SheetsError(f"Network error fetching sheet: {exc}") from exc
+
+    return data.get("values", [])
+
+
 async def fetch_and_build_embed(
     title: str, sheet_id: str, sheet_range: str
 ) -> discord.Embed:

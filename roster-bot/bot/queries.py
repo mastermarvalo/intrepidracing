@@ -12,6 +12,7 @@ from typing import Any, Sequence
 
 import asyncpg
 
+from bot.market import results as results_engine
 from bot.models import (
     Contract,
     ContractOffer,
@@ -595,6 +596,7 @@ def _row_to_league_config(row: asyncpg.Record) -> LeagueConfig:
         active_driver_slots=row["active_driver_slots"],
         weekly_move_cap=row["weekly_move_cap"],
         exceptional_move_cap=row["exceptional_move_cap"],
+        min_term_seasons=row["min_term_seasons"],
         max_term_seasons=row["max_term_seasons"],
         max_incentive_pct=row["max_incentive_pct"],
         offer_ttl_hours=row["offer_ttl_hours"],
@@ -617,6 +619,7 @@ async def upsert_league_config(
     active_driver_slots: int,
     weekly_move_cap: Decimal,
     exceptional_move_cap: Decimal,
+    min_term_seasons: int,
     max_term_seasons: int,
     max_incentive_pct: Decimal,
     offer_ttl_hours: int,
@@ -638,27 +641,30 @@ async def upsert_league_config(
             INSERT INTO league_config (
                 season_id, tier_id, salary_cap, min_salary, max_salary,
                 active_driver_slots, weekly_move_cap, exceptional_move_cap,
-                max_term_seasons, max_incentive_pct, offer_ttl_hours
+                min_term_seasons, max_term_seasons, max_incentive_pct,
+                offer_ttl_hours
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id
             """,
             season_id, tier_id, salary_cap, min_salary, max_salary,
             active_driver_slots, weekly_move_cap, exceptional_move_cap,
-            max_term_seasons, max_incentive_pct, offer_ttl_hours,
+            min_term_seasons, max_term_seasons, max_incentive_pct,
+            offer_ttl_hours,
         )
     await conn.execute(
         """
         UPDATE league_config SET
             salary_cap = $1, min_salary = $2, max_salary = $3,
             active_driver_slots = $4, weekly_move_cap = $5,
-            exceptional_move_cap = $6, max_term_seasons = $7,
-            max_incentive_pct = $8, offer_ttl_hours = $9
-        WHERE id = $10
+            exceptional_move_cap = $6, min_term_seasons = $7,
+            max_term_seasons = $8, max_incentive_pct = $9,
+            offer_ttl_hours = $10
+        WHERE id = $11
         """,
         salary_cap, min_salary, max_salary, active_driver_slots,
-        weekly_move_cap, exceptional_move_cap, max_term_seasons,
-        max_incentive_pct, offer_ttl_hours, existing,
+        weekly_move_cap, exceptional_move_cap, min_term_seasons,
+        max_term_seasons, max_incentive_pct, offer_ttl_hours, existing,
     )
     return existing
 
@@ -1914,3 +1920,441 @@ async def fetch_team_effective_payroll(
     payroll = await fetch_team_payroll(conn, team_id)
     dead = await fetch_dead_money_total(conn, team_id, season_id)
     return payroll + dead
+
+
+# ── Race results & normalization (Phase 6) ──────────────────────────────
+
+
+def _row_to_position_score(row: asyncpg.Record) -> results_engine.PositionScore:
+    return results_engine.PositionScore(
+        position=row["position"],
+        race_score=row["race_score"],
+        quali_score=row["quali_score"],
+        points=row["points"],
+        is_win=row["is_win"],
+        is_podium=row["is_podium"],
+        is_pole=row["is_pole"],
+    )
+
+
+def _row_to_round_result(row: asyncpg.Record) -> results_engine.RoundResult:
+    return results_engine.RoundResult(
+        round_order=row["round_order"],
+        driver_id=row["driver_id"],
+        finish_position=row["finish_position"],
+        grid_position=row["grid_position"],
+        dnf=row["dnf"],
+        dns=row["dns"],
+        fastest_lap=row["fastest_lap"],
+        driver_of_day=row["driver_of_day"],
+        incident_points=row["incident_points"],
+    )
+
+
+async def fetch_position_scores(
+    conn: asyncpg.Connection, season_id: int
+) -> list[results_engine.PositionScore]:
+    """The season's normalization curve, ordered by position."""
+    rows = await conn.fetch(
+        "SELECT * FROM position_scores WHERE season_id = $1 ORDER BY position",
+        season_id,
+    )
+    return [_row_to_position_score(r) for r in rows]
+
+
+async def fetch_results_tuning(
+    conn: asyncpg.Connection, season_id: int, tier_id: int | None
+) -> results_engine.ResultsTuning | None:
+    """
+    Resolved results_config for (season, tier): the tier override if one
+    exists, otherwise the season default. Mirrors the league_config
+    resolution pattern.
+    """
+    row = None
+    if tier_id is not None:
+        row = await conn.fetchrow(
+            "SELECT * FROM results_config WHERE season_id = $1 AND tier_id = $2",
+            season_id,
+            tier_id,
+        )
+    if row is None:
+        row = await conn.fetchrow(
+            "SELECT * FROM results_config WHERE season_id = $1 AND tier_id IS NULL",
+            season_id,
+        )
+    if row is None:
+        return None
+    return results_engine.ResultsTuning(
+        form_window_rounds=row["form_window_rounds"],
+        consistency_window_rounds=row["consistency_window_rounds"],
+        max_incident_points=row["max_incident_points"],
+    )
+
+
+async def fetch_race_round(
+    conn: asyncpg.Connection, season_id: int, tier_id: int, round_label: str
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT * FROM race_rounds
+         WHERE season_id = $1 AND tier_id = $2 AND round_label = $3
+        """,
+        season_id,
+        tier_id,
+        round_label,
+    )
+
+
+async def fetch_race_round_by_id(
+    conn: asyncpg.Connection, round_id: int
+) -> asyncpg.Record | None:
+    return await conn.fetchrow("SELECT * FROM race_rounds WHERE id = $1", round_id)
+
+
+async def next_round_order(
+    conn: asyncpg.Connection, season_id: int, tier_id: int
+) -> int:
+    """
+    The next round_order for a tier. Rounds are ordered per tier because
+    tiers race their own calendars.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT COALESCE(MAX(round_order), 0) + 1 AS next
+          FROM race_rounds WHERE season_id = $1 AND tier_id = $2
+        """,
+        season_id,
+        tier_id,
+    )
+    return row["next"]
+
+
+async def upsert_race_round(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    round_label: str,
+    round_order: int | None = None,
+    held_on: Any = None,
+    imported_by: int | None = None,
+    source: str | None = None,
+) -> asyncpg.Record:
+    """
+    Create the round, or return the existing one for this label so a
+    re-import after a stewards' decision updates facts in place rather
+    than creating a duplicate round.
+    """
+    existing = await fetch_race_round(conn, season_id, tier_id, round_label)
+    if existing is not None:
+        await conn.execute(
+            """
+            UPDATE race_rounds
+               SET imported_at = NOW(), imported_by = $2, source = $3
+             WHERE id = $1
+            """,
+            existing["id"],
+            imported_by,
+            source,
+        )
+        return await fetch_race_round_by_id(conn, existing["id"])  # type: ignore[return-value]
+
+    order = (
+        round_order
+        if round_order is not None
+        else await next_round_order(conn, season_id, tier_id)
+    )
+    return await conn.fetchrow(
+        """
+        INSERT INTO race_rounds
+            (season_id, tier_id, round_label, round_order, held_on,
+             imported_by, source)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *
+        """,
+        season_id,
+        tier_id,
+        round_label,
+        order,
+        held_on,
+        imported_by,
+        source,
+    )
+
+
+async def upsert_race_results(
+    conn: asyncpg.Connection,
+    *,
+    round_id: int,
+    rows: Sequence[dict[str, Any]],
+) -> int:
+    """
+    Write one round's results. Re-importing the same round overwrites
+    each driver's facts — results are facts, not money, so correcting
+    them is not a ledger event.
+
+    Returns the number of rows written.
+    """
+    if not rows:
+        return 0
+    await conn.executemany(
+        """
+        INSERT INTO race_results
+            (round_id, driver_id, finish_position, grid_position, dnf, dns,
+             fastest_lap, driver_of_day, incident_points, note)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (round_id, driver_id) DO UPDATE SET
+            finish_position = EXCLUDED.finish_position,
+            grid_position   = EXCLUDED.grid_position,
+            dnf             = EXCLUDED.dnf,
+            dns             = EXCLUDED.dns,
+            fastest_lap     = EXCLUDED.fastest_lap,
+            driver_of_day   = EXCLUDED.driver_of_day,
+            incident_points = EXCLUDED.incident_points,
+            note            = EXCLUDED.note
+        """,
+        [
+            (
+                round_id,
+                r["driver_id"],
+                r.get("finish_position"),
+                r.get("grid_position"),
+                r.get("dnf", False),
+                r.get("dns", False),
+                r.get("fastest_lap", False),
+                r.get("driver_of_day", False),
+                r.get("incident_points", Decimal(0)),
+                r.get("note"),
+            )
+            for r in rows
+        ],
+    )
+    return len(rows)
+
+
+async def fetch_results_for_round(
+    conn: asyncpg.Connection, round_id: int
+) -> list[results_engine.RoundResult]:
+    rows = await conn.fetch(
+        """
+        SELECT rr.*, r.round_order
+          FROM race_results rr
+          JOIN race_rounds r ON r.id = rr.round_id
+         WHERE rr.round_id = $1
+         ORDER BY rr.driver_id
+        """,
+        round_id,
+    )
+    return [_row_to_round_result(r) for r in rows]
+
+
+async def fetch_results_history(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    through_round_order: int,
+) -> dict[int, list[results_engine.RoundResult]]:
+    """
+    Every result in this tier up to and including `through_round_order`,
+    grouped by driver and ordered oldest-first.
+
+    Bounded by round_order rather than "everything" so that re-running a
+    mid-season round reproduces exactly the form and consistency values
+    it originally saw — a later round must never leak backwards into an
+    earlier valuation.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT rr.*, r.round_order
+          FROM race_results rr
+          JOIN race_rounds r ON r.id = rr.round_id
+         WHERE r.season_id = $1 AND r.tier_id = $2 AND r.round_order <= $3
+         ORDER BY rr.driver_id, r.round_order
+        """,
+        season_id,
+        tier_id,
+        through_round_order,
+    )
+    grouped: dict[int, list[results_engine.RoundResult]] = {}
+    for row in rows:
+        grouped.setdefault(row["driver_id"], []).append(_row_to_round_result(row))
+    return grouped
+
+
+async def list_race_rounds(
+    conn: asyncpg.Connection, season_id: int, tier_id: int | None = None
+) -> list[asyncpg.Record]:
+    if tier_id is None:
+        return list(
+            await conn.fetch(
+                """
+                SELECT r.*, t.code AS tier_code,
+                       (SELECT COUNT(*) FROM race_results x WHERE x.round_id = r.id)
+                           AS result_count
+                  FROM race_rounds r
+                  JOIN tiers t ON t.id = r.tier_id
+                 WHERE r.season_id = $1
+                 ORDER BY t.rank_order, r.round_order
+                """,
+                season_id,
+            )
+        )
+    return list(
+        await conn.fetch(
+            """
+            SELECT r.*, t.code AS tier_code,
+                   (SELECT COUNT(*) FROM race_results x WHERE x.round_id = r.id)
+                       AS result_count
+              FROM race_rounds r
+              JOIN tiers t ON t.id = r.tier_id
+             WHERE r.season_id = $1 AND r.tier_id = $2
+             ORDER BY r.round_order
+            """,
+            season_id,
+            tier_id,
+        )
+    )
+
+
+async def set_valuation_run_round(
+    conn: asyncpg.Connection, run_id: int, round_id: int | None
+) -> None:
+    await conn.execute(
+        "UPDATE valuation_runs SET round_id = $2 WHERE id = $1", run_id, round_id
+    )
+
+
+# ── Guided-panel status reads ────────────────────────────────────────
+# Small aggregate reads backing the /league home panel. They exist here
+# rather than in the panel cog because the queries layer is the only
+# place SQL lives.
+
+
+async def fetch_latest_unpublished_run_id(
+    conn: asyncpg.Connection, season_id: int, tier_id: int
+) -> int | None:
+    """Most recent dry-run awaiting publication for a tier, if any."""
+    return await conn.fetchval(
+        """
+        SELECT id
+          FROM valuation_runs
+         WHERE season_id = $1
+           AND tier_id   = $2
+           AND published = FALSE
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        season_id,
+        tier_id,
+    )
+
+
+async def tier_has_published_valuation(conn: asyncpg.Connection, tier_id: int) -> bool:
+    """Whether a tier has ever published a run (i.e. has a live market)."""
+    return bool(
+        await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM valuation_runs
+                 WHERE tier_id = $1 AND published = TRUE
+            )
+            """,
+            tier_id,
+        )
+    )
+
+
+async def count_offers_awaiting_approval(conn: asyncpg.Connection, season_id: int) -> int:
+    """Contract offers sitting in the commissioner's queue."""
+    return (
+        await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM contract_offers
+             WHERE season_id = $1 AND state = 'pending_approval'
+            """,
+            season_id,
+        )
+        or 0
+    )
+
+
+async def count_trades_awaiting_approval(conn: asyncpg.Connection, season_id: int) -> int:
+    """Trades sitting in the commissioner's queue."""
+    return (
+        await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM trades
+             WHERE season_id = $1 AND state = 'pending_approval'
+            """,
+            season_id,
+        )
+        or 0
+    )
+
+
+# ── Approval queue listings (control panel) ──────────────────────────────
+#
+# The counts in `count_*_awaiting_approval` drive the panel's badge; these
+# two return enough detail to render an actionable queue, so a
+# commissioner never has to go hunt for ids.
+
+
+async def fetch_offers_awaiting_approval(
+    conn: asyncpg.Connection, season_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """
+    Offers in `pending_approval`, oldest first, with display names joined.
+
+    Oldest first because the queue is worked front to back — the offer
+    that has been waiting longest is the one holding up a signing.
+    """
+    return await conn.fetch(
+        """
+        SELECT o.id,
+               o.salary,
+               o.term_seasons,
+               o.contract_type,
+               o.signing_bonus,
+               o.offer_kind,
+               o.created_at,
+               d.display_name AS driver_name,
+               t.name         AS team_name,
+               ti.code        AS tier_code
+          FROM contract_offers o
+          JOIN drivers d ON d.id = o.driver_id
+          JOIN teams   t ON t.id = o.team_id
+          JOIN tiers  ti ON ti.id = o.tier_id
+         WHERE o.season_id = $1
+           AND o.state = 'pending_approval'
+         ORDER BY o.created_at ASC
+         LIMIT $2
+        """,
+        season_id,
+        limit,
+    )
+
+
+async def fetch_trades_awaiting_approval(
+    conn: asyncpg.Connection, season_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """Trades in `pending_approval`, oldest first, with team names and size."""
+    return await conn.fetch(
+        """
+        SELECT tr.id,
+               tr.created_at,
+               pt.name AS proposing_team_name,
+               ot.name AS other_team_name,
+               (SELECT COUNT(*) FROM trade_items i WHERE i.trade_id = tr.id)
+                   AS item_count
+          FROM trades tr
+          JOIN teams pt ON pt.id = tr.proposing_team_id
+          JOIN teams ot ON ot.id = tr.other_team_id
+         WHERE tr.season_id = $1
+           AND tr.state = 'pending_approval'
+         ORDER BY tr.created_at ASC
+         LIMIT $2
+        """,
+        season_id,
+        limit,
+    )

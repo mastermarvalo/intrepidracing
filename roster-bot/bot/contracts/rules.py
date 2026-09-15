@@ -64,7 +64,11 @@ class OfferInputs:
     has_linked_release: bool = False
 
     # ── term
+    # Both bounds come from league_config. The defaults describe the
+    # narrowest legal league (one-season contracts only) rather than an
+    # assumption about any particular one.
     term_seasons: int = 1
+    min_term_seasons: int = 1
     max_term_seasons: int = 1
 
     # ── window / mechanics
@@ -246,10 +250,25 @@ def seat_available(inputs: OfferInputs) -> RuleResult:
 
 
 def term_within_bounds(inputs: OfferInputs) -> RuleResult:
+    """
+    Both bounds are league config, not code.
+
+    The absolute floor of one season stays hardcoded because a zero- or
+    negative-season contract is not a league policy choice, it is a
+    nonsense value; the schema carries the same CHECK. Above that floor
+    the minimum is whatever the commissioner set.
+    """
     if inputs.term_seasons < 1:
         return _block(
             "term_too_short",
-            f"Term must be at least 1 season (got {inputs.term_seasons}).",
+            f"A contract must run for at least 1 season "
+            f"(got {inputs.term_seasons}).",
+        )
+    if inputs.term_seasons < inputs.min_term_seasons:
+        return _block(
+            "term_below_minimum",
+            f"Term of {inputs.term_seasons} season(s) is below the league "
+            f"minimum of {inputs.min_term_seasons}.",
         )
     if inputs.term_seasons > inputs.max_term_seasons:
         return _block(
@@ -355,6 +374,7 @@ def rule_codes() -> Sequence[str]:
         "cap_exceeded",
         "no_seat_available",
         "term_too_short",
+        "term_below_minimum",
         "term_too_long",
         "incentives_negative",
         "incentives_over_cap",

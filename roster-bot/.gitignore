@@ -13,3 +13,7 @@ db/
 .env.*
 !.env.example
 .pytest_cache/
+
+# Google Sheets service account key — secret, never commit
+service-account.json
+*-service-account.json
