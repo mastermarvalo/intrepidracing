@@ -12,6 +12,7 @@ import discord
 import pytest
 
 from bot import workflow
+from bot.cogs import panel
 from bot.cogs.panel import _next_step_text as next_step
 from bot.cogs.panel import build_status_embed
 from bot.ui.setup_screen import build_setup_embed
@@ -183,3 +184,103 @@ def test_setup_embed_within_limits_at_both_extremes():
         build_setup_embed(status(season=None, season_id=None, tiers=[], has_config=False))
     )
     _assert_within_limits(build_setup_embed(status()))
+
+
+# ── every screen is reachable from home ──────────────────────────────
+#
+# The consolidation work is only real if a league owner can get to each
+# screen by clicking. Five screens shipped fully built but unreachable
+# because nothing on the home panel opened them, which is the exact
+# failure these tests exist to prevent.
+
+
+# The twelve consolidated screens and the button label that opens each.
+# Setup, Race Night and All commands are the pre-existing three.
+ADMIN_SCREEN_LABELS = {
+    "Setup",
+    "Race Night",
+    "Drivers",
+    "Approvals",
+    "Boards",
+    "Money",
+    "Off-season",
+    "Market",
+    "Contracts",
+    "Trades",
+    "All commands",
+}
+
+# Non-admins get the three read/act desks plus help. They must NOT get
+# Setup, Money or Off-season: those rewrite league-wide state.
+MEMBER_SCREEN_LABELS = {"Market", "Contracts", "Trades", "All commands"}
+
+DISCORD_MAX_COMPONENTS_PER_VIEW = 25
+
+
+def _labels(view) -> set[str]:
+    return {
+        getattr(item, "label", "").split(" (")[0]
+        for item in view.children
+    }
+
+
+def test_an_admin_can_reach_every_screen_from_home():
+    view = panel.HomeView(status=status(), opener_id=1, is_admin=True)
+    missing = ADMIN_SCREEN_LABELS - _labels(view)
+    assert not missing, f"unreachable from home: {sorted(missing)}"
+
+
+def test_a_member_gets_the_desks_but_not_the_commissioners_books():
+    """
+    A Team Principal must be able to read the market and work their own
+    contracts without a commissioner. They must not be handed Setup,
+    Money or Off-season, which change the whole league.
+    """
+    view = panel.HomeView(status=status(), opener_id=1, is_admin=False)
+    labels = _labels(view)
+    assert MEMBER_SCREEN_LABELS <= labels
+    assert not ({"Setup", "Money", "Off-season"} & labels)
+
+
+def test_every_home_button_actually_opens_something():
+    """
+    A button with no callback is worse than a missing one: it looks like
+    the feature exists and then does nothing.
+    """
+    view = panel.HomeView(status=status(), opener_id=1, is_admin=True)
+    for item in view.children:
+        assert callable(getattr(item, "callback", None)), (
+            f"{getattr(item, 'label', item)} has no callback"
+        )
+
+
+def test_home_stays_inside_discords_component_limit():
+    """
+    Discord rejects a view with more than 25 components outright, so the
+    panel would fail to render at all rather than degrade.
+    """
+    view = panel.HomeView(status=status(), opener_id=1, is_admin=True)
+    assert len(view.children) <= DISCORD_MAX_COMPONENTS_PER_VIEW
+
+
+def test_the_desks_are_hidden_until_there_are_tiers():
+    """
+    Market, Contracts and Trades are all tier-scoped. Before any tier
+    exists they would open onto nothing, so Setup comes first.
+    """
+    view = panel.HomeView(
+        status=status(season_id=1, tiers=[]), opener_id=1, is_admin=True
+    )
+    labels = _labels(view)
+    assert not ({"Market", "Contracts", "Trades"} & labels)
+    assert "Setup" in labels
+
+
+def test_money_and_offseason_need_a_season():
+    """Both read season-scoped money; with no season there is nothing."""
+    view = panel.HomeView(
+        status=status(season=None, season_id=None, tiers=[]),
+        opener_id=1,
+        is_admin=True,
+    )
+    assert not ({"Money", "Off-season"} & _labels(view))

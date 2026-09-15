@@ -42,6 +42,7 @@ import discord
 from bot import db, queries
 from bot.models import Team, TeamSlot
 from bot.render import build_flair_embed, build_roster_embeds, roster_flair_file
+from bot.ui import base
 
 log = logging.getLogger(__name__)
 
@@ -342,7 +343,7 @@ class _EditMenuView(discord.ui.View):
 # ── step 1: text fields ───────────────────────────────────────────────────────
 
 
-class _Step1Modal(discord.ui.Modal, title="Team Setup (1/9)"):
+class _Step1Modal(base.PanelModal, title="Team Setup (1/9)"):
     team_name = discord.ui.TextInput(
         label="Display name", placeholder="Red Bull Racing", max_length=64
     )
@@ -388,7 +389,7 @@ class _Step1Modal(discord.ui.Modal, title="Team Setup (1/9)"):
             await _show_step2_color(interaction, self._state)
 
 
-class _RelinkStep1Modal(discord.ui.Modal, title="Team Relink — Setup"):
+class _RelinkStep1Modal(base.PanelModal, title="Team Relink — Setup"):
     """Step 1 for the relink flow. Same fields as create, plus the existing message URL."""
 
     team_name = discord.ui.TextInput(
@@ -526,7 +527,7 @@ class _Step2ColorView(discord.ui.View):
         _discard(self._state)
 
 
-class _CustomHexModal(discord.ui.Modal, title="Custom Team Color"):
+class _CustomHexModal(base.PanelModal, title="Custom Team Color"):
     hex_input = discord.ui.TextInput(
         label="Hex color code",
         placeholder="#FF0000 or FF0000",
@@ -783,7 +784,7 @@ class _BuilderView(discord.ui.View):
         _discard(self._state)
 
 
-class _SlotTextModal(discord.ui.Modal):
+class _SlotTextModal(base.PanelModal):
     label_input = discord.ui.TextInput(
         label="Slot label", placeholder="Tier 1 Drivers", max_length=64
     )
@@ -1013,7 +1014,7 @@ class _Step8InfoView(discord.ui.View):
         _discard(self._state)
 
 
-class _InfoBoxModal(discord.ui.Modal, title="Info Box"):
+class _InfoBoxModal(base.PanelModal, title="Info Box"):
     label_input = discord.ui.TextInput(
         label="Section label",
         placeholder="Accolades",

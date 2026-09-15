@@ -615,6 +615,11 @@ def _row_to_league_config(row: asyncpg.Record) -> LeagueConfig:
         transactions_channel_id=row["transactions_channel_id"],
         approvals_channel_id=row["approvals_channel_id"],
         commissioner_role_id=row["commissioner_role_id"],
+        races_per_season=row["races_per_season"],
+        min_term_races=row["min_term_races"],
+        max_term_races=row["max_term_races"],
+        resign_premium_pct=row["resign_premium_pct"],
+        length_premium_pct=row["length_premium_pct"],
     )
 
 
@@ -633,10 +638,22 @@ async def upsert_league_config(
     max_term_seasons: int,
     max_incentive_pct: Decimal,
     offer_ttl_hours: int,
+    races_per_season: int | None = None,
+    min_term_races: int | None = None,
+    max_term_races: int | None = None,
+    resign_premium_pct: Decimal | None = None,
+    length_premium_pct: Decimal | None = None,
 ) -> int:
     """
     Insert or replace the league_config row for (season_id, tier_id).
     A tier_id of None writes the season-default row.
+
+    The five Phase 9 fields are optional and None means "leave alone",
+    not "reset". Every pre-Phase-9 caller omits them, and those callers
+    edit other settings entirely — if omission wrote a default instead,
+    changing the salary cap would wipe a commissioner's tuned premiums
+    and term bounds as a side effect. On insert, omitted fields fall to
+    the schema defaults; on update they are simply not touched.
     """
     existing = await conn.fetchval(
         """
@@ -645,36 +662,61 @@ async def upsert_league_config(
         """,
         season_id, tier_id,
     )
+    optional = {
+        "races_per_season": races_per_season,
+        "min_term_races": min_term_races,
+        "max_term_races": max_term_races,
+        "resign_premium_pct": resign_premium_pct,
+        "length_premium_pct": length_premium_pct,
+    }
+    supplied = {k: v for k, v in optional.items() if v is not None}
+
     if existing is None:
-        return await conn.fetchval(
-            """
-            INSERT INTO league_config (
-                season_id, tier_id, salary_cap, min_salary, max_salary,
-                active_driver_slots, weekly_move_cap, exceptional_move_cap,
-                min_term_seasons, max_term_seasons, max_incentive_pct,
-                offer_ttl_hours
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            RETURNING id
-            """,
+        cols = [
+            "season_id", "tier_id", "salary_cap", "min_salary", "max_salary",
+            "active_driver_slots", "weekly_move_cap", "exceptional_move_cap",
+            "min_term_seasons", "max_term_seasons", "max_incentive_pct",
+            "offer_ttl_hours",
+        ]
+        vals = [
             season_id, tier_id, salary_cap, min_salary, max_salary,
             active_driver_slots, weekly_move_cap, exceptional_move_cap,
             min_term_seasons, max_term_seasons, max_incentive_pct,
             offer_ttl_hours,
+        ]
+        cols.extend(supplied.keys())
+        vals.extend(supplied.values())
+        placeholders = ", ".join(f"${i}" for i in range(1, len(vals) + 1))
+        return await conn.fetchval(
+            f"""
+            INSERT INTO league_config ({", ".join(cols)})
+            VALUES ({placeholders})
+            RETURNING id
+            """,
+            *vals,
         )
-    await conn.execute(
-        """
-        UPDATE league_config SET
-            salary_cap = $1, min_salary = $2, max_salary = $3,
-            active_driver_slots = $4, weekly_move_cap = $5,
-            exceptional_move_cap = $6, min_term_seasons = $7,
-            max_term_seasons = $8, max_incentive_pct = $9,
-            offer_ttl_hours = $10
-        WHERE id = $11
-        """,
+    sets = [
+        "salary_cap = $1", "min_salary = $2", "max_salary = $3",
+        "active_driver_slots = $4", "weekly_move_cap = $5",
+        "exceptional_move_cap = $6", "min_term_seasons = $7",
+        "max_term_seasons = $8", "max_incentive_pct = $9",
+        "offer_ttl_hours = $10",
+    ]
+    vals = [
         salary_cap, min_salary, max_salary, active_driver_slots,
         weekly_move_cap, exceptional_move_cap, min_term_seasons,
-        max_term_seasons, max_incentive_pct, offer_ttl_hours, existing,
+        max_term_seasons, max_incentive_pct, offer_ttl_hours,
+    ]
+    for col, val in supplied.items():
+        vals.append(val)
+        sets.append(f"{col} = ${len(vals)}")
+    vals.append(existing)
+    await conn.execute(
+        f"""
+        UPDATE league_config SET {", ".join(sets)}
+        WHERE id = ${len(vals)}
+        """,
+        *vals,
     )
     return existing
 
@@ -1047,8 +1089,13 @@ async def fetch_driver_valuation_history(
     """
     return await conn.fetch(
         """
+        -- D1: `rank_in_tier` is selected because `render_driver_card`
+        -- reads it off the newest row. It was omitted here, so
+        -- `/market driver` raised KeyError for every driver that had a
+        -- published valuation -- which is every driver in a live league.
         SELECT vr.round_label, vr.published_at, vr.created_at,
-               dv.market_value, dv.previous_value, dv.delta, dv.capped
+               dv.market_value, dv.previous_value, dv.delta, dv.capped,
+               dv.rank_in_tier
         FROM driver_valuations dv
         JOIN valuation_runs vr ON vr.id = dv.run_id
         WHERE dv.driver_id = $1 AND vr.published
@@ -1204,6 +1251,36 @@ def _row_to_contract(row: asyncpg.Record) -> Contract:
         season_index=row["season_index"],
         carried_from_contract_id=row["carried_from_contract_id"],
         origin_contract_id=row["origin_contract_id"],
+        term_races=row["term_races"],
+        races_served_before=row["races_served_before"],
+    )
+
+
+async def derive_term_races(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_id: int,
+    term_seasons: int,
+) -> int:
+    """
+    Convert a season-denominated term into races.
+
+    Mirrors the backfill in migration 015 exactly, including the
+    fallbacks: the tier's own calendar if it has one, else the season
+    default, else 24. Never returns less than 1, so a zero-season term
+    cannot produce a contract the CHECK constraint would reject.
+    """
+    return await conn.fetchval(
+        """
+        SELECT GREATEST(1, $3::int * COALESCE(
+            (SELECT lc.races_per_season FROM league_config lc
+              WHERE lc.season_id = $1 AND lc.tier_id = $2),
+            (SELECT lc.races_per_season FROM league_config lc
+              WHERE lc.season_id = $1 AND lc.tier_id IS NULL),
+            24))
+        """,
+        season_id, tier_id, term_seasons,
     )
 
 
@@ -1227,28 +1304,43 @@ async def insert_contract(
     carried_from_contract_id: int | None = None,
     origin_contract_id: int | None = None,
     signed_at: datetime | None = None,
+    term_races: int | None = None,
+    races_served_before: int = 0,
 ) -> int:
     """
     `signed_at` defaults to NOW() for an active row. Carry-over passes the
     original signing timestamp so a continuation row still says when the
     deal was actually agreed.
+
+    `term_races` is NOT NULL in the schema. A caller that still thinks in
+    seasons may omit it, and it is then derived as
+    `term_seasons × races_per_season` — deliberately the same conversion
+    migration 015 used to backfill existing contracts, so a deal signed
+    through an older code path and one backfilled by the migration end up
+    with identical terms.
     """
+    if term_races is None:
+        term_races = await derive_term_races(
+            conn, season_id=season_id, tier_id=tier_id, term_seasons=term_seasons,
+        )
     return await conn.fetchval(
         """
         INSERT INTO contracts
             (season_id, tier_id, driver_id, team_id, contract_value,
              signing_bonus, max_incentives, term_seasons, contract_type,
              state, value_at_signing, signed_at, approved_by, external_ref,
-             season_index, carried_from_contract_id, origin_contract_id)
+             season_index, carried_from_contract_id, origin_contract_id,
+             term_races, races_served_before)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                 COALESCE($14, CASE WHEN $10 = 'active' THEN NOW() ELSE NULL END),
-                $12, $13, $15, $16, $17)
+                $12, $13, $15, $16, $17, $18, $19)
         RETURNING id
         """,
         season_id, tier_id, driver_id, team_id, contract_value,
         signing_bonus, max_incentives, term_seasons, contract_type,
         state, value_at_signing, approved_by, external_ref,
         signed_at, season_index, carried_from_contract_id, origin_contract_id,
+        term_races, races_served_before,
     )
 
 
@@ -1265,6 +1357,52 @@ async def fetch_active_contracts_for_season(
         season_id,
     )
     return [_row_to_contract(r) for r in rows]
+
+
+async def fetch_active_contracts_for_tier(
+    conn: asyncpg.Connection, season_id: int, tier_id: int
+) -> list[Contract]:
+    """
+    Every active contract in one tier of a season, oldest first.
+
+    Tier-scoped because markets are tier-isolated (ADR-001) and race
+    night imports one tier at a time — charging a tier's results against
+    another tier's contracts would cross that boundary.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT * FROM contracts
+        WHERE season_id = $1 AND tier_id = $2 AND state = 'active'
+        ORDER BY team_id, id
+        """,
+        season_id, tier_id,
+    )
+    return [_row_to_contract(r) for r in rows]
+
+
+async def complete_contract(
+    conn: asyncpg.Connection, contract_id: int
+) -> bool:
+    """
+    Mark a contract `completed`: its term ran to the end.
+
+    Distinct from `terminated` on purpose. A completed contract was
+    honoured in full and its escrow settles at the unpro-rated P/L; a
+    terminated one was cut short. Collapsing them would lose the only
+    signal telling a team whether it saw a deal through.
+
+    Returns False when the row was not active, so a re-import cannot
+    complete the same contract twice.
+    """
+    result = await conn.execute(
+        """
+        UPDATE contracts
+        SET state = 'completed', voided_at = NOW()
+        WHERE id = $1 AND state = 'active'
+        """,
+        contract_id,
+    )
+    return result.endswith(" 1")
 
 
 async def fetch_contract_chain(
@@ -2519,6 +2657,7 @@ def _row_to_budget_config(row: asyncpg.Record) -> budget_engine.BudgetConfig:
         dnf_penalty=row["dnf_penalty"],
         dns_penalty=row["dns_penalty"],
         penalty_per_incident_pt=row["penalty_per_incident_pt"],
+        escrow_enabled=row["escrow_enabled"],
     )
 
 
@@ -2642,22 +2781,29 @@ async def insert_budget_entry(
     note: str | None = None,
     actor_id: int | None = None,
     is_correction: bool = False,
+    contract_id: int | None = None,
 ) -> int:
     """
     Append one signed budget row. The DB trigger enforces sign-by-kind
     unless `is_correction` — a correction reverses an earlier automatic
     charge and so legitimately points the other way.
+
+    `contract_id` is the provenance for the escrow kinds: it is what
+    lets a budget history explain a `salary_escrow` line as "race 7 of
+    Verstappen's deal" rather than an unexplained debit.
     """
     return await conn.fetchval(
         """
         INSERT INTO team_budget_ledger
             (season_id, team_id, kind, amount, race_result_id, round_id,
-             from_season_id, note, detail, actor_id, is_correction)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+             from_season_id, note, detail, actor_id, is_correction,
+             contract_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
         RETURNING id
         """,
         season_id, team_id, kind, amount, race_result_id, round_id,
         from_season_id, note, json.dumps(detail or {}), actor_id, is_correction,
+        contract_id,
     )
 
 
@@ -2811,3 +2957,322 @@ async def fetch_team_ids_with_budget_rows(
         season_id,
     )
     return [r["team_id"] for r in rows]
+
+
+# ── salary escrow (Phase 9) ──────────────────────────────────────────────────
+#
+# Escrow is the cash side of a contract: the per-season salary is taken
+# from the team's balance one race at a time and returned, adjusted by
+# the driver's P/L, when the term ends. These are the only queries that
+# touch the escrow tables; the operations that use them live in
+# `bot/market/escrow_ops.py` and the arithmetic in `bot/market/escrow.py`.
+
+
+async def remember_results_sheet(
+    conn: asyncpg.Connection,
+    *,
+    season_id: int,
+    tier_code: str,
+    sheet_url: str,
+    sheet_range: str,
+) -> None:
+    """
+    Store the spreadsheet a tier's results came from (migration 016).
+
+    Called after a successful import, never before: remembering a URL
+    that failed to import would prefill the next attempt with a known
+    bad value. Blank strings are ignored rather than written, because
+    the schema's CHECK rejects them and a failed remember must not fail
+    an import that already succeeded.
+
+    Keyed by tier code rather than id because the panel's status object
+    carries codes, and resolving here keeps one lookup in SQL instead of
+    an extra round trip on every panel open.
+
+    Requires a `results_config` row for the tier, which every seeded
+    season has; if one is somehow absent this is a no-op rather than an
+    error, since losing the convenience is not worth losing the import.
+    """
+    if not sheet_url.strip() or not sheet_range.strip():
+        return
+    # A seeded season has only the season-level default row, so a plain
+    # UPDATE on the tier row would match nothing and silently remember
+    # nothing. Insert the tier's own row on first use, copying the
+    # normalization windows from the season default so the new row does
+    # not change how results are scored -- it only carries the sheet.
+    await conn.execute(
+        """
+        INSERT INTO results_config
+            (season_id, tier_id, form_window_rounds,
+             consistency_window_rounds, max_incident_points,
+             sheet_url, sheet_range)
+        SELECT
+            $1,
+            t.id,
+            COALESCE(d.form_window_rounds, 0),
+            COALESCE(d.consistency_window_rounds, 0),
+            COALESCE(d.max_incident_points, 0),
+            $3,
+            $4
+        FROM tiers t
+        LEFT JOIN results_config d
+            ON d.season_id = $1 AND d.tier_id IS NULL
+        WHERE t.season_id = $1 AND t.code = $2
+        ON CONFLICT (season_id, tier_id) DO UPDATE
+        SET sheet_url = EXCLUDED.sheet_url,
+            sheet_range = EXCLUDED.sheet_range
+        """,
+        season_id, tier_code, sheet_url.strip(), sheet_range.strip(),
+    )
+
+
+async def fetch_remembered_results_sheet(
+    conn: asyncpg.Connection, *, season_id: int, tier_code: str
+) -> tuple[str | None, str | None]:
+    """
+    The last sheet and range this tier imported from, or (None, None).
+
+    Falls back to the season-level default row so a league that keeps
+    every tier on one spreadsheet only has to paste it once.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT sheet_url, sheet_range FROM results_config
+        WHERE season_id = $1
+          AND tier_id = (
+              SELECT id FROM tiers WHERE season_id = $1 AND code = $2
+          )
+        """,
+        season_id, tier_code,
+    )
+    if row is not None and row["sheet_url"]:
+        return row["sheet_url"], row["sheet_range"]
+    fallback = await conn.fetchrow(
+        """
+        SELECT sheet_url, sheet_range FROM results_config
+        WHERE season_id = $1 AND tier_id IS NULL
+        """,
+        season_id,
+    )
+    if fallback is not None and fallback["sheet_url"]:
+        return fallback["sheet_url"], fallback["sheet_range"]
+    return None, None
+
+
+async def repoint_contract_escrow(
+    conn: asyncpg.Connection, escrow_id: int, *, contract_id: int
+) -> bool:
+    """
+    Move a live holding onto a different contract row of the same chain.
+
+    Season carry-over closes one contract row and opens its successor,
+    but the escrow already paid in belongs to the same unfinished term.
+    Settling it at the season boundary would pay a team its P/L halfway
+    through a deal; opening a fresh zero holding would strand the money.
+    Repointing carries the balance across with no money movement at all,
+    so the term still settles exactly once, at its end.
+
+    Returns False when the holding was not live, so a re-run cannot move
+    an already-settled holding.
+    """
+    result = await conn.execute(
+        """
+        UPDATE contract_escrow
+        SET contract_id = $2
+        WHERE id = $1 AND state = 'held'
+        """,
+        escrow_id, contract_id,
+    )
+    return result.endswith(" 1")
+
+
+async def insert_contract_escrow(
+    conn: asyncpg.Connection,
+    *,
+    contract_id: int,
+    origin_contract_id: int,
+    season_id: int,
+    team_id: int,
+    races_served_at_open: int = 0,
+) -> int:
+    """
+    Open a holding at zero. It costs the team nothing until races are
+    run; `uq_contract_escrow_one_held` guarantees a contract row can
+    never have two live holdings, so a double-open raises rather than
+    quietly charging a team twice.
+
+    `races_served_at_open` is 0 for a signing and the contract's served
+    count for a holding opened by a trade, so the receiving team is
+    settled over its own races rather than the whole term.
+    """
+    return await conn.fetchval(
+        """
+        INSERT INTO contract_escrow
+            (contract_id, origin_contract_id, season_id, team_id,
+             races_served_at_open)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        contract_id, origin_contract_id, season_id, team_id,
+        races_served_at_open,
+    )
+
+
+async def fetch_held_escrow(
+    conn: asyncpg.Connection, contract_id: int
+) -> asyncpg.Record | None:
+    """The live holding for a contract row, or None if there is not one."""
+    return await conn.fetchrow(
+        """
+        SELECT * FROM contract_escrow
+        WHERE contract_id = $1 AND state = 'held'
+        """,
+        contract_id,
+    )
+
+
+async def add_escrow_held(
+    conn: asyncpg.Connection, escrow_id: int, amount: Decimal
+) -> Decimal:
+    """Add this race's share to a holding. Returns the new total held."""
+    return await conn.fetchval(
+        """
+        UPDATE contract_escrow
+           SET amount_held = amount_held + $2
+         WHERE id = $1
+        RETURNING amount_held
+        """,
+        escrow_id, amount,
+    )
+
+
+async def record_race_service(
+    conn: asyncpg.Connection,
+    *,
+    contract_id: int,
+    round_id: int,
+    team_id: int,
+    amount: Decimal,
+) -> int | None:
+    """
+    Count one race against a term. Returns the new row's id, or None if
+    this (contract, round) was already counted.
+
+    The None case is the whole reason this table exists: a round
+    re-imported after a stewards' decision must not advance the term a
+    second time or escrow the same race twice. Callers treat None as
+    "already served, change nothing".
+    """
+    return await conn.fetchval(
+        """
+        INSERT INTO contract_race_service
+            (contract_id, round_id, team_id, amount)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (contract_id, round_id) DO NOTHING
+        RETURNING id
+        """,
+        contract_id, round_id, team_id, amount,
+    )
+
+
+async def count_race_service(conn: asyncpg.Connection, contract_id: int) -> int:
+    """Races this contract ROW has served (not the whole chain)."""
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM contract_race_service WHERE contract_id = $1",
+        contract_id,
+    )
+
+
+async def mark_escrow_settled(conn: asyncpg.Connection, escrow_id: int) -> None:
+    """
+    Close a holding. Paired with `insert_escrow_settlement` inside one
+    transaction: the state change and the audit record must not be able
+    to exist without each other.
+    """
+    await conn.execute(
+        """
+        UPDATE contract_escrow
+           SET state = 'settled', settled_at = NOW()
+         WHERE id = $1
+        """,
+        escrow_id,
+    )
+
+
+async def insert_escrow_settlement(
+    conn: asyncpg.Connection,
+    *,
+    escrow_id: int,
+    contract_id: int,
+    origin_contract_id: int,
+    season_id: int,
+    team_id: int,
+    driver_id: int,
+    reason: str,
+    amount_returned: Decimal,
+    market_value: Decimal | None,
+    contract_value: Decimal,
+    pl: Decimal | None,
+    races_served: int,
+    term_races: int,
+    note: str | None = None,
+    actor_id: int | None = None,
+) -> int:
+    """
+    The narrative record of one settlement. Money moves in
+    `team_budget_ledger`; this explains it. `market_value` and `pl` are
+    NULL together when the driver never had a published valuation.
+    """
+    return await conn.fetchval(
+        """
+        INSERT INTO escrow_settlements
+            (escrow_id, contract_id, origin_contract_id, season_id, team_id,
+             driver_id, reason, amount_returned, market_value, contract_value,
+             pl, races_served, term_races, note, actor_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15)
+        RETURNING id
+        """,
+        escrow_id, contract_id, origin_contract_id, season_id, team_id,
+        driver_id, reason, amount_returned, market_value, contract_value,
+        pl, races_served, term_races, note, actor_id,
+    )
+
+
+async def fetch_escrow_settlements_for_team(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> list[asyncpg.Record]:
+    """Settled deals for a team's season, newest first, with driver names."""
+    return await conn.fetch(
+        """
+        SELECT es.*, d.display_name AS driver_name,
+               r.label AS reason_label
+          FROM escrow_settlements es
+          JOIN drivers d ON d.id = es.driver_id
+          JOIN escrow_settlement_reasons r ON r.code = es.reason
+         WHERE es.team_id = $1 AND es.season_id = $2
+         ORDER BY es.created_at DESC
+        """,
+        team_id, season_id,
+    )
+
+
+async def fetch_team_escrow_held(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> Decimal:
+    """
+    Total cash a team currently has locked in escrow this season.
+
+    This is the number that explains the gap between what a team has
+    earned and what it can spend, so every money surface should show it
+    alongside the balance rather than leaving the difference unexplained.
+    """
+    total = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount_held), 0)
+          FROM contract_escrow
+         WHERE team_id = $1 AND season_id = $2 AND state = 'held'
+        """,
+        team_id, season_id,
+    )
+    return Decimal(total)

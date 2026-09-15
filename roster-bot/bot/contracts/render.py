@@ -17,6 +17,7 @@ import discord
 
 from bot import limits
 from bot.contracts.rules import OfferValidation
+from bot.market.budget import available_to_spend
 from bot.market.money import format_money, format_pl
 
 _ZERO = Decimal(0)
@@ -236,6 +237,7 @@ def render_cap_sheet(
     dead_money: Decimal = Decimal("0"),
     dead_money_rows: Sequence[Mapping] = (),
     budget_balance: Decimal | None = None,
+    escrow_enabled: bool = False,
 ) -> discord.Embed:
     """
     /market team output. Two-line-per-driver layout with contract vs
@@ -269,14 +271,33 @@ def render_cap_sheet(
     if budget_balance is not None:
         # The budget is the team's own money; the cap is the league's
         # ceiling. Spending is bounded by whichever is smaller.
-        available = budget_balance - effective_payroll
+        #
+        # D7: this used to subtract payroll unconditionally. Under
+        # escrow, salary genuinely leaves the balance one race at a
+        # time, so subtracting payroll again charged every team twice
+        # and understated what they could actually spend -- teams were
+        # shown less headroom than the validator would have allowed.
+        # Deferring to `available_to_spend` keeps this display and the
+        # rule that gates signings reading from one definition.
+        available = available_to_spend(
+            budget_balance,
+            effective_payroll,
+            escrow_enabled=escrow_enabled,
+        )
+        budget_lines = [
+            f"Budget: {format_money(budget_balance)}",
+            f"Available to spend: {format_money(available)}",
+            f"Binding limit: {'budget' if available < cap_space else 'cap'}",
+        ]
+        if escrow_enabled:
+            budget_lines.append(
+                "Escrow is on: salary is charged per race, so this "
+                "figure is cash on hand and does not hold anything "
+                "back for the rest of the term."
+            )
         embed.add_field(
             name="Team budget",
-            value=_bound_lines([
-                f"Budget: {format_money(budget_balance)}",
-                f"Available to spend: {format_money(available)}",
-                f"Binding limit: {'budget' if available < cap_space else 'cap'}",
-            ]),
+            value=_bound_lines(budget_lines),
             inline=False,
         )
     if not contracts_with_market:

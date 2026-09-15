@@ -30,7 +30,7 @@ from decimal import Decimal
 import asyncpg
 
 from bot import queries
-from bot.market import budget_ops
+from bot.market import budget_ops, escrow_ops
 
 _ZERO = Decimal(0)
 
@@ -43,6 +43,10 @@ class TransitionError(Exception):
 class ApprovalResult:
     contract_id: int
     external_ref: str
+    # Phase 9. `escrow_id` is None when escrow is off for the season,
+    # which is every pre-migration-015 season and stays true for all of
+    # them — this is not an error and callers must not treat it as one.
+    escrow_id: int | None = None
 
 
 # ── open-state helpers ────────────────────────────────────────────────
@@ -456,7 +460,19 @@ async def _approve_new_signing(
         },
         actor_id=actor_id,
     )
-    return ApprovalResult(contract_id=contract_id, external_ref=external_ref)
+    # Open the escrow holding. Zero money moves here: salary is taken
+    # race by race as results land, not in a lump at signing, so a
+    # contract signed between rounds costs the team nothing until the
+    # next race is imported. Returns None when escrow is off.
+    contract = await queries.fetch_contract_by_id(conn, contract_id)
+    escrow_id = None
+    if contract is not None:
+        escrow_id = await escrow_ops.open_for_contract(
+            conn, contract=contract, tier_id=offer.tier_id, actor_id=actor_id,
+        )
+    return ApprovalResult(
+        contract_id=contract_id, external_ref=external_ref, escrow_id=escrow_id,
+    )
 
 
 async def _approve_extension(
@@ -549,7 +565,19 @@ async def void_contract(
     *,
     actor_id: int,
     note: str | None = None,
-) -> None:
+) -> escrow_ops.SettlementResult | None:
+    """
+    Void a contract and return its escrow in full.
+
+    Returns the settlement, or None when the contract held no escrow —
+    which is the case for every season signed before escrow was enabled.
+
+    A void is an administrative erasure: the contract is being treated as
+    something that should never have existed. So no P/L is applied, and
+    `market_value=None` is passed deliberately rather than omitted — the
+    team gets back exactly what it put in, no profit and no loss, however
+    the driver's value has moved since.
+    """
     contract = await queries.fetch_contract_by_id(conn, contract_id)
     if contract is None:
         raise TransitionError(f"No contract with id {contract_id}")
@@ -568,6 +596,14 @@ async def void_contract(
         detail={"note": note},
         actor_id=actor_id,
     )
+    return await escrow_ops.settle_holding(
+        conn,
+        contract=contract,
+        reason=escrow_ops.REASON_VOID,
+        actor_id=actor_id,
+        note=note,
+        market_value=None,
+    )
 
 
 # ── Phase 5: release / buyout / trades / promotion ──────────────────
@@ -580,11 +616,16 @@ async def release_contract(
     actor_id: int,
     market_value_at_release: Decimal | None,
     note: str | None = None,
-) -> None:
+) -> escrow_ops.SettlementResult | None:
     """
     End an active contract. `market_value_at_release` is captured in
     the ledger detail so the driver's frozen P/L (market − contract)
     is preserved even after future market moves.
+
+    Also settles the contract's escrow, returning the settlement or None
+    when there was none. An early release pro-rates the P/L by races
+    served, so letting a driver go after one race of a long deal does not
+    hand the team — or cost it — a whole term's worth of movement.
     """
     contract = await queries.fetch_contract_by_id(conn, contract_id)
     if contract is None:
@@ -626,6 +667,16 @@ async def release_contract(
         },
         actor_id=actor_id,
     )
+    # Reuse the value the caller already resolved rather than re-reading
+    # it, so the settlement and `pl_at_release` above can never disagree.
+    return await escrow_ops.settle_holding(
+        conn,
+        contract=contract,
+        reason=escrow_ops.REASON_RELEASE,
+        actor_id=actor_id,
+        note=note,
+        market_value=market_value_at_release,
+    )
 
 
 async def buyout_contract(
@@ -636,11 +687,16 @@ async def buyout_contract(
     buyout_amount: Decimal,
     market_value_at_release: Decimal | None,
     note: str | None = None,
-) -> None:
+) -> escrow_ops.SettlementResult | None:
     """
     Buy out a contract: release it AND leave a dead-money row on the
     team's books for the season. Cap enforcement counts dead_money
     via `queries.fetch_team_effective_payroll`.
+
+    The escrow settles too, and the two are independent: the escrow comes
+    back (adjusted for P/L over the races actually served) while the
+    buyout fee stays charged as dead money. A team buying out a deal
+    therefore recovers its unserved salary but still pays to get out.
     """
     contract = await queries.fetch_contract_by_id(conn, contract_id)
     if contract is None:
@@ -687,6 +743,14 @@ async def buyout_contract(
             ),
         },
         actor_id=actor_id,
+    )
+    return await escrow_ops.settle_holding(
+        conn,
+        contract=contract,
+        reason=escrow_ops.REASON_BUYOUT,
+        actor_id=actor_id,
+        note=note,
+        market_value=market_value_at_release,
     )
 
 
@@ -897,9 +961,32 @@ async def commissioner_approve_trade(
                 f"Contract {item.contract_id} is no longer active — trade "
                 "cannot be approved."
             )
+        # Hand the escrow over with the contract. The selling team is
+        # settled for the races it actually served — it gets its money
+        # back adjusted for how the driver moved on its watch — and the
+        # buying team opens a fresh holding that starts accruing from the
+        # next imported race. Settling BEFORE the transfer so the holding
+        # is closed against the team that owned it.
+        served_at_transfer = await escrow_ops.races_served(conn, contract)
+        await escrow_ops.settle_holding(
+            conn,
+            contract=contract,
+            reason=escrow_ops.REASON_TRADE,
+            actor_id=actor_id,
+            note=f"Traded to team {new_team_id} (trade {trade_id})",
+        )
         await queries.transfer_contract(
             conn, item.contract_id, new_team_id=new_team_id,
         )
+        moved = await queries.fetch_contract_by_id(conn, item.contract_id)
+        if moved is not None:
+            await escrow_ops.open_for_contract(
+                conn,
+                contract=moved,
+                tier_id=contract.tier_id,
+                actor_id=actor_id,
+                races_served_at_open=served_at_transfer,
+            )
         await queries.append_ledger(
             conn,
             season_id=trade.season_id, tier_id=contract.tier_id,

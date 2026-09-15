@@ -427,8 +427,12 @@ async def test_budget_rollover_is_order_independent(pg_conn_migrated):
         conn, from_season_id=ctx["s7"], to_season_id=ctx["s8"], teams=teams, actor_id=1,
     )
     first = {ln.team_id: ln.carried for ln in lines}
-    assert first[ctx["team_a"]] == Decimal("145") + Decimal("15") - Decimal("32")
-    assert first[ctx["team_b"]] == Decimal("145") + Decimal("3") - Decimal("8")
+    # No payroll term: S7 seeds escrow ON, so salary already left the
+    # balance race by race and the whole balance carries. Order
+    # independence — the actual point of this test — is unaffected either
+    # way, because neither ordering changes what the source season holds.
+    assert first[ctx["team_a"]] == Decimal("145") + Decimal("15")
+    assert first[ctx["team_b"]] == Decimal("145") + Decimal("3")
 
     # Order 2: contracts first, then budget — into a fresh target season.
     s8b = await _season(conn, "S8b", active=False)
@@ -456,3 +460,133 @@ async def test_extension_resets_season_index(pg_conn_migrated):
     )
     carried_ids = {ln.contract_id for ln in outcome.lines if ln.outcome == "carried"}
     assert ctx["c_mid"] in carried_ids
+
+
+# ── Phase 9: race-based terms and escrow across the boundary ─────────
+
+
+async def test_carry_over_preserves_race_service_instead_of_restarting_it(
+    pg_conn_migrated,
+):
+    """
+    The bug this guards: carry-over used to omit `term_races`, so
+    `insert_contract` derived a fresh one and a driver with four races
+    left arrived in the new season owing a full 24 again — an unpayable
+    term the team never agreed to.
+
+    A 36-race deal that has run 24 races must arrive owing 12: the term
+    stays 36 and the 24 already run come across as service.
+    """
+    conn = pg_conn_migrated
+    old_season = await _season(conn, "S8", active=True)
+    new_season = await _season(conn, "S9", active=False)
+    old_tier = await _tier(conn, old_season)
+    new_tier = await _tier(conn, new_season)
+    team = await _team(conn, "wil", 900)
+    driver = await queries.insert_driver(
+        conn, old_season, old_tier, member_id=555, display_name="Carried",
+        status="active",
+    )
+    contract_id = await _sign(
+        conn, season_id=old_season, tier_id=old_tier, driver_id=driver,
+        team_id=team, value="24.00", term=2,
+        term_races=36, races_served_before=24,
+    )
+    await queries.insert_driver(
+        conn, new_season, new_tier, member_id=555, display_name="Carried",
+        status="active",
+    )
+
+    outcome = await carryover.carry_over(
+        conn, from_season_id=old_season, to_season_id=new_season, actor_id=5,
+    )
+
+    assert outcome.carried
+    new_row = await queries.fetch_active_contract_for_driver(
+        conn,
+        await conn.fetchval(
+            "SELECT id FROM drivers WHERE season_id = $1 AND member_id = 555",
+            new_season,
+        ),
+    )
+    assert new_row is not None
+    assert new_row.id != contract_id
+    # Term unchanged, service inherited: 36 - 24 = 12 races still owed.
+    assert new_row.term_races == 36
+    assert new_row.races_served_before == 24
+    from bot.market import escrow as escrow_engine
+    assert escrow_engine.races_remaining(
+        term_races=new_row.term_races, races_served=new_row.races_served_before
+    ) == 12
+
+
+async def test_carry_over_moves_the_escrow_without_moving_money(
+    pg_conn_migrated,
+):
+    """
+    An unfinished term must not settle at the season boundary. The
+    holding follows the contract to its new row with its balance intact,
+    and the team's cash does not change — otherwise a team would collect
+    its P/L halfway through a deal, or lose the escrow entirely because
+    it was stranded on a closed row.
+    """
+    conn = pg_conn_migrated
+    from bot.market import escrow_ops
+
+    old_season = await _season(conn, "S8", active=True)
+    new_season = await _season(conn, "S9", active=False)
+    old_tier = await _tier(conn, old_season)
+    new_tier = await _tier(conn, new_season)
+    team = await _team(conn, "wil", 910)
+    driver = await queries.insert_driver(
+        conn, old_season, old_tier, member_id=556, display_name="Held",
+        status="active",
+    )
+    contract_id = await _sign(
+        conn, season_id=old_season, tier_id=old_tier, driver_id=driver,
+        team_id=team, value="24.00", term=2,
+        term_races=36, races_served_before=0,
+    )
+    contract = await queries.fetch_contract_by_id(conn, contract_id)
+    await escrow_ops.open_for_contract(
+        conn, contract=contract, tier_id=old_tier, actor_id=5,
+    )
+    # Run two races so there is a real balance to carry.
+    for order in (1, 2):
+        round_id = await conn.fetchval(
+            "INSERT INTO race_rounds "
+            "(season_id, tier_id, round_label, round_order) "
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            old_season, old_tier, f"R{order}", order,
+        )
+        await escrow_ops.charge_round_for_tier(
+            conn, season_id=old_season, tier_id=old_tier, round_id=round_id,
+            races_per_season=24, actor_id=5,
+        )
+    held_before = await queries.fetch_held_escrow(conn, contract_id)
+    assert Decimal(held_before["amount_held"]) == Decimal("2.00")
+    cash_before = await queries.fetch_budget_balance(conn, team, old_season)
+
+    await queries.insert_driver(
+        conn, new_season, new_tier, member_id=556, display_name="Held",
+        status="active",
+    )
+    await carryover.carry_over(
+        conn, from_season_id=old_season, to_season_id=new_season, actor_id=5,
+    )
+
+    # Old row has no live holding; the new row has the same one, same money.
+    assert await queries.fetch_held_escrow(conn, contract_id) is None
+    new_driver = await conn.fetchval(
+        "SELECT id FROM drivers WHERE season_id = $1 AND member_id = 556",
+        new_season,
+    )
+    new_row = await queries.fetch_active_contract_for_driver(conn, new_driver)
+    held_after = await queries.fetch_held_escrow(conn, new_row.id)
+    assert held_after is not None
+    assert held_after["id"] == held_before["id"]
+    assert Decimal(held_after["amount_held"]) == Decimal("2.00")
+    # No settlement, so no cash movement in the old season.
+    assert await queries.fetch_budget_balance(
+        conn, team, old_season
+    ) == cash_before

@@ -47,7 +47,7 @@ from decimal import Decimal
 import asyncpg
 
 from bot import queries
-from bot.market import driver_ops
+from bot.market import driver_ops, escrow_ops
 from bot.models import Contract
 
 STATE_ACTIVE = "active"
@@ -266,6 +266,19 @@ async def _carry(
         )
 
     origin_id = contract.origin_contract_id or contract.id
+
+    # Race-based terms carry the SERVICE, not a fresh term. The new row
+    # keeps the original `term_races` and inherits everything the chain
+    # has already run as `races_served_before`, so a 36-race deal signed
+    # in a 24-race season arrives owing 12 races rather than another 36.
+    #
+    # Deliberately not `escrow.carried_term_races` (shortening the term
+    # instead): `settle` pro-rates an early exit by
+    # races_served / term_races, and a shortened term would make the new
+    # season's remainder look like a whole deal, over-crediting anyone
+    # who released the driver early.
+    served_so_far = await escrow_ops.races_served(conn, contract)
+
     new_id = await queries.insert_contract(
         conn,
         season_id=to_season_id, tier_id=target_tier.id,
@@ -274,6 +287,8 @@ async def _carry(
         signing_bonus=Decimal("0"),
         max_incentives=contract.max_incentives,
         term_seasons=contract.term_seasons,
+        term_races=contract.term_races,
+        races_served_before=served_so_far,
         contract_type=contract.contract_type,
         state=STATE_ACTIVE,
         value_at_signing=contract.value_at_signing,
@@ -290,6 +305,15 @@ async def _carry(
     if not closed:  # pragma: no cover - fetch was 'active' moments ago
         raise CarryOverError(f"contract {contract.id} changed state mid-run")
 
+    # Carry the escrow across the row boundary without moving money. The
+    # term is unfinished, so it must not settle here, and the balance
+    # must not be stranded on the closed row.
+    held = await queries.fetch_held_escrow(conn, contract.id)
+    if held is not None:
+        await queries.repoint_contract_escrow(
+            conn, held["id"], contract_id=new_id
+        )
+
     detail = {
         "origin_contract_id": origin_id,
         "from_contract_id": contract.id,
@@ -298,6 +322,9 @@ async def _carry(
         "to_season_id": to_season_id,
         "season_index": contract.season_index + 1,
         "term_seasons": contract.term_seasons,
+        "term_races": contract.term_races,
+        "races_served_before": served_so_far,
+        "escrow_carried": held is not None,
         "tier_changed": target_tier.code != tier_code,
     }
     await queries.append_ledger(

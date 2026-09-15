@@ -71,6 +71,12 @@ class BudgetConfig:
     penalty_per_incident_pt: Decimal
     tier_id: int | None = None
     id: int | None = None
+    # Whether salary is actually taken from cash race by race. DEFAULT
+    # TRUE in the DB and here: escrow only engages at signings that
+    # happen after migration 015, so an existing roster is untouched
+    # either way, and defaulting on means the feature works without a
+    # config trip first. Set FALSE to keep the commitment-only model.
+    escrow_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -189,21 +195,54 @@ def charges_for_round(
     return charges, unattributed
 
 
-def available_to_spend(balance: Decimal, effective_payroll: Decimal) -> Decimal:
+def available_to_spend(
+    balance: Decimal,
+    effective_payroll: Decimal,
+    *,
+    escrow_enabled: bool = False,
+) -> Decimal:
     """
     Budget headroom: what a team can still commit this season.
 
-    Payroll is not debited from the ledger — contracts are already the
-    source of truth for what is committed, and duplicating them into the
-    budget ledger would risk drift. Instead the balance is compared
-    against payroll, exactly as the cap is. This can go negative after a
-    penalty lands on a team that had already spent to its limit; that
-    team is then frozen out of signings until it earns its way back.
+    **Without escrow** payroll is not debited from the ledger — contracts
+    are already the source of truth for what is committed, and
+    duplicating them into the budget ledger would risk drift. Instead the
+    balance is compared against payroll, exactly as the cap is. This can
+    go negative after a penalty lands on a team that had already spent to
+    its limit; that team is then frozen out of signings until it earns
+    its way back.
+
+    **With escrow** salary genuinely leaves the balance, one race at a
+    time, so subtracting payroll as well would charge every team twice —
+    once in cash and once again as a phantom commitment. Cash becomes the
+    single source of truth and the balance is returned as it stands.
+
+    A consequence worth stating plainly, because it is a real change in
+    exposure: under escrow this figure no longer reserves anything for
+    the *unescrowed* remainder of a term. A team can commit to a payroll
+    it will not be able to fund later in the season and only discover it
+    when a race-night charge takes the balance negative. The cap still
+    limits total annual commitment, which is the backstop, but it is a
+    commitment gate and not a solvency test. Reserving the remaining
+    term would be the stricter rule; it is deliberately not implemented
+    here, and is the first thing to revisit if teams start running dry
+    mid-season.
+
+    `escrow_enabled` defaults to False so any caller that has not
+    resolved the budget config keeps the pre-escrow behaviour rather than
+    silently loosening the check.
     """
+    if escrow_enabled:
+        return round_money(balance)
     return round_money(balance - effective_payroll)
 
 
-def rollover_amount(balance: Decimal, effective_payroll: Decimal) -> Decimal:
+def rollover_amount(
+    balance: Decimal,
+    effective_payroll: Decimal,
+    *,
+    escrow_enabled: bool = False,
+) -> Decimal:
     """
     What carries into the next season: the unspent portion of the budget.
 
@@ -211,8 +250,15 @@ def rollover_amount(balance: Decimal, effective_payroll: Decimal) -> Decimal:
     can never disagree about what "unspent" means. A negative headroom
     rolls over as debt — a team that finished the season underwater
     starts the next one paying it off.
+
+    Under escrow this is the balance itself: salary has already been
+    taken race by race, so there is no payroll left to net off. Carrying
+    `balance - payroll` in that mode would deduct a season of salary a
+    second time on the way into the new season.
     """
-    return available_to_spend(balance, effective_payroll)
+    return available_to_spend(
+        balance, effective_payroll, escrow_enabled=escrow_enabled
+    )
 
 
 # ── internals ────────────────────────────────────────────────────────────

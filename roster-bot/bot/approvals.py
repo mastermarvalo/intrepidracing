@@ -40,6 +40,47 @@ log = logging.getLogger(__name__)
 # select options; the queue uses one option per item plus none reserved.
 QUEUE_PAGE_SIZE = 25
 
+# Warning text for the three ways an approval can succeed on the money
+# side while a Discord-side or snapshot-side step silently does not
+# happen. Kept as module constants so the panel, the cogs and the tests
+# all assert against one wording.
+NO_VALUATION_WARNING = (
+    "no published market value for {driver} — `value_at_signing` is empty, so "
+    "P/L can never be tracked for this contract (the snapshot cannot be "
+    "recovered later). Run a valuation for {tier} and publish it before "
+    "approving the next signing."
+)
+MEMBER_MISSING_ROLE_WARNING = (
+    "driver not found in the server — team role NOT assigned, so the roster "
+    "now disagrees with the contract. Assign the role by hand or re-run "
+    "`/roster sign` once the member is back in the guild."
+)
+TEAM_MISSING_ROLE_WARNING = (
+    "team record for this contract is missing — team role NOT assigned, so "
+    "the roster now disagrees with the contract. Fix the team, then assign "
+    "the role with `/roster sign`."
+)
+NO_TRANSACTIONS_CHANNEL_WARNING = (
+    "no transactions channel set — nothing was announced, and there is no "
+    "backfill, so this signing has no public record. Set it in "
+    "Setup → Channels."
+)
+MISSING_ANNOUNCE_CONTEXT_WARNING = (
+    "team or tier record missing — nothing was announced, and there is no "
+    "backfill, so this signing has no public record."
+)
+CHANNEL_UNREACHABLE_WARNING = (
+    "transactions channel {channel_id} is not a reachable text channel — "
+    "nothing was announced, and there is no backfill. Re-pick it in "
+    "Setup → Channels."
+)
+FORBIDDEN_ANNOUNCE_WARNING = (
+    "no permission to post in the transactions channel — nothing was "
+    "announced, and there is no backfill, so this signing has no public "
+    "record. Grant Send Messages there or re-pick the channel in "
+    "Setup → Channels."
+)
+
 
 class ApprovalError(Exception):
     """Raised with text meant to be shown directly to the actor."""
@@ -47,10 +88,50 @@ class ApprovalError(Exception):
 
 @dataclass(frozen=True)
 class OfferApprovalResult:
+    """
+    Outcome of an offer approval.
+
+    The money side is authoritative and already committed by the time
+    this is built, so everything that could silently *not* happen after
+    it is reported here as a warning rather than raised. Fields are only
+    ever added, never removed or renamed: `bot/ui/approvals_screen.py`
+    and `bot/cogs/admin_market.py` read them.
+
+    Warning fields:
+      role_warning        the Discord team role was NOT assigned
+      valuation_warning   no published market value existed, so
+                          `value_at_signing` is NULL for ever (G11)
+      announcement_warning  no public signing post was made (G26)
+
+    `warnings` is the ordered list of whichever of those are set, for
+    callers that just want to print everything.
+    """
+
     offer_id: int
     contract_id: int
     external_ref: str
     role_warning: str | None = None
+    valuation_warning: str | None = None
+    announcement_warning: str | None = None
+    value_at_signing: Decimal | None = None
+    announced: bool = False
+
+    @property
+    def warnings(self) -> list[str]:
+        """Every warning that fired, in reporting order."""
+        return [
+            text
+            for text in (
+                self.valuation_warning,
+                self.role_warning,
+                self.announcement_warning,
+            )
+            if text
+        ]
+
+    @property
+    def has_warnings(self) -> bool:
+        return bool(self.warnings)
 
 
 @dataclass(frozen=True)
@@ -193,7 +274,23 @@ async def approve_offer(
     # /roster sign, per CLAUDE.md §8 invariant).
     member = guild.get_member(driver_row["member_id"])
     role_warning: str | None = None
-    if member is not None and team is not None:
+    if member is None:
+        # G12: the trade path has always warned for this; the offer path
+        # used to fall through the `if` and report plain success.
+        role_warning = MEMBER_MISSING_ROLE_WARNING
+        log.warning(
+            "Contract %s approved but member %s is not in guild %s — "
+            "team role not assigned",
+            approval.external_ref, driver_row["member_id"], guild.id,
+        )
+    elif team is None:
+        role_warning = TEAM_MISSING_ROLE_WARNING
+        log.warning(
+            "Contract %s approved but its team row is missing — team role "
+            "not assigned",
+            approval.external_ref,
+        )
+    else:
         try:
             await roster_ops.sign_to_team(
                 guild=guild,
@@ -205,10 +302,31 @@ async def approve_offer(
         except roster_ops.RoleAssignmentError as exc:
             role_warning = str(exc)
 
-    # Public signed post to the transactions channel.
-    if guild_config.transactions_channel_id and team is not None and tier is not None:
+    # G11: value_at_signing is a snapshot. If the driver had no published
+    # valuation there is nothing to compare the contract against, now or
+    # ever — the number cannot be reconstructed after the fact.
+    valuation_warning: str | None = None
+    if contract.value_at_signing is None:
+        valuation_warning = NO_VALUATION_WARNING.format(
+            driver=driver_row["display_name"],
+            tier=tier.label if tier is not None else "this tier",
+        )
+
+    # Public signed post to the transactions channel. G26: every branch
+    # that skips the post has to say so — there is no backfill.
+    announcement_warning: str | None = None
+    announced = False
+    if not guild_config.transactions_channel_id:
+        announcement_warning = NO_TRANSACTIONS_CHANNEL_WARNING
+    elif team is None or tier is None:
+        announcement_warning = MISSING_ANNOUNCE_CONTEXT_WARNING
+    else:
         channel = client.get_channel(guild_config.transactions_channel_id)
-        if isinstance(channel, discord.TextChannel):
+        if not isinstance(channel, discord.TextChannel):
+            announcement_warning = CHANNEL_UNREACHABLE_WARNING.format(
+                channel_id=guild_config.transactions_channel_id
+            )
+        else:
             try:
                 await channel.send(
                     embed=contract_render.render_signed_contract_post(
@@ -224,17 +342,29 @@ async def approve_offer(
                         approved_by_mention=actor.mention,
                     )
                 )
+                announced = True
             except discord.Forbidden:
                 log.warning(
                     "No permission to post signed-contract to channel %s",
                     guild_config.transactions_channel_id,
                 )
+                announcement_warning = FORBIDDEN_ANNOUNCE_WARNING
+
+    if announcement_warning is not None:
+        log.warning(
+            "Contract %s approved but not announced: %s",
+            approval.external_ref, announcement_warning,
+        )
 
     return OfferApprovalResult(
         offer_id=offer_id,
         contract_id=approval.contract_id,
         external_ref=approval.external_ref,
         role_warning=role_warning,
+        valuation_warning=valuation_warning,
+        announcement_warning=announcement_warning,
+        value_at_signing=contract.value_at_signing,
+        announced=announced,
     )
 
 

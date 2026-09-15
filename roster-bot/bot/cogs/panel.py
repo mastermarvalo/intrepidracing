@@ -1,12 +1,19 @@
 """
 `/league` — the guided front door.
 
-The bot has 62 slash commands. That is the right number of commands for
+The bot has 84 slash commands. That is the right number of commands for
 what it does, but it is the wrong number of things to ask a commissioner
 to remember at 9pm on a race night. Nothing here removes or renames any
 of them; this is a navigation layer that sits on top and drives the same
 code, so a server admin can run a whole race night without typing a
 command, while power users keep every command they already know.
+
+The panel is organised as twelve screens, each reachable from this home
+view: Setup, Race Night, Drivers, Approvals, Boards, Money, Off-season,
+Market, Contracts, Trades, History and All commands. Setup, Money and
+Off-season are commissioner-only; the three desks — Market, Contracts
+and Trades — are open to everyone, because a Team Principal should not
+need a commissioner to read the market or work their own roster.
 
 Three principles:
 
@@ -17,7 +24,9 @@ Three principles:
     that does not exist.
   * **Same code as the commands.** Actions call `bot/workflow.py`, which
     the slash commands also call. There is no second implementation to
-    drift out of sync.
+    drift out of sync. Receipts are shared too: the import receipt is
+    rendered by `bot/ui/receipts.py` for both surfaces, so the panel
+    cannot quietly omit money lines the command reports.
 
 Everything is ephemeral. A panel is private to whoever opened it, so two
 commissioners can work at once without stepping on each other.
@@ -31,13 +40,19 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import workflow
+from bot import db, queries, workflow
 from bot.panel_help import COMMAND_CATALOG, build_help_embed, help_category_options
+from bot.ui import base, receipts
 from bot.ui.approvals_screen import open_approvals
 from bot.ui.boards_screen import open_boards
+from bot.ui.contracts_screen import open_contracts
 from bot.ui.drivers_screen import open_drivers
 from bot.ui.history_screen import open_history
+from bot.ui.market_screen import open_market
+from bot.ui.money_screen import open_money
+from bot.ui.offseason_screen import open_offseason
 from bot.ui.setup_screen import open_setup
+from bot.ui.trades_screen import open_trades
 
 log = logging.getLogger(__name__)
 
@@ -170,7 +185,7 @@ def _next_step_text(status: workflow.LeagueStatus) -> str:
 # ── Race night ───────────────────────────────────────────────────────
 
 
-class ImportModal(discord.ui.Modal, title="Import race results"):
+class ImportModal(base.PanelModal, title="Import race results"):
     """
     The four things an import needs, in one dialog.
 
@@ -178,7 +193,14 @@ class ImportModal(discord.ui.Modal, title="Import race results"):
     three fields and week three is usually two.
     """
 
-    def __init__(self, *, tier: str, parent: RaceNightView, remembered_sheet: str | None) -> None:
+    def __init__(
+        self,
+        *,
+        tier: str,
+        parent: RaceNightView,
+        remembered_sheet: str | None,
+        remembered_tab: str | None = None,
+    ) -> None:
         super().__init__()
         self.tier = tier
         self.parent = parent
@@ -196,6 +218,7 @@ class ImportModal(discord.ui.Modal, title="Import race results"):
         self.tab = discord.ui.TextInput(
             label="Tab / range",
             placeholder="R14 Abu Dhabi!A1:I30",
+            default=remembered_tab or None,
             required=False,
         )
         self.held_on = discord.ui.TextInput(
@@ -231,7 +254,26 @@ class ImportModal(discord.ui.Modal, title="Import race results"):
             await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
 
-        self.parent.remember_sheet(self.tier, sheet_value)
+        # G23: remember the sheet in the database, not just on this
+        # view. The view dies after 600s and on every bot restart, so
+        # the commissioner used to re-paste the same long Sheets URL
+        # before every single race.
+        self.parent.remember_sheet(self.tier, sheet_value, tab_value)
+        if self.parent.status.season_id is not None:
+            try:
+                async with db.connect() as conn:
+                    await queries.remember_results_sheet(
+                        conn,
+                        season_id=self.parent.status.season_id,
+                        tier_code=self.tier,
+                        sheet_url=sheet_value,
+                        sheet_range=tab_value,
+                    )
+            except Exception:  # pragma: no cover - convenience only
+                # The import already succeeded and is committed. Losing
+                # the prefill is a small annoyance; turning it into a
+                # failure message would imply the results were lost.
+                log.warning("could not remember results sheet", exc_info=True)
 
         embed = discord.Embed(
             title="✅ Results imported",
@@ -248,6 +290,17 @@ class ImportModal(discord.ui.Modal, title="Import race results"):
                     ", ".join(outcome.missing_drivers)
                     + "\nThey will score nothing for this round."
                 ),
+                inline=False,
+            )
+        # G9: the panel receipt used to stop at the result count, so an
+        # admin importing here never learned that budgets had been
+        # credited or that salary had just left every team's cash. Same
+        # renderer as the slash-command receipt, so the two cannot drift.
+        money_lines = receipts.render_money_outcome(outcome)
+        if money_lines:
+            embed.add_field(
+                name="Money",
+                value=_truncate_field("\n".join(money_lines)),
                 inline=False,
             )
         embed.add_field(
@@ -278,30 +331,24 @@ def _import_error_embed(exc: workflow.ImportAborted) -> discord.Embed:
     return embed
 
 
-class _OwnedView(discord.ui.View):
+class _OwnedView(base.OwnedView):
     """
     A view only its opener may press.
 
     Panels are ephemeral, but Discord still delivers component clicks
     from anyone who can somehow reach them; this keeps a second admin's
     stale panel from acting on the first one's session.
+
+    Kept as a named subclass of the shared `base.OwnedView` so the home
+    and help screens — which non-admins are meant to reach — inherit the
+    timeout and error handling without also inheriting the Manage Server
+    gate. Admin race-night views extend `base.AdminOwnedView` instead, so
+    a permission removed mid-session takes effect on the next click
+    rather than at the end of the 10-minute window.
     """
 
-    def __init__(self, *, opener_id: int, timeout: float | None = _PANEL_TIMEOUT_SECONDS) -> None:
-        super().__init__(timeout=timeout)
-        self.opener_id = opener_id
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.opener_id:
-            await interaction.response.send_message(
-                "That panel belongs to someone else. Run `/league` to open your own.",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-
-class PricePromptView(_OwnedView):
+class PricePromptView(base.AdminOwnedView):
     """Shown straight after an import: the obvious next action, pre-filled."""
 
     def __init__(self, *, tier: str, round_label: str, opener_id: int) -> None:
@@ -372,7 +419,7 @@ async def _do_run_valuation(
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
-class PublishView(_OwnedView):
+class PublishView(base.AdminOwnedView):
     """
     Publish is the only irreversible step in a race night, so it gets a
     confirm rather than firing on the first click.
@@ -451,7 +498,7 @@ class PublishView(_OwnedView):
         )
 
 
-class RaceNightView(_OwnedView):
+class RaceNightView(base.AdminOwnedView):
     """
     The weekly loop, in the order it actually happens.
 
@@ -461,21 +508,57 @@ class RaceNightView(_OwnedView):
 
     default_range = "A1:Z100"
 
-    def __init__(self, *, status: workflow.LeagueStatus, opener_id: int) -> None:
+    def __init__(
+        self,
+        *,
+        status: workflow.LeagueStatus,
+        opener_id: int,
+        remembered: dict[str, tuple[str, str]] | None = None,
+    ) -> None:
         super().__init__(opener_id=opener_id)
         self.status = status
-        self._sheets: dict[str, str] = {}
+        self._sheets: dict[str, tuple[str, str]] = dict(remembered or {})
 
         for tier in status.tiers[:_MAX_TIER_BUTTONS]:
             self.add_item(_ImportTierButton(tier.code))
         self.add_item(_BrowseHistoryButton())
         self.add_item(_BackHomeButton())
 
-    def remember_sheet(self, tier: str, sheet: str) -> None:
-        self._sheets[tier] = sheet
+    def remember_sheet(self, tier: str, sheet: str, tab: str) -> None:
+        self._sheets[tier] = (sheet, tab)
 
-    def remembered(self, tier: str) -> str | None:
-        return self._sheets.get(tier)
+    def remembered(self, tier: str) -> tuple[str | None, str | None]:
+        return self._sheets.get(tier, (None, None))
+
+    @classmethod
+    async def load(
+        cls, *, status: workflow.LeagueStatus, opener_id: int
+    ) -> RaceNightView:
+        """
+        Build the view with each tier's last-used sheet already filled in.
+
+        A classmethod because the lookup is a database read and a Discord
+        view constructor cannot await.
+        """
+        remembered: dict[str, tuple[str, str]] = {}
+        if status.season_id is not None:
+            try:
+                async with db.connect() as conn:
+                    for tier in status.tiers[:_MAX_TIER_BUTTONS]:
+                        url, rng = await queries.fetch_remembered_results_sheet(
+                            conn,
+                            season_id=status.season_id,
+                            tier_code=tier.code,
+                        )
+                        if url:
+                            remembered[tier.code] = (url, rng or "")
+            except Exception:  # pragma: no cover - convenience only
+                log.warning(
+                    "could not load remembered sheets", exc_info=True
+                )
+        return cls(
+            status=status, opener_id=opener_id, remembered=remembered
+        )
 
 
 class _ImportTierButton(discord.ui.Button):
@@ -489,11 +572,13 @@ class _ImportTierButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         view: RaceNightView = self.view  # type: ignore[assignment]
+        sheet, tab = view.remembered(self.tier_code)
         await interaction.response.send_modal(
             ImportModal(
                 tier=self.tier_code,
                 parent=view,
-                remembered_sheet=view.remembered(self.tier_code),
+                remembered_sheet=sheet,
+                remembered_tab=tab,
             )
         )
 
@@ -569,6 +654,20 @@ class HomeView(_OwnedView):
                 self.add_item(_ApprovalsButton(status))
             if status.has_tiers:
                 self.add_item(_BoardsButton(status))
+            if status.has_season:
+                self.add_item(_MoneyButton())
+                self.add_item(_OffseasonButton())
+
+        # The three desks are for everyone. A Team Principal needs to
+        # read the market, manage their own contracts and propose trades
+        # without a commissioner opening a screen for them, and a driver
+        # needs to see their own deal. Each screen gates its own actions
+        # by role, so showing the door to everybody is safe.
+        if status.has_tiers:
+            self.add_item(_MarketButton())
+            self.add_item(_ContractsButton())
+            self.add_item(_TradesButton())
+
         self.add_item(_HelpButton())
 
 
@@ -613,7 +712,9 @@ class _RaceNightButton(discord.ui.Button):
             )
         await interaction.response.edit_message(
             embed=embed,
-            view=RaceNightView(status=status, opener_id=interaction.user.id),
+            view=await RaceNightView.load(
+                status=status, opener_id=interaction.user.id
+            ),
         )
 
 
@@ -689,6 +790,86 @@ class _BoardsButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await open_boards(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
+        )
+
+
+class _MoneyButton(discord.ui.Button):
+    """Budgets, cash, escrow and the ledger — the commissioner's books."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Money",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f4b0",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_money(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
+        )
+
+
+class _OffseasonButton(discord.ui.Button):
+    """Carry-over, rollover, promotion and relegation."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Off-season",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f504",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_offseason(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
+        )
+
+
+class _MarketButton(discord.ui.Button):
+    """Driver values and the tier market — readable by anyone."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Market",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f4c8",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_market(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
+        )
+
+
+class _ContractsButton(discord.ui.Button):
+    """Offers, signings, releases and buyouts."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Contracts",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f4dd",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_contracts(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
+        )
+
+
+class _TradesButton(discord.ui.Button):
+    """Propose, review and approve driver trades."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Trades",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f501",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_trades(
             interaction, opener_id=interaction.user.id, on_back=_back_to_home
         )
 

@@ -47,6 +47,7 @@ from bot import db, queries
 from bot.contracts import render as contract_render
 from bot.contracts import rules, service
 from bot.market import budget_ops
+from bot.ui import base
 
 log = logging.getLogger(__name__)
 
@@ -611,7 +612,7 @@ class ContractsCog(commands.Cog):
 # ── modals + views ─────────────────────────────────────────────────────
 
 
-class _OfferModal(discord.ui.Modal):
+class _OfferModal(base.PanelModal):
     def __init__(
         self,
         *,
@@ -872,7 +873,7 @@ class _ReviewSubmitView(discord.ui.View):
         return interaction.client  # type: ignore[return-value]
 
 
-class _CounterModal(discord.ui.Modal):
+class _CounterModal(base.PanelModal):
     def __init__(self, *, parent_offer) -> None:
         super().__init__(title=f"Counter offer #{parent_offer.id}")
         self._owner = parent_offer

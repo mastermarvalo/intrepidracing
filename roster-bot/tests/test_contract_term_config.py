@@ -19,6 +19,10 @@ from bot.presets import f1 as f1_preset
 from bot.ui import config_modal
 from bot.ui.base import MODAL_MAX_INPUTS
 
+# Money limits, Contract rules, Race terms & premiums. A named constant
+# so adding a fourth section is a deliberate edit here, not a surprise.
+CONFIG_SECTION_COUNT = 3
+
 # ── schema ───────────────────────────────────────────────────────────
 
 
@@ -78,6 +82,69 @@ async def test_floor_persists_through_the_config_writer(pg_conn_migrated):
 
     reread = await queries.fetch_league_config_row(pg_conn_migrated, season_id, None)
     assert (reread.min_term_seasons, reread.max_term_seasons) == (2, 4)
+
+
+@pytest.fixture
+def config_db(monkeypatch, pg_conn_migrated):
+    """Point config_modal's `db.connect()` at the test schema."""
+
+    class _Ctx:
+        async def __aenter__(self):
+            return pg_conn_migrated
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(config_modal.db, "connect", lambda: _Ctx())
+    return pg_conn_migrated
+
+
+async def test_saving_one_section_does_not_revert_the_other(config_db):
+    """
+    Regression: the section menu hands each modal a config snapshot taken
+    when the menu was built. An admin who edited Money limits and then
+    Contract rules had the second save write the stale pre-edit cap back,
+    silently undoing the first edit while both saves reported success.
+    """
+    season_id = await _seeded_season(config_db)
+    stale = await queries.fetch_league_config_row(config_db, season_id, None)
+
+    # First edit: raise the cap (as the Money limits modal does).
+    await config_modal._save(
+        season_id=season_id, tier_id=None, current=stale,
+        salary_cap=Decimal("200.00"),
+    )
+
+    # Second edit from the SAME menu, so it still carries `stale`.
+    await config_modal._save(
+        season_id=season_id, tier_id=None, current=stale,
+        min_term_seasons=2, max_term_seasons=4,
+    )
+
+    reread = await queries.fetch_league_config_row(config_db, season_id, None)
+    assert reread.salary_cap == Decimal("200.00"), (
+        "the second section's save reverted the cap edited by the first"
+    )
+    assert (reread.min_term_seasons, reread.max_term_seasons) == (2, 4)
+
+
+async def test_save_still_works_when_no_row_exists_yet(config_db):
+    """
+    Falling back to the snapshot matters: the first-ever save has nothing
+    to re-read, so `current` is the only source for the untouched half.
+    """
+    season_id = await _seeded_season(config_db)
+    seeded = await queries.fetch_league_config_row(config_db, season_id, None)
+    await config_db.execute("DELETE FROM league_config WHERE season_id = $1", season_id)
+
+    await config_modal._save(
+        season_id=season_id, tier_id=None, current=seeded,
+        salary_cap=Decimal("150.00"),
+    )
+
+    reread = await queries.fetch_league_config_row(config_db, season_id, None)
+    assert reread.salary_cap == Decimal("150.00")
+    assert reread.offer_ttl_hours == seeded.offer_ttl_hours, "untouched half lost"
 
 
 async def test_schema_rejects_an_inverted_range(pg_conn_migrated):
@@ -293,6 +360,13 @@ class _FakeConfig:
     max_term_seasons = 4
     max_incentive_pct = Decimal("0.150")
     offer_ttl_hours = 48
+    # Phase 9: race-based terms and the two premiums. Premiums at zero
+    # match the shipped default, where contract pricing is unchanged.
+    races_per_season = 24
+    min_term_races = 5
+    max_term_races = 48
+    length_premium_pct = Decimal("0")
+    resign_premium_pct = Decimal("0")
 
 
 def _labels(modal) -> list[str]:
@@ -416,7 +490,7 @@ def test_chooser_has_no_back_button_when_opened_standalone():
     view = config_modal.ConfigSectionView(
         season_id=1, tier_id=None, current=_FakeConfig(), opener_id=5
     )
-    assert len(view.children) == 2
+    assert len(view.children) == CONFIG_SECTION_COUNT
 
 
 def test_chooser_gains_a_back_button_inside_the_panel():
@@ -439,3 +513,112 @@ def test_chooser_is_owner_locked():
         season_id=1, tier_id=None, current=_FakeConfig(), opener_id=1234
     )
     assert view.opener_id == 1234
+
+
+# ── Phase 9: race terms & premiums section ───────────────────────────
+
+
+def test_race_terms_modal_fits_discords_five_input_limit():
+    modal = config_modal.RaceTermsConfigModal(
+        season_id=1, tier_id=None, current=_FakeConfig()
+    )
+    assert len(modal.children) == MODAL_MAX_INPUTS
+
+
+def test_race_terms_modal_exposes_the_race_bounds_and_both_premiums():
+    """
+    These five are the whole point of the section: if any one is missing
+    an admin has no in-Discord way to set it and would need SQL.
+    """
+    labels = " | ".join(
+        _labels(
+            config_modal.RaceTermsConfigModal(
+                season_id=1, tier_id=None, current=_FakeConfig()
+            )
+        )
+    )
+    assert "Races per season" in labels
+    assert "Min contract length (races)" in labels
+    assert "Max contract length (races)" in labels
+    assert "Length premium" in labels
+    assert "Re-sign premium" in labels
+
+
+def test_config_embed_reports_premiums_as_off_when_both_are_zero():
+    """
+    Shipped default. An admin reading the panel should be told pricing is
+    unchanged rather than shown two 0.000% figures to interpret.
+    """
+    embed = config_modal.build_config_embed(
+        _FakeConfig(), scope_label="whole league"
+    )
+    race_field = next(
+        f for f in embed.fields if "Race terms" in f.name
+    )
+    assert "off" in race_field.value
+    assert "24" in race_field.value
+
+
+def test_config_embed_reports_tuned_premiums_numerically():
+    class Tuned(_FakeConfig):
+        length_premium_pct = Decimal("0.005")
+        resign_premium_pct = Decimal("0.150")
+
+    embed = config_modal.build_config_embed(Tuned(), scope_label="Tier 1")
+    race_field = next(f for f in embed.fields if "Race terms" in f.name)
+    assert "off" not in race_field.value
+    assert "0.500" in race_field.value
+    assert "15.000" in race_field.value
+
+
+def test_a_max_below_the_min_race_term_is_rejected():
+    """Every offer would fail, so it must fail here with a reason."""
+    with pytest.raises(config_modal.ConfigError) as exc:
+        config_modal.validate_race_terms(
+            races_per_season=24,
+            min_term_races=10,
+            max_term_races=4,
+            length_premium_pct=Decimal("0"),
+            resign_premium_pct=Decimal("0"),
+        )
+    assert "below the" in str(exc.value)
+
+
+def test_a_zero_race_season_is_rejected():
+    """Salary is charged per race; zero races would make contracts free."""
+    with pytest.raises(config_modal.ConfigError):
+        config_modal.validate_race_terms(
+            races_per_season=0,
+            min_term_races=1,
+            max_term_races=4,
+            length_premium_pct=Decimal("0"),
+            resign_premium_pct=Decimal("0"),
+        )
+
+
+def test_negative_premiums_are_rejected():
+    """
+    A negative length premium would pay teams to sign the longest deal
+    possible; a negative re-sign premium would invert the whole feature.
+    """
+    for bad in ("length_premium_pct", "resign_premium_pct"):
+        kwargs = dict(
+            races_per_season=24,
+            min_term_races=5,
+            max_term_races=48,
+            length_premium_pct=Decimal("0"),
+            resign_premium_pct=Decimal("0"),
+        )
+        kwargs[bad] = Decimal("-0.010")
+        with pytest.raises(config_modal.ConfigError):
+            config_modal.validate_race_terms(**kwargs)
+
+
+def test_zero_premiums_are_allowed_because_that_is_the_shipped_default():
+    config_modal.validate_race_terms(
+        races_per_season=24,
+        min_term_races=5,
+        max_term_races=48,
+        length_premium_pct=Decimal("0"),
+        resign_premium_pct=Decimal("0"),
+    )

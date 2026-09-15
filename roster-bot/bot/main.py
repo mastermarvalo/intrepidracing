@@ -3,6 +3,7 @@ import logging
 import os
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -28,6 +29,7 @@ class RosterBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await db.init()
+        self.tree.on_error = self._on_app_command_error
         await self.load_extension("bot.cogs.roster")
         await self.load_extension("bot.cogs.sheets")
         await self.load_extension("bot.cogs.admin_market")
@@ -42,6 +44,36 @@ class RosterBot(commands.Bot):
         # For faster dev iteration, call tree.sync(guild=discord.Object(id=YOUR_GUILD_ID)).
         await self.tree.sync()
         log.info("Command tree synced")
+
+    async def _on_app_command_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        """
+        Last resort for a slash command that raised something unexpected.
+
+        Each cog catches its own domain errors; anything else used to
+        surface as "The application did not respond" (or nothing at all,
+        once the command had deferred) with the traceback visible only in
+        the log. A wrong answer the owner can see beats a silent one.
+        """
+        original = getattr(error, "original", error)
+        log.exception("Unhandled app command error", exc_info=original)
+
+        note = (
+            f"❌ Something went wrong: `{type(original).__name__}`.\n"
+            "This was not an expected failure, so the league may be in a "
+            "partly-changed state — check `/league` before retrying. The "
+            "details are in the bot log."
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(note, ephemeral=True)
+            else:
+                await interaction.response.send_message(note, ephemeral=True)
+        except discord.HTTPException as exc:
+            log.debug("Could not deliver the error notice: %s", exc)
 
     async def on_ready(self) -> None:
         assert self.user is not None

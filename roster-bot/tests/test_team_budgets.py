@@ -174,6 +174,11 @@ async def test_tier_override_falls_back_to_season_default(pg_conn_migrated):
 
 @pytest.mark.asyncio
 async def test_snapshot_opens_balance_once_and_reports_available(pg_conn_migrated):
+    """
+    A fresh league seeds escrow ON, so salary is taken from cash race by
+    race and `available` is the balance itself. Netting payroll off as
+    well would charge every team twice for the same contracts.
+    """
     ctx = await _bootstrap(pg_conn_migrated)
     snap = await budget_ops.snapshot(
         pg_conn_migrated, season_id=ctx["season_id"], tier_id=None, team_id=ctx["team_a"],
@@ -181,11 +186,31 @@ async def test_snapshot_opens_balance_once_and_reports_available(pg_conn_migrate
     assert snap.opened_now
     assert snap.balance == Decimal("145.00")
     assert snap.effective_payroll == Decimal("10.00")
-    assert snap.available == Decimal("135.00")
+    assert snap.config.escrow_enabled
+    assert snap.available == Decimal("145.00")
     again = await budget_ops.snapshot(
         pg_conn_migrated, season_id=ctx["season_id"], tier_id=None, team_id=ctx["team_a"],
     )
     assert not again.opened_now and again.balance == Decimal("145.00")
+
+
+@pytest.mark.asyncio
+async def test_snapshot_still_nets_payroll_off_when_escrow_is_off(pg_conn_migrated):
+    """
+    The commitment-only model is what every season used before migration
+    015 and what an in-flight season keeps using, so it has to stay
+    exactly as it was: available = balance − payroll.
+    """
+    ctx = await _bootstrap(pg_conn_migrated)
+    await pg_conn_migrated.execute(
+        "UPDATE budget_config SET escrow_enabled = FALSE WHERE season_id = $1",
+        ctx["season_id"],
+    )
+    snap = await budget_ops.snapshot(
+        pg_conn_migrated, season_id=ctx["season_id"], tier_id=None, team_id=ctx["team_a"],
+    )
+    assert not snap.config.escrow_enabled
+    assert snap.available == Decimal("135.00")
 
 
 @pytest.mark.asyncio
@@ -345,7 +370,10 @@ async def test_round_charges_noop_when_budgets_off(pg_conn_migrated):
 @pytest.mark.asyncio
 async def test_rollover_carries_unspent_and_is_idempotent(pg_conn_migrated):
     ctx = await _bootstrap(pg_conn_migrated)
-    # Season 7: A has 145 + 20 prize, payroll 10 → 155 unspent. B: 145 − 0.50, payroll 12.
+    # Season 7 seeds escrow ON, so salary leaves the balance race by race
+    # and the whole balance carries. A: 145 + 20 prize = 165. B: 145 − 0.50
+    # DNF = 144.50. Payroll is NOT netted off — it would deduct a season of
+    # salary a second time on the way into the new season.
     await budget_ops.award(
         pg_conn_migrated, season_id=ctx["season_id"], tier_id=None, team_id=ctx["team_a"],
         kind="prize_money", amount=Decimal("20"), note="P1", actor_id=1,
@@ -366,15 +394,15 @@ async def test_rollover_carries_unspent_and_is_idempotent(pg_conn_migrated):
         teams=teams, actor_id=1,
     )
     by_team = {line.team_id: line for line in lines}
-    assert by_team[ctx["team_a"]].carried == Decimal("155.00")
-    assert by_team[ctx["team_b"]].carried == Decimal("132.50")
+    assert by_team[ctx["team_a"]].carried == Decimal("165.00")
+    assert by_team[ctx["team_b"]].carried == Decimal("144.50")
     # New season balance = opening 145 + rollover; A now holds far more than the cap.
     bal_a_s8 = await queries.fetch_budget_balance(pg_conn_migrated, ctx["team_a"], s8)
-    assert bal_a_s8 == Decimal("300.00")
+    assert bal_a_s8 == Decimal("310.00")
     snap = await budget_ops.snapshot(
         pg_conn_migrated, season_id=s8, tier_id=None, team_id=ctx["team_a"],
     )
-    assert snap.available == Decimal("300.00") - snap.effective_payroll
+    assert snap.available == Decimal("310.00")
 
     again = await budget_ops.rollover(
         pg_conn_migrated, from_season_id=ctx["season_id"], to_season_id=s8,
@@ -382,7 +410,7 @@ async def test_rollover_carries_unspent_and_is_idempotent(pg_conn_migrated):
     )
     assert all(line.skipped_reason == "already rolled over" for line in again)
     bal_a_s8 = await queries.fetch_budget_balance(pg_conn_migrated, ctx["team_a"], s8)
-    assert bal_a_s8 == Decimal("300.00")
+    assert bal_a_s8 == Decimal("310.00")
 
 
 @pytest.mark.asyncio

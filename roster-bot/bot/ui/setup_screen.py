@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation
 import discord
 
 from bot import workflow
+from bot.ui import base
 from bot.ui.base import (
     COLOR_INFO,
     COLOR_OK,
@@ -65,7 +66,10 @@ def build_setup_embed(status: workflow.LeagueStatus) -> discord.Embed:
         + (
             f"{sum(t.driver_count for t in status.tiers)} across all tiers"
             if status.has_drivers
-            else "none yet, add them with `/roster add`"
+            else (
+                "none yet — bulk-enrol with "
+                "`/market-admin driver sync-all`, or press **Drivers**"
+            )
         ),
     ]
 
@@ -99,17 +103,32 @@ def build_setup_embed(status: workflow.LeagueStatus) -> discord.Embed:
             inline=False,
         )
     elif not status.has_tiers:
+        # G2: a season created without the preset has no tiers *and* no
+        # league config, and adding tiers by hand does not create the
+        # config row — so "add a tier" alone still leaves the season
+        # unusable. Offer the preset as the one-press route out.
         embed.add_field(
             name="Next step",
-            value="Press **Tier** to add your first tier.",
+            value=(
+                "This season has no tiers. If you skipped the F1 preset "
+                "when you created it, run `/market-admin season "
+                f"seed-preset name:{status.season_name}` to add "
+                "three tiers, the scoring table, the valuation factors "
+                "and the default $145.00M cap at once.\n"
+                "To build it by hand instead, press **Tier** \u2014 but "
+                "you will also need to set the league config yourself."
+            ),
             inline=False,
         )
     elif not status.has_drivers:
         embed.add_field(
             name="Next step",
             value=(
-                "Add drivers with `/roster add`, then come back and press "
-                "**Boards** to pin the market tables."
+                "Enrol drivers with `/market-admin driver sync-all` — it "
+                "reads every tier role at once. One at a time is "
+                "`/market-admin driver add`, or `/league` → **Drivers**. "
+                "Then come back and press **Boards** to pin the market "
+                "tables."
             ),
             inline=False,
         )
@@ -123,7 +142,7 @@ def build_setup_embed(status: workflow.LeagueStatus) -> discord.Embed:
 # ── season ───────────────────────────────────────────────────────────
 
 
-class _SeasonModal(discord.ui.Modal, title="Create a season"):
+class _SeasonModal(base.PanelModal, title="Create a season"):
     """
     Creates and activates in one step.
 
@@ -186,7 +205,35 @@ class _SeasonModal(discord.ui.Modal, title="Create a season"):
 # ── tiers ────────────────────────────────────────────────────────────
 
 
-class _TierModal(discord.ui.Modal, title="Add a tier"):
+# One source of truth: the rule now lives in `workflow` so the typed
+# `/market-admin tier add|edit` commands enforce it too. Re-exported
+# under the original names because tests and this module both use them.
+find_rank_conflict = workflow.find_rank_conflict
+rank_conflict_message = workflow.rank_conflict_message
+
+
+async def _rank_conflict_error(
+    interaction: discord.Interaction,
+    rank_order: int,
+    *,
+    exclude_code: str | None = None,
+) -> bool:
+    """
+    Re-read the season's tiers and report a duplicate rank. True if blocked.
+
+    Read at submit time rather than trusting the status the screen was
+    rendered from: the modal may have been open for minutes, and another
+    admin may have added a tier in the meantime.
+    """
+    tiers = await workflow.list_tiers(interaction.guild_id)
+    holder = find_rank_conflict(tiers, rank_order, exclude_code=exclude_code)
+    if holder is None:
+        return False
+    await report_error(interaction, rank_conflict_message(rank_order, holder))
+    return True
+
+
+class _TierModal(base.PanelModal, title="Add a tier"):
     def __init__(self, parent: SetupView, *, suggested_rank: int) -> None:
         super().__init__()
         self._owner = parent
@@ -238,6 +285,8 @@ class _TierModal(discord.ui.Modal, title="Add a tier"):
 
         await interaction.response.defer(ephemeral=True)
         code = self._code.value.strip().lower()
+        if await _rank_conflict_error(interaction, rank, exclude_code=code):
+            return
         try:
             await workflow.add_tier(
                 guild_id=interaction.guild_id,
@@ -886,7 +935,7 @@ class _AddTierButton(discord.ui.Button):
         )
 
 
-class _TierEditModal(discord.ui.Modal, title="Edit tier"):
+class _TierEditModal(base.PanelModal, title="Edit tier"):
     """
     Rewrite a tier's label, rank, or accent colour.
 
@@ -943,6 +992,10 @@ class _TierEditModal(discord.ui.Modal, title="Edit tier"):
                 return
 
         await interaction.response.defer(ephemeral=True)
+        if await _rank_conflict_error(
+            interaction, rank, exclude_code=self._tier.code
+        ):
+            return
         try:
             await workflow.edit_tier(
                 guild_id=interaction.guild_id,
@@ -1142,7 +1195,7 @@ class _AdjustCapSelect(discord.ui.Select):
         await interaction.response.send_modal(_CapAdjustModal(self._owner, team))
 
 
-class _CapAdjustModal(discord.ui.Modal, title="Adjust team cap"):
+class _CapAdjustModal(base.PanelModal, title="Adjust team cap"):
     """
     Records a cap_adjustment ledger entry.
 
