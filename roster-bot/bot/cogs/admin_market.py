@@ -1236,9 +1236,6 @@ class AdminMarketCog(commands.Cog):
         )
 
 
-# ── helpers ──────────────────────────────────────────────────────────────
-
-
     # ── /market-admin results ────────────────────────────────────────────
 
     @results.command(
