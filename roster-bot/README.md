@@ -150,6 +150,54 @@ pickers, so ids are never typed by hand. Choosing the **f1** preset when
 creating a season seeds three tiers, the scoring table, the valuation
 factors and the default **$145.00M** salary cap in one step.
 
+#### Cap & rules
+
+Discord allows five inputs per dialog and there are ten numeric league
+settings, so **Cap & rules** first asks which half you want:
+
+```
+💰 League rules
+Editing the season default. Pick a section to change.
+
+Money limits
+Salary cap $145.00M
+Salary floor $1.00M · ceiling none
+Weekly move cap ±$0.75M
+Exceptional move cap ±$1.25M
+
+Contract rules
+Contract length 1–3 seasons
+Active driver slots 2 per team
+Max incentives 15.0% of salary
+Offers expire after 48h
+
+[ 💰 Money limits ]  [ 📝 Contract rules ]  [ ◀ Back to setup ]
+```
+
+**Contract rules** is where you set how long Team Principals may sign
+drivers for. Both ends are editable:
+
+| Setting | Meaning |
+|---|---|
+| Min contract length | Shortest deal a TP may offer, in seasons |
+| Max contract length | Longest deal a TP may offer, in seasons |
+| Active driver slots | Seats per team per tier |
+| Max incentives | Performance bonus ceiling, as a % of salary |
+| Offer expiry | Hours before an unanswered offer lapses |
+
+Setting both bounds to the same number locks the league to a single
+contract length. An offer outside the range is rejected before it ever
+reaches the driver, with a message naming the league's own limit.
+
+Impossible ranges are refused at the point of editing rather than at
+offer time — a minimum above the maximum would make every offer illegal
+while looking like the TP's mistake. The database carries the same
+constraint, so no other code path can write one either.
+
+Both bounds can be set per tier as well as league-wide:
+`/market-admin config edit tier:t2` edits the Tier 2 override only. Tiers
+without an override inherit the season default.
+
 ### Race Night
 
 **Race Night** is the weekly loop in the order it happens: pick a tier →
@@ -288,7 +336,7 @@ driver mathematically cannot influence a Tier-1 value.
 | `/market-admin tier edit <code> ...` | Edit an existing tier (labels, roles, colors) |
 | `/market-admin tier list` | List tiers for the active season |
 | `/market-admin config show [tier]` | Show league config (season default or tier override) |
-| `/market-admin config edit [tier]` | Modal to edit the five most-tuned numeric values |
+| `/market-admin config edit [tier]` | Edit money limits or contract rules (incl. min/max contract length) |
 | `/market-admin config channel <kind> <#channel> [tier]` | Set market / transactions / approvals channel |
 | `/market-admin config role <@role> [tier]` | Set the commissioner role |
 | `/market-admin config free-agency <open\|closed> [tier]` | Open or close the free-agency window |
@@ -451,7 +499,7 @@ The equivalent commands, if you'd rather type them:
 /market-admin tier edit code: t2 label: "Tier 2" rank_order: 2 role: @Tier-2
 /market-admin tier edit code: t3 label: "Tier 3" rank_order: 3 role: @Tier-3
 /market-admin config show
-/market-admin config edit               # tune the numeric defaults
+/market-admin config edit               # cap, salaries, contract length bounds
 
 # First valuation snapshot per tier (baselines every driver at min_salary)
 /market-admin valuation run tier: t1 round_label: "Pre-season baseline"

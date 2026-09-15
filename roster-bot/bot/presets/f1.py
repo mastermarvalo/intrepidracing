@@ -178,6 +178,9 @@ _DEFAULT_LEAGUE_CONFIG: dict[str, object] = {
     "active_driver_slots": 2,
     "weekly_move_cap": Decimal("0.75"),
     "exceptional_move_cap": Decimal("1.25"),
+    # One season is the shortest contract the league recognises; three is
+    # the longest a TP may offer. Both are commissioner-editable.
+    "min_term_seasons": 1,
     "max_term_seasons": 3,
     "max_incentive_pct": Decimal("0.150"),
     "offer_ttl_hours": 48,
@@ -316,6 +319,7 @@ async def _seed_default_config(conn: asyncpg.Connection, season_id: int) -> None
         active_driver_slots=_DEFAULT_LEAGUE_CONFIG["active_driver_slots"],  # type: ignore[arg-type]
         weekly_move_cap=_DEFAULT_LEAGUE_CONFIG["weekly_move_cap"],  # type: ignore[arg-type]
         exceptional_move_cap=_DEFAULT_LEAGUE_CONFIG["exceptional_move_cap"],  # type: ignore[arg-type]
+        min_term_seasons=_DEFAULT_LEAGUE_CONFIG["min_term_seasons"],  # type: ignore[arg-type]
         max_term_seasons=_DEFAULT_LEAGUE_CONFIG["max_term_seasons"],  # type: ignore[arg-type]
         max_incentive_pct=_DEFAULT_LEAGUE_CONFIG["max_incentive_pct"],  # type: ignore[arg-type]
         offer_ttl_hours=_DEFAULT_LEAGUE_CONFIG["offer_ttl_hours"],  # type: ignore[arg-type]

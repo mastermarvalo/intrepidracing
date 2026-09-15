@@ -30,7 +30,7 @@ from bot.ui.base import (
     truncate_field,
 )
 from bot.ui.boards_screen import open_boards
-from bot.ui.config_modal import ConfigModal
+from bot.ui.config_modal import ConfigSectionView, build_config_embed
 
 _PRESET_F1 = "f1"
 _PRESET_NONE = "none"
@@ -581,8 +581,19 @@ class _ConfigButton(discord.ui.Button):
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
-        await interaction.response.send_modal(
-            ConfigModal(season_id=season_id, tier_id=tier_id, current=cfg)
+        # Two modals, not one: ten numeric tunables do not fit in
+        # Discord's five-input modal, so the button opens a chooser.
+        view = self.view
+        assert isinstance(view, SetupView)
+        await interaction.response.edit_message(
+            embed=build_config_embed(cfg, scope_label="the season default"),
+            view=ConfigSectionView(
+                season_id=season_id,
+                tier_id=tier_id,
+                current=cfg,
+                opener_id=view.opener_id,
+                on_back=view.reload,
+            ),
         )
 
 

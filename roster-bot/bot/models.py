@@ -222,6 +222,7 @@ class LeagueConfig:
     active_driver_slots: int
     weekly_move_cap: Decimal
     exceptional_move_cap: Decimal
+    min_term_seasons: int
     max_term_seasons: int
     max_incentive_pct: Decimal
     offer_ttl_hours: int

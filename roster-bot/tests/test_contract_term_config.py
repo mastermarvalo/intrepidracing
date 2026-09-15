@@ -1,0 +1,441 @@
+"""
+Contract length is a league tunable at both ends.
+
+`max_term_seasons` was always configurable; the minimum used to be a
+hardcoded `< 1` in bot/contracts/rules.py, so a commissioner could cap
+contracts but could not require a floor. These tests cover the four
+layers that had to agree for that to change: the schema, the config
+writer, the offer rule, and the editing UI.
+"""
+
+from decimal import Decimal
+
+import pytest
+from asyncpg.exceptions import CheckViolationError
+
+from bot import queries
+from bot.contracts import rules
+from bot.presets import f1 as f1_preset
+from bot.ui import config_modal
+from bot.ui.base import MODAL_MAX_INPUTS
+
+# ── schema ───────────────────────────────────────────────────────────
+
+
+async def _seeded_season(conn, guild_id: int = 77) -> int:
+    season_id = await queries.insert_season(conn, guild_id, "S1", is_active=True)
+    await f1_preset.seed_season(conn, season_id)
+    return season_id
+
+
+async def test_preset_seeds_a_one_season_floor(pg_conn_migrated):
+    """The default reproduces the old hardcoded behaviour exactly."""
+    season_id = await _seeded_season(pg_conn_migrated)
+    cfg = await queries.fetch_league_config_row(pg_conn_migrated, season_id, None)
+    assert cfg.min_term_seasons == 1
+    assert cfg.max_term_seasons == 3
+
+
+async def test_existing_rows_default_to_the_old_floor(pg_conn_migrated):
+    """
+    A row written without the new column still gets 1, so the migration
+    needs no backfill.
+    """
+    season_id = await queries.insert_season(pg_conn_migrated, 78, "S2", is_active=True)
+    await pg_conn_migrated.execute(
+        """
+        INSERT INTO league_config (
+            season_id, tier_id, salary_cap, min_salary, active_driver_slots,
+            weekly_move_cap, exceptional_move_cap, max_term_seasons,
+            max_incentive_pct, offer_ttl_hours
+        ) VALUES ($1, NULL, 145.00, 1.00, 2, 0.75, 1.25, 3, 0.150, 48)
+        """,
+        season_id,
+    )
+    cfg = await queries.fetch_league_config_row(pg_conn_migrated, season_id, None)
+    assert cfg.min_term_seasons == 1
+
+
+async def test_floor_persists_through_the_config_writer(pg_conn_migrated):
+    season_id = await _seeded_season(pg_conn_migrated)
+    cfg = await queries.fetch_league_config_row(pg_conn_migrated, season_id, None)
+
+    await queries.upsert_league_config(
+        pg_conn_migrated,
+        season_id=season_id,
+        tier_id=None,
+        salary_cap=cfg.salary_cap,
+        min_salary=cfg.min_salary,
+        max_salary=cfg.max_salary,
+        active_driver_slots=cfg.active_driver_slots,
+        weekly_move_cap=cfg.weekly_move_cap,
+        exceptional_move_cap=cfg.exceptional_move_cap,
+        min_term_seasons=2,
+        max_term_seasons=4,
+        max_incentive_pct=cfg.max_incentive_pct,
+        offer_ttl_hours=cfg.offer_ttl_hours,
+    )
+
+    reread = await queries.fetch_league_config_row(pg_conn_migrated, season_id, None)
+    assert (reread.min_term_seasons, reread.max_term_seasons) == (2, 4)
+
+
+async def test_schema_rejects_an_inverted_range(pg_conn_migrated):
+    """The CHECK is the backstop: an unsatisfiable range cannot be stored."""
+    season_id = await _seeded_season(pg_conn_migrated)
+    with pytest.raises(CheckViolationError):
+        await pg_conn_migrated.execute(
+            "UPDATE league_config SET min_term_seasons = 5, max_term_seasons = 3 "
+            "WHERE season_id = $1",
+            season_id,
+        )
+
+
+async def test_schema_rejects_a_zero_season_floor(pg_conn_migrated):
+    season_id = await _seeded_season(pg_conn_migrated)
+    with pytest.raises(CheckViolationError):
+        await pg_conn_migrated.execute(
+            "UPDATE league_config SET min_term_seasons = 0 WHERE season_id = $1",
+            season_id,
+        )
+
+
+# ── offer rule ───────────────────────────────────────────────────────
+
+
+def _inputs(*, term: int, min_term: int, max_term: int) -> rules.OfferInputs:
+    return rules.OfferInputs(
+        actor_id=100,
+        actor_is_principal=True,
+        actor_is_admin=False,
+        driver_present_in_tier=True,
+        driver_status="active",
+        driver_has_active_contract=False,
+        duplicate_open_offer_exists=False,
+        salary=Decimal("5.00"),
+        min_salary=Decimal("1.00"),
+        max_salary=Decimal("50.00"),
+        signing_bonus=Decimal("0"),
+        incentives_amount=Decimal("0"),
+        max_incentive_pct=Decimal("0.15"),
+        team_payroll_before=Decimal("50.00"),
+        salary_cap=Decimal("145.00"),
+        active_slots_used=1,
+        active_slots_max=2,
+        has_linked_release=False,
+        term_seasons=term,
+        min_term_seasons=min_term,
+        max_term_seasons=max_term,
+        offer_kind="new",
+        free_agency_open=True,
+    )
+
+
+def test_term_below_configured_minimum_is_blocked():
+    result = rules.term_within_bounds(_inputs(term=1, min_term=2, max_term=4))
+    assert not result.ok
+    assert result.code == "term_below_minimum"
+    # The message must name the league's own number, not a constant.
+    assert "2" in result.message
+
+
+def test_term_exactly_at_the_minimum_passes():
+    result = rules.term_within_bounds(_inputs(term=2, min_term=2, max_term=4))
+    assert result.ok
+
+
+def test_term_exactly_at_the_maximum_passes():
+    result = rules.term_within_bounds(_inputs(term=4, min_term=2, max_term=4))
+    assert result.ok
+
+
+def test_term_above_maximum_still_blocked():
+    result = rules.term_within_bounds(_inputs(term=5, min_term=2, max_term=4))
+    assert not result.ok
+    assert result.code == "term_too_long"
+
+
+def test_zero_season_term_reports_the_absolute_floor_not_the_league_floor():
+    """
+    Distinct codes matter: a nonsense value and a policy violation need
+    different messages for the TP to know which one they hit.
+    """
+    result = rules.term_within_bounds(_inputs(term=0, min_term=3, max_term=4))
+    assert not result.ok
+    assert result.code == "term_too_short"
+
+
+def test_a_league_with_a_single_legal_length_accepts_only_that_length():
+    assert rules.term_within_bounds(_inputs(term=2, min_term=2, max_term=2)).ok
+    assert not rules.term_within_bounds(
+        _inputs(term=3, min_term=2, max_term=2)
+    ).ok
+    assert not rules.term_within_bounds(
+        _inputs(term=1, min_term=2, max_term=2)
+    ).ok
+
+
+def test_default_inputs_describe_the_narrowest_legal_league():
+    """
+    The dataclass defaults must not smuggle in a policy assumption; a
+    caller that forgets to pass the bounds should get one season only.
+    """
+    fields = rules.OfferInputs.__dataclass_fields__
+    assert fields["min_term_seasons"].default == 1
+    assert fields["max_term_seasons"].default == 1
+
+
+def test_full_validation_surfaces_the_minimum_failure():
+    validation = rules.validate_offer(_inputs(term=1, min_term=3, max_term=3))
+    assert not validation.ok
+    codes = [r.code for r in validation.results if not r.ok]
+    assert "term_below_minimum" in codes
+
+
+# ── editing guardrails ───────────────────────────────────────────────
+
+
+def _valid_terms(**overrides):
+    kwargs = {
+        "min_term": 1,
+        "max_term": 3,
+        "slots": 2,
+        "incentive_pct": Decimal("0.15"),
+        "ttl_hours": 48,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_validate_terms_accepts_a_sane_range():
+    config_modal.validate_terms(**_valid_terms())
+
+
+def test_validate_terms_accepts_min_equal_to_max():
+    config_modal.validate_terms(**_valid_terms(min_term=2, max_term=2))
+
+
+def test_validate_terms_rejects_a_zero_minimum():
+    with pytest.raises(config_modal.ConfigError) as exc:
+        config_modal.validate_terms(**_valid_terms(min_term=0))
+    assert "at least 1 season" in str(exc.value)
+
+
+def test_validate_terms_rejects_an_inverted_range():
+    """
+    The admin-facing message has to explain the consequence, because the
+    symptom is every offer being rejected for no obvious reason.
+    """
+    with pytest.raises(config_modal.ConfigError) as exc:
+        config_modal.validate_terms(**_valid_terms(min_term=4, max_term=2))
+    assert "below the" in str(exc.value)
+
+
+def test_validate_terms_rejects_zero_driver_slots():
+    with pytest.raises(config_modal.ConfigError):
+        config_modal.validate_terms(**_valid_terms(slots=0))
+
+
+def test_validate_terms_rejects_negative_incentives():
+    with pytest.raises(config_modal.ConfigError):
+        config_modal.validate_terms(**_valid_terms(incentive_pct=Decimal("-0.1")))
+
+
+def test_validate_terms_rejects_a_zero_hour_expiry():
+    with pytest.raises(config_modal.ConfigError):
+        config_modal.validate_terms(**_valid_terms(ttl_hours=0))
+
+
+def test_money_validation_rejects_a_floor_above_the_cap():
+    with pytest.raises(config_modal.ConfigError) as exc:
+        config_modal._validate_money(
+            salary_cap=Decimal("10.00"),
+            min_salary=Decimal("20.00"),
+            max_salary=None,
+            weekly=Decimal("0.75"),
+            exceptional=Decimal("1.25"),
+        )
+    assert "cannot exceed" in str(exc.value)
+
+
+def test_money_validation_allows_a_blank_ceiling():
+    config_modal._validate_money(
+        salary_cap=Decimal("145.00"),
+        min_salary=Decimal("1.00"),
+        max_salary=None,
+        weekly=Decimal("0.75"),
+        exceptional=Decimal("1.25"),
+    )
+
+
+def test_money_validation_rejects_a_ceiling_over_the_cap():
+    with pytest.raises(config_modal.ConfigError):
+        config_modal._validate_money(
+            salary_cap=Decimal("145.00"),
+            min_salary=Decimal("1.00"),
+            max_salary=Decimal("200.00"),
+            weekly=Decimal("0.75"),
+            exceptional=Decimal("1.25"),
+        )
+
+
+# ── modal composition ────────────────────────────────────────────────
+
+
+class _FakeConfig:
+    salary_cap = Decimal("145.00")
+    min_salary = Decimal("1.00")
+    max_salary = None
+    active_driver_slots = 2
+    weekly_move_cap = Decimal("0.75")
+    exceptional_move_cap = Decimal("1.25")
+    min_term_seasons = 2
+    max_term_seasons = 4
+    max_incentive_pct = Decimal("0.150")
+    offer_ttl_hours = 48
+
+
+def _labels(modal) -> list[str]:
+    return [getattr(item, "label", "") for item in modal.children]
+
+
+def test_terms_modal_fits_discords_five_input_limit():
+    modal = config_modal.TermsConfigModal(
+        season_id=1, tier_id=None, current=_FakeConfig()
+    )
+    assert len(modal.children) == MODAL_MAX_INPUTS
+
+
+def test_money_modal_fits_discords_five_input_limit():
+    modal = config_modal.MoneyConfigModal(
+        season_id=1, tier_id=None, current=_FakeConfig()
+    )
+    assert len(modal.children) == MODAL_MAX_INPUTS
+
+
+def test_terms_modal_exposes_both_contract_length_bounds():
+    modal = config_modal.TermsConfigModal(
+        season_id=1, tier_id=None, current=_FakeConfig()
+    )
+    labels = _labels(modal)
+    assert any("Min contract length" in label for label in labels)
+    assert any("Max contract length" in label for label in labels)
+
+
+def test_terms_modal_prefills_the_current_bounds():
+    modal = config_modal.TermsConfigModal(
+        season_id=1, tier_id=None, current=_FakeConfig()
+    )
+    defaults = {
+        getattr(item, "label", ""): getattr(item, "default", None)
+        for item in modal.children
+    }
+    assert defaults["Min contract length (seasons)"] == "2"
+    assert defaults["Max contract length (seasons)"] == "4"
+
+
+def test_terms_modal_shows_incentives_as_a_percentage():
+    """Storage is a fraction; admins read percentages everywhere else."""
+    modal = config_modal.TermsConfigModal(
+        season_id=1, tier_id=None, current=_FakeConfig()
+    )
+    defaults = {
+        getattr(item, "label", ""): getattr(item, "default", None)
+        for item in modal.children
+    }
+    assert defaults["Max incentives (% of salary)"] == "15.0"
+
+
+def test_money_modal_leaves_an_absent_ceiling_blank():
+    modal = config_modal.MoneyConfigModal(
+        season_id=1, tier_id=None, current=_FakeConfig()
+    )
+    ceiling = next(
+        item for item in modal.children
+        if "Maximum salary" in getattr(item, "label", "")
+    )
+    assert ceiling.default == ""
+    assert ceiling.required is False
+
+
+def test_every_numeric_config_field_is_editable_somewhere():
+    """
+    The split existed to give every tunable a surface. If someone adds a
+    config column without adding an input, this test should notice.
+    """
+    money = _labels(
+        config_modal.MoneyConfigModal(
+            season_id=1, tier_id=None, current=_FakeConfig()
+        )
+    )
+    terms = _labels(
+        config_modal.TermsConfigModal(
+            season_id=1, tier_id=None, current=_FakeConfig()
+        )
+    )
+    assert len(money) + len(terms) == 10
+
+
+# ── chooser ──────────────────────────────────────────────────────────
+
+
+def test_config_embed_shows_the_length_range():
+    embed = config_modal.build_config_embed(
+        _FakeConfig(), scope_label="the season default"
+    )
+    body = " ".join(field.value for field in embed.fields)
+    assert "2–4 seasons" in body
+
+
+def test_config_embed_collapses_a_single_legal_length():
+    class Fixed(_FakeConfig):
+        min_term_seasons = 2
+        max_term_seasons = 2
+
+    embed = config_modal.build_config_embed(Fixed(), scope_label="tier `t1`")
+    body = " ".join(field.value for field in embed.fields)
+    assert "exactly 2 season(s)" in body
+
+
+def test_config_embed_names_the_scope_being_edited():
+    embed = config_modal.build_config_embed(_FakeConfig(), scope_label="tier `t1`")
+    assert "tier `t1`" in embed.description
+
+
+def test_chooser_offers_both_sections():
+    view = config_modal.ConfigSectionView(
+        season_id=1, tier_id=None, current=_FakeConfig(), opener_id=5
+    )
+    labels = [getattr(item, "label", "") for item in view.children]
+    assert "Money limits" in labels
+    assert "Contract rules" in labels
+
+
+def test_chooser_has_no_back_button_when_opened_standalone():
+    """The slash command opens this as a top-level message."""
+    view = config_modal.ConfigSectionView(
+        season_id=1, tier_id=None, current=_FakeConfig(), opener_id=5
+    )
+    assert len(view.children) == 2
+
+
+def test_chooser_gains_a_back_button_inside_the_panel():
+    async def _back(interaction):
+        return None
+
+    view = config_modal.ConfigSectionView(
+        season_id=1,
+        tier_id=None,
+        current=_FakeConfig(),
+        opener_id=5,
+        on_back=_back,
+    )
+    labels = [getattr(item, "label", "") for item in view.children]
+    assert "Back to setup" in labels
+
+
+def test_chooser_is_owner_locked():
+    view = config_modal.ConfigSectionView(
+        season_id=1, tier_id=None, current=_FakeConfig(), opener_id=1234
+    )
+    assert view.opener_id == 1234

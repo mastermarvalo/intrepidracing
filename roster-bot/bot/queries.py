@@ -596,6 +596,7 @@ def _row_to_league_config(row: asyncpg.Record) -> LeagueConfig:
         active_driver_slots=row["active_driver_slots"],
         weekly_move_cap=row["weekly_move_cap"],
         exceptional_move_cap=row["exceptional_move_cap"],
+        min_term_seasons=row["min_term_seasons"],
         max_term_seasons=row["max_term_seasons"],
         max_incentive_pct=row["max_incentive_pct"],
         offer_ttl_hours=row["offer_ttl_hours"],
@@ -618,6 +619,7 @@ async def upsert_league_config(
     active_driver_slots: int,
     weekly_move_cap: Decimal,
     exceptional_move_cap: Decimal,
+    min_term_seasons: int,
     max_term_seasons: int,
     max_incentive_pct: Decimal,
     offer_ttl_hours: int,
@@ -639,27 +641,30 @@ async def upsert_league_config(
             INSERT INTO league_config (
                 season_id, tier_id, salary_cap, min_salary, max_salary,
                 active_driver_slots, weekly_move_cap, exceptional_move_cap,
-                max_term_seasons, max_incentive_pct, offer_ttl_hours
+                min_term_seasons, max_term_seasons, max_incentive_pct,
+                offer_ttl_hours
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id
             """,
             season_id, tier_id, salary_cap, min_salary, max_salary,
             active_driver_slots, weekly_move_cap, exceptional_move_cap,
-            max_term_seasons, max_incentive_pct, offer_ttl_hours,
+            min_term_seasons, max_term_seasons, max_incentive_pct,
+            offer_ttl_hours,
         )
     await conn.execute(
         """
         UPDATE league_config SET
             salary_cap = $1, min_salary = $2, max_salary = $3,
             active_driver_slots = $4, weekly_move_cap = $5,
-            exceptional_move_cap = $6, max_term_seasons = $7,
-            max_incentive_pct = $8, offer_ttl_hours = $9
-        WHERE id = $10
+            exceptional_move_cap = $6, min_term_seasons = $7,
+            max_term_seasons = $8, max_incentive_pct = $9,
+            offer_ttl_hours = $10
+        WHERE id = $11
         """,
         salary_cap, min_salary, max_salary, active_driver_slots,
-        weekly_move_cap, exceptional_move_cap, max_term_seasons,
-        max_incentive_pct, offer_ttl_hours, existing,
+        weekly_move_cap, exceptional_move_cap, min_term_seasons,
+        max_term_seasons, max_incentive_pct, offer_ttl_hours, existing,
     )
     return existing
 

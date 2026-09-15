@@ -249,6 +249,7 @@ def test_every_documented_rule_code_is_reachable():
         _replace(_baseline_ok(),
                  active_slots_used=2, active_slots_max=2),
         _replace(_baseline_ok(), term_seasons=0),
+        _replace(_baseline_ok(), term_seasons=1, min_term_seasons=2),
         _replace(_baseline_ok(), term_seasons=999, max_term_seasons=3),
         _replace(_baseline_ok(), incentives_amount=Decimal("-1")),
         _replace(_baseline_ok(),

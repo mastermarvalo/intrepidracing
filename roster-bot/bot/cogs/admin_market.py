@@ -60,7 +60,7 @@ from bot import approvals, db, queries, sheets, workflow
 from bot.contracts import service as contracts_service
 from bot.market import results as results_engine
 from bot.market.money import format_money, format_pl
-from bot.ui.config_modal import ConfigModal
+from bot.ui.config_modal import ConfigSectionView, build_config_embed
 
 log = logging.getLogger(__name__)
 
@@ -398,7 +398,8 @@ class AdminMarketCog(commands.Cog):
             f"Active driver slots: {cfg.active_driver_slots}",
             f"Weekly move cap: ±{_fmt_money(cfg.weekly_move_cap)}",
             f"Exceptional move cap: ±{_fmt_money(cfg.exceptional_move_cap)}",
-            f"Max contract term: {cfg.max_term_seasons} season(s)",
+            f"Contract length: {cfg.min_term_seasons}–{cfg.max_term_seasons} "
+            f"season(s)",
             f"Max incentive %: {_fmt_pct(cfg.max_incentive_pct)}",
             f"Offer TTL: {cfg.offer_ttl_hours}h",
             f"Free agency: {'🟢 open' if cfg.free_agency_open else '🔴 closed'}",
@@ -413,7 +414,10 @@ class AdminMarketCog(commands.Cog):
             lines.append(f"Commissioner role: <@&{cfg.commissioner_role_id}>")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-    @config.command(name="edit", description="Edit numeric league config (opens modal)")
+    @config.command(
+        name="edit",
+        description="Edit league money limits or contract rules",
+    )
     @app_commands.describe(tier="Edit tier override (leave unset for season default)")
     async def config_edit(
         self, interaction: discord.Interaction, tier: str | None = None
@@ -448,8 +452,16 @@ class AdminMarketCog(commands.Cog):
             )
             return
 
-        await interaction.response.send_modal(
-            ConfigModal(season_id=season.id, tier_id=tier_id, current=cfg)
+        scope_label = f"tier `{tier}`" if tier else "the season default"
+        await interaction.response.send_message(
+            embed=build_config_embed(cfg, scope_label=scope_label),
+            view=ConfigSectionView(
+                season_id=season.id,
+                tier_id=tier_id,
+                current=cfg,
+                opener_id=interaction.user.id,
+            ),
+            ephemeral=True,
         )
 
     @config.command(name="channel", description="Set a market channel for the active season")
