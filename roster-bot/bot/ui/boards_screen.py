@@ -221,7 +221,7 @@ class _RemoveBoardSelect(discord.ui.Select):
             ],
             disabled=not boards,
         )
-        self._parent = parent
+        self._owner = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -231,7 +231,7 @@ class _RemoveBoardSelect(discord.ui.Select):
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
-        await self._parent.reload(
+        await self._owner.reload(
             interaction, note=f"✅ Board `{board_id}` removed."
         )
 
@@ -342,7 +342,7 @@ class _RefreshOneSelect(discord.ui.Select):
             ],
             disabled=not boards,
         )
-        self._parent = parent
+        self._owner = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -352,7 +352,7 @@ class _RefreshOneSelect(discord.ui.Select):
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
-        await self._parent.reload(
+        await self._owner.reload(
             interaction, note=f"✅ Refreshed board `{board_id}`."
         )
 

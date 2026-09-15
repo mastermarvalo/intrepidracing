@@ -205,7 +205,7 @@ class _RejectModal(discord.ui.Modal):
         super().__init__(title=f"Reject {label} #{item_id}")
         self._kind = kind
         self._item_id = item_id
-        self._parent = parent
+        self._owner = parent
         self._note = discord.ui.TextInput(
             label="Reason (optional)",
             placeholder="Recorded in the audit log and shown to the team.",
@@ -235,7 +235,7 @@ class _RejectModal(discord.ui.Modal):
             return
 
         label = "Offer" if self._kind == _OFFER else "Trade"
-        await self._parent.reload(
+        await self._owner.reload(
             interaction, note=f"✅ {label} #{self._item_id} rejected."
         )
 

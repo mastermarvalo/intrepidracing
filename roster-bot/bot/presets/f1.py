@@ -45,6 +45,7 @@ _CONTRACT_STATES: list[tuple[str, str, bool]] = [
     ("expired", "Expired", True),
     ("voided", "Voided", True),
     ("terminated", "Terminated", True),
+    ("carried", "Carried to next season", True),
 ]
 
 _OFFER_STATES: list[tuple[str, str, bool]] = [
@@ -79,6 +80,8 @@ _TRANSACTION_KINDS: list[tuple[str, str]] = [
     ("trade", "Trade"),
     ("cap_adjustment", "Cap adjustment"),
     ("status_change", "Driver status change"),
+    ("contract_carried", "Contract carried over"),
+    ("contract_expired", "Contract expired"),
 ]
 
 _BOARD_KINDS: list[tuple[str, str]] = [

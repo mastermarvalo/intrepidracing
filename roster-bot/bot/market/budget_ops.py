@@ -325,14 +325,17 @@ async def rollover(
     `rollover` row. Idempotent per (team, target season) via the partial
     unique index; a team already rolled over is reported as skipped.
 
-    "Unspent" = balance − effective payroll in the source season, using
-    the same arithmetic as the signing rule so the two cannot disagree.
-    A team that finished underwater carries a negative rollover.
+    "Unspent" = balance − the payroll that season actually carried
+    (`queries.fetch_team_season_payroll`: rows signed or carried into the
+    source season, whether they are still active, were carried on, or
+    expired at its end, plus that season's dead money). Pinning the
+    payroll to the source season's own rows means this number is the
+    same whether contract carry-over has already run or not. A team that
+    finished underwater carries a negative rollover.
 
     Requires `rollover_enabled` on the TARGET season's config: the league
-    that is starting decides whether it honours the past. Contracts do
-    not carry over across seasons in this codebase yet; the rollover is
-    money only.
+    that is starting decides whether it honours the past. Contracts are
+    carried separately by `bot.contracts.carryover`; this is money only.
     """
     if from_season_id == to_season_id:
         raise BudgetError("Source and target seasons must differ.")
@@ -357,7 +360,7 @@ async def rollover(
             )
             continue
         from_balance = await queries.fetch_budget_balance(conn, team_id, from_season_id)
-        from_payroll = await queries.fetch_team_effective_payroll(
+        from_payroll = await queries.fetch_team_season_payroll(
             conn, team_id, from_season_id
         )
         carried = budget_engine.rollover_amount(from_balance, from_payroll)

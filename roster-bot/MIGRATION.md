@@ -1,5 +1,58 @@
 # Upgrade notes
 
+## Control panel fix — discord.py ≥ 2.6 (no migration)
+
+Every button and select in the `/league` panel stored its owning view as
+`self._parent`. discord.py 2.6 introduced its own `Item._parent` (the
+item's container) and reads it in `Item._run_checks` before every
+callback, so on a current library the first click on **Free agency**,
+**Teams → adjust cap**, **Drivers → pick a driver**, and every other
+panel control raised
+`AttributeError: '<View>' object has no attribute '_run_checks'` and the
+click was ignored. The attribute is now `_owner` throughout `bot/ui/` and
+`bot/cogs/contracts.py`; `tests/test_ui_reserved_attrs.py` scans every
+`discord.ui.*` subclass for reserved names and drives the three
+crashing controls through discord.py's real check path.
+
+## Migration 014 — contract carry-over (Phase 8)
+
+Apply as usual; the runner picks up `014_contract_carryover.sql` on the
+next bot start. Forward-only, safe to re-apply.
+
+**What it adds**
+
+- `contracts.season_index INTEGER NOT NULL DEFAULT 1` (CHECK `>= 1`) —
+  which season of `term_seasons` the row represents.
+- `contracts.carried_from_contract_id` / `contracts.origin_contract_id`
+  — nullable self-references (`ON DELETE SET NULL`) linking each season's
+  row to the previous one and to the original signing.
+- Partial unique index `uq_contracts_carried_once` on
+  `carried_from_contract_id`: a row can be continued at most once.
+- Indexes on `origin_contract_id` and `(season_id, state)`.
+- `contract_states` gains `carried` (terminal).
+- `transaction_kinds` gains `contract_carried` and `contract_expired`.
+
+**What it changes in existing data**
+
+Every existing contract row gets `season_index = 1` and NULL links. No
+row changes state; nothing else is written.
+
+**Behavioural changes to be aware of**
+
+- **Nothing happens until you run `/market-admin season carry-over`.**
+  Contracts from past seasons remain `active` (and keep counting against
+  live payroll, exactly as before) until a commissioner runs the command
+  for that season. If the bot has already crossed a season boundary,
+  run it once per past season, oldest first.
+- `queries.update_contract_terms` (the extension path) now also sets
+  `season_index = 1`. An extension is treated as a new term starting in
+  the current season.
+- `budget_ops.rollover` computes the source season's payroll with the
+  new `queries.fetch_team_season_payroll` (rows that served that season
+  — `active`, `carried`, or `expired` — plus dead money) instead of
+  `fetch_team_effective_payroll` (active rows only). The number is
+  identical when carry-over has not run and stays put when it has.
+
 ## Migration 013 — team budgets (Phase 7)
 
 Apply as usual; the runner picks up `013_team_budgets.sql` on the next bot

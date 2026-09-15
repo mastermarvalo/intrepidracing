@@ -219,6 +219,31 @@ class AdminMarketCog(commands.Cog):
             f"\u2705 **{name}** is now the active season.", ephemeral=True
         )
 
+    @season.command(
+        name="carry-over",
+        description="Carry active contracts from a past season into the active one",
+    )
+    @app_commands.describe(from_season="Name of the season that just finished")
+    async def season_carry_over(
+        self, interaction: discord.Interaction, from_season: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await approvals.carry_over_season(
+                guild=interaction.guild,
+                actor=interaction.user,
+                from_season_name=from_season,
+            )
+        except approvals.ApprovalError as exc:
+            await interaction.followup.send(f"\u274c {exc}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            embed=_render_carry_over(result), ephemeral=True
+        )
+
     @season.command(name="list", description="List all seasons for this server")
     async def season_list(self, interaction: discord.Interaction) -> None:
         if not await _admin_or_deny(interaction):
@@ -2119,6 +2144,80 @@ def _render_rollover(from_season: str, lines) -> str:
         "didn't have one. Award prize money with `/market-admin budget award`."
     )
     return "\n".join(out)
+
+
+def _render_carry_over(result: approvals.CarryOverResult) -> discord.Embed:
+    report = result.report
+    outcome = report.outcome
+    embed = discord.Embed(
+        title=f"Contract carry-over: {report.from_season_name} \u2192 {report.to_season_name}",
+        description=(
+            f"**{outcome.carried}** carried \u2022 **{outcome.expired}** expired \u2022 "
+            f"**{outcome.skipped}** need attention \u2022 "
+            f"{outcome.drivers_created} driver rows created"
+        ),
+        colour=discord.Colour.orange() if outcome.skipped or outcome.over_cap
+        else discord.Colour.green(),
+    )
+    if not outcome.lines:
+        embed.add_field(
+            name="Nothing to do",
+            value=(
+                f"No active contracts remain in **{report.from_season_name}**. "
+                "Either carry-over already ran or nothing was signed."
+            ),
+            inline=False,
+        )
+        return embed
+
+    def team(line) -> str:
+        return report.team_names.get(line.team_id, f"team {line.team_id}")
+
+    carried = [
+        f"\u2022 {ln.display_name} \u2014 {team(ln)} {format_money(ln.contract_value)}, "
+        f"season {ln.season_index_from + 1}/{ln.term_seasons}"
+        + (f" (now `{ln.new_tier_code}`)" if ln.new_tier_code != ln.tier_code else "")
+        for ln in outcome.lines if ln.outcome == "carried"
+    ]
+    expired = [
+        f"\u2022 {ln.display_name} \u2014 {team(ln)} {format_money(ln.contract_value)}, "
+        f"{ln.term_seasons}-season deal complete \u2192 free agent"
+        for ln in outcome.lines if ln.outcome == "expired"
+    ]
+    skipped = [
+        f"\u2022 {ln.display_name} \u2014 {team(ln)}: {ln.reason} (contract `{ln.contract_id}` "
+        "left active)"
+        for ln in outcome.lines if ln.outcome == "skipped"
+    ]
+    for name, rows in (("Carried", carried), ("Expired", expired), ("Needs attention", skipped)):
+        if rows:
+            shown = rows[:_MAX_LISTED_RESULTS]
+            if len(rows) > len(shown):
+                shown.append(f"\u2026 and {len(rows) - len(shown)} more")
+            embed.add_field(name=name, value="\n".join(shown), inline=False)
+    if outcome.over_cap:
+        embed.add_field(
+            name="\u26a0 Over the spending cap after carry-over",
+            value="\n".join(
+                f"\u2022 {report.team_names.get(oc.team_id, oc.team_id)}: payroll "
+                f"{format_money(oc.payroll)} vs cap {format_money(oc.salary_cap)} "
+                f"(over by {format_money(oc.over_by)})"
+                for oc in outcome.over_cap
+            ) + "\nCarried deals are binding, so nothing was blocked. Resolve with a "
+            "release, buyout, or trade before that team signs anyone.",
+            inline=False,
+        )
+    if result.role_warnings:
+        embed.add_field(
+            name="Role warnings",
+            value="\n".join(f"\u2022 {w}" for w in result.role_warnings[:_MAX_LISTED_ERRORS]),
+            inline=False,
+        )
+    embed.set_footer(
+        text="Re-running is safe: only rows still active in the old season are touched. "
+        "Run `/market-admin budget rollover` for the money side."
+    )
+    return embed
 
 
 async def setup(bot: commands.Bot) -> None:

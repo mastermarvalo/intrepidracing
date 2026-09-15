@@ -7,6 +7,7 @@ the work in a transaction).
 """
 
 import json
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Sequence
 
@@ -1200,6 +1201,9 @@ def _row_to_contract(row: asyncpg.Record) -> Contract:
         approved_by=row["approved_by"],
         external_ref=row["external_ref"],
         created_at=row["created_at"],
+        season_index=row["season_index"],
+        carried_from_contract_id=row["carried_from_contract_id"],
+        origin_contract_id=row["origin_contract_id"],
     )
 
 
@@ -1219,22 +1223,110 @@ async def insert_contract(
     value_at_signing: Decimal | None,
     approved_by: int | None,
     external_ref: str | None = None,
+    season_index: int = 1,
+    carried_from_contract_id: int | None = None,
+    origin_contract_id: int | None = None,
+    signed_at: datetime | None = None,
 ) -> int:
+    """
+    `signed_at` defaults to NOW() for an active row. Carry-over passes the
+    original signing timestamp so a continuation row still says when the
+    deal was actually agreed.
+    """
     return await conn.fetchval(
         """
         INSERT INTO contracts
             (season_id, tier_id, driver_id, team_id, contract_value,
              signing_bonus, max_incentives, term_seasons, contract_type,
-             state, value_at_signing, signed_at, approved_by, external_ref)
+             state, value_at_signing, signed_at, approved_by, external_ref,
+             season_index, carried_from_contract_id, origin_contract_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                CASE WHEN $10 = 'active' THEN NOW() ELSE NULL END,
-                $12, $13)
+                COALESCE($14, CASE WHEN $10 = 'active' THEN NOW() ELSE NULL END),
+                $12, $13, $15, $16, $17)
         RETURNING id
         """,
         season_id, tier_id, driver_id, team_id, contract_value,
         signing_bonus, max_incentives, term_seasons, contract_type,
         state, value_at_signing, approved_by, external_ref,
+        signed_at, season_index, carried_from_contract_id, origin_contract_id,
     )
+
+
+async def fetch_active_contracts_for_season(
+    conn: asyncpg.Connection, season_id: int
+) -> list[Contract]:
+    """Every active row signed or carried into this season, oldest first."""
+    rows = await conn.fetch(
+        """
+        SELECT * FROM contracts
+        WHERE season_id = $1 AND state = 'active'
+        ORDER BY team_id, id
+        """,
+        season_id,
+    )
+    return [_row_to_contract(r) for r in rows]
+
+
+async def fetch_contract_chain(
+    conn: asyncpg.Connection, contract_id: int
+) -> list[Contract]:
+    """
+    The whole multi-season history of a deal, origin first. Accepts any
+    row in the chain.
+    """
+    rows = await conn.fetch(
+        """
+        WITH target AS (
+            SELECT COALESCE(origin_contract_id, id) AS origin_id
+            FROM contracts WHERE id = $1
+        )
+        SELECT c.* FROM contracts c, target
+        WHERE c.id = target.origin_id OR c.origin_contract_id = target.origin_id
+        ORDER BY c.season_index, c.id
+        """,
+        contract_id,
+    )
+    return [_row_to_contract(r) for r in rows]
+
+
+async def close_contract_at_season_end(
+    conn: asyncpg.Connection, contract_id: int, *, new_state: str
+) -> bool:
+    """
+    Move an ACTIVE row to `carried` or `expired`. Returns False when the
+    row was not active (already processed), so callers stay idempotent.
+    """
+    if new_state not in ("carried", "expired"):
+        raise ValueError(f"close_contract_at_season_end: bad state {new_state!r}")
+    status = await conn.execute(
+        "UPDATE contracts SET state = $2 WHERE id = $1 AND state = 'active'",
+        contract_id, new_state,
+    )
+    return status.endswith(" 1")
+
+
+async def fetch_team_season_payroll(
+    conn: asyncpg.Connection, team_id: int, season_id: int
+) -> Decimal:
+    """
+    Payroll that was committed *in* a given season: contract rows whose
+    season_id is that season and which served it (active, carried on, or
+    expired at its end), plus that season's dead money. This is what a
+    past season cost — unlike fetch_team_effective_payroll it does not
+    move when a later carry-over changes row states.
+    """
+    value = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(contract_value), 0)
+        FROM contracts
+        WHERE team_id = $1 AND season_id = $2
+          AND state IN ('active', 'carried', 'expired')
+        """,
+        team_id, season_id,
+    )
+    payroll = value if isinstance(value, Decimal) else Decimal(value)
+    dead = await fetch_dead_money_total(conn, team_id, season_id)
+    return payroll + dead
 
 
 async def fetch_contract_by_id(
@@ -1663,7 +1755,8 @@ async def update_contract_terms(
     await conn.execute(
         """
         UPDATE contracts
-        SET contract_value = $1, term_seasons = $2, signing_bonus = $3
+        SET contract_value = $1, term_seasons = $2, signing_bonus = $3,
+            season_index = 1
         WHERE id = $4 AND state = 'active'
         """,
         contract_value, term_seasons, signing_bonus, contract_id,

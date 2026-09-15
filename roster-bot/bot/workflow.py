@@ -25,6 +25,7 @@ from datetime import date
 from decimal import Decimal
 
 from bot import db, queries, results_ingest, sheets
+from bot.contracts import carryover as contract_carryover
 from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
 from bot.market import budget_ops, driver_ops
@@ -1752,6 +1753,52 @@ async def rollover_budgets(
             )
         except budget_ops.BudgetError as exc:
             raise WorkflowError(str(exc)) from exc
+
+
+@dataclass(frozen=True)
+class CarryOverReport:
+    from_season_name: str
+    to_season_name: str
+    outcome: contract_carryover.CarryOutcome
+    team_names: dict[int, str]
+
+
+async def carry_over_contracts(
+    *,
+    guild_id: int,
+    actor_id: int,
+    from_season_name: str,
+) -> CarryOverReport:
+    """
+    Carry every active contract in `from_season_name` into the ACTIVE
+    season: multi-season deals get their next row, finished deals expire.
+    One transaction; idempotent; skipped rows stay active and are
+    reported again on the next run. Run once after activating the new
+    season, alongside `/market-admin budget rollover`.
+    """
+    async with db.connect() as conn:
+        to_season = await queries.fetch_active_season(conn, guild_id)
+        if to_season is None:
+            raise WorkflowError("No active season to carry into. Activate the new season first.")
+        from_season = await queries.fetch_season_by_name(conn, guild_id, from_season_name)
+        if from_season is None:
+            raise WorkflowError(f"No season named `{from_season_name}`.")
+        try:
+            outcome = await contract_carryover.carry_over(
+                conn,
+                from_season_id=from_season.id,
+                to_season_id=to_season.id,
+                actor_id=actor_id,
+            )
+        except contract_carryover.CarryOverError as exc:
+            raise WorkflowError(str(exc)) from exc
+        teams = await queries.fetch_all_teams(conn, guild_id)
+    return CarryOverReport(
+        from_season_name=from_season.name,
+        to_season_name=to_season.name,
+        outcome=outcome,
+        team_names={t.id: t.name for t in teams},
+    )
 
 
 async def get_budget_config(*, guild_id: int, tier: str | None):

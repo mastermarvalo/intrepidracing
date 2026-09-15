@@ -426,6 +426,7 @@ class ContractsCog(commands.Cog):
                     "team_name": team.name if team else "?",
                     "contract_value": active.contract_value,
                     "term_seasons": active.term_seasons,
+                    "season_index": active.season_index,
                     "contract_type": active.contract_type,
                     "signed_at": active.signed_at,
                     "external_ref": active.external_ref,
@@ -874,7 +875,7 @@ class _ReviewSubmitView(discord.ui.View):
 class _CounterModal(discord.ui.Modal):
     def __init__(self, *, parent_offer) -> None:
         super().__init__(title=f"Counter offer #{parent_offer.id}")
-        self._parent = parent_offer
+        self._owner = parent_offer
         self._salary = discord.ui.TextInput(
             label="Counter salary ($M)",
             default=str(parent_offer.salary), required=True,
@@ -913,9 +914,9 @@ class _CounterModal(discord.ui.Modal):
 
         async with db.connect() as conn:
             cfg = await queries.fetch_league_config_row(
-                conn, self._parent.season_id, self._parent.tier_id
+                conn, self._owner.season_id, self._owner.tier_id
             ) or await queries.fetch_league_config_row(
-                conn, self._parent.season_id, None
+                conn, self._owner.season_id, None
             )
             if cfg is None:
                 await interaction.response.send_message(
@@ -923,20 +924,20 @@ class _CounterModal(discord.ui.Modal):
                 )
                 return
             payroll_before = await queries.fetch_team_effective_payroll(
-                conn, self._parent.team_id, self._parent.season_id,
+                conn, self._owner.team_id, self._owner.season_id,
             )
             budget_snap = await budget_ops.snapshot(
-                conn, season_id=self._parent.season_id, tier_id=self._parent.tier_id,
-                team_id=self._parent.team_id, actor_id=interaction.user.id,
+                conn, season_id=self._owner.season_id, tier_id=self._owner.tier_id,
+                team_id=self._owner.team_id, actor_id=interaction.user.id,
             )
             slots_used = await queries.fetch_team_active_slot_count(
-                conn, self._parent.team_id
+                conn, self._owner.team_id
             )
             driver_row = await conn.fetchrow(
-                "SELECT status FROM drivers WHERE id = $1", self._parent.driver_id
+                "SELECT status FROM drivers WHERE id = $1", self._owner.driver_id
             )
             existing = await queries.fetch_active_contract_for_driver(
-                conn, self._parent.driver_id
+                conn, self._owner.driver_id
             )
             inputs = rules.OfferInputs(
                 actor_id=interaction.user.id,
@@ -963,7 +964,7 @@ class _CounterModal(discord.ui.Modal):
                 term_seasons=term,
                 min_term_seasons=cfg.min_term_seasons,
                 max_term_seasons=cfg.max_term_seasons,
-                offer_kind=self._parent.offer_kind,
+                offer_kind=self._owner.offer_kind,
                 free_agency_open=cfg.free_agency_open,
             )
             # Skip actor-is-authorised for counter validation — the
@@ -973,7 +974,7 @@ class _CounterModal(discord.ui.Modal):
             try:
                 child_id = await service.driver_counter(
                     conn,
-                    self._parent.id,
+                    self._owner.id,
                     actor_id=interaction.user.id,
                     salary=salary,
                     term_seasons=term,
