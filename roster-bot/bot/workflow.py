@@ -1410,6 +1410,134 @@ async def show_round(
     )
 
 
+# ── Setup polish (list seasons/tiers, edit tier, show config, FA) ────
+#
+# Backs the Setup sub-panels for browsing seasons and tiers, viewing
+# the current league config, and toggling free agency. Mirrors
+# `/market-admin season list`, `tier list|edit`, `config show`, and
+# `config free-agency`.
+
+
+async def list_seasons(guild_id: int):
+    """Every season for the guild, order not guaranteed here."""
+    async with db.connect() as conn:
+        return await queries.fetch_all_seasons(conn, guild_id)
+
+
+async def list_tiers(guild_id: int):
+    """
+    Every tier in the active season with rank / label / role / colour.
+
+    Returns [] when no season is active — the caller renders an empty
+    state rather than raising.
+    """
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            return []
+        return await queries.fetch_all_tiers(conn, season.id)
+
+
+async def edit_tier(
+    *,
+    guild_id: int,
+    tier_code: str,
+    label: str,
+    rank_order: int,
+    accent_color: int | None,
+) -> None:
+    """
+    Rewrite a tier's label / rank / accent colour, preserving its role.
+
+    Reuses `update_tier`, which rewrites every column, so we read the
+    current tier_role_id first and pass it back unchanged (identical
+    pattern to `set_tier_role`).
+    """
+    label = label.strip()
+    if not label:
+        raise WorkflowError("Tier label cannot be empty.")
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        tier = await queries.fetch_tier(conn, season.id, tier_code)
+        if tier is None:
+            raise WorkflowError(
+                f"No tier `{tier_code}` in **{season.name}**."
+            )
+        await queries.update_tier(
+            conn,
+            tier.id,
+            label=label,
+            rank_order=rank_order,
+            tier_role_id=tier.tier_role_id,
+            accent_color=accent_color,
+        )
+
+
+async def show_config(guild_id: int, *, tier_code: str | None = None):
+    """
+    Read the league config for the season default or a tier override.
+
+    Raises WorkflowError when the target scope has no row so the panel
+    can render a "seed with the F1 preset" hint.
+    """
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        tier_id: int | None = None
+        if tier_code is not None:
+            tier = await queries.fetch_tier(conn, season.id, tier_code)
+            if tier is None:
+                raise WorkflowError(
+                    f"No tier `{tier_code}` in **{season.name}**."
+                )
+            tier_id = tier.id
+        cfg = await queries.fetch_league_config_row(conn, season.id, tier_id)
+    if cfg is None:
+        scope = f"tier `{tier_code}`" if tier_code else "the season default"
+        raise WorkflowError(
+            f"No league config row for {scope}. Create a season with the "
+            "F1 preset to seed one."
+        )
+    return cfg
+
+
+async def set_free_agency(
+    *,
+    guild_id: int,
+    is_open: bool,
+    tier_code: str | None = None,
+) -> None:
+    """
+    Toggle the free_agency_open flag on the season default or a tier
+    override. Same fallback shape as `set_channel` / `set_commissioner_role`.
+    """
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        tier_id: int | None = None
+        if tier_code is not None:
+            tier = await queries.fetch_tier(conn, season.id, tier_code)
+            if tier is None:
+                raise WorkflowError(
+                    f"No tier `{tier_code}` in **{season.name}**."
+                )
+            tier_id = tier.id
+        if await queries.fetch_league_config_row(conn, season.id, tier_id) is None:
+            raise WorkflowError(
+                "No config row for that scope. Run Setup → Cap & rules first."
+            )
+        await queries.set_league_config_channels(
+            conn,
+            season_id=season.id,
+            tier_id=tier_id,
+            free_agency_open=is_open,
+        )
+
+
 async def list_tier_choices(guild_id: int) -> list[tuple[str, str]]:
     """
     `(code, label)` pairs for the active season's tiers, in rank order.

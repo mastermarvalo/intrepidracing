@@ -876,3 +876,91 @@ async def test_show_round_rejects_unknown_round(workflow_db):
         await workflow.show_round(
             GUILD, tier_code="t1", round_label="never-imported"
         )
+
+
+# ── setup polish (list seasons/tiers, edit tier, show config, FA) ────
+
+
+async def test_list_seasons_returns_all_seasons(workflow_db):
+    await _seeded_season(workflow_db, name="S1")
+    await workflow.create_season(guild_id=GUILD, name="S2")
+
+    names = {s.name for s in await workflow.list_seasons(GUILD)}
+    assert names == {"S1", "S2"}
+
+
+async def test_list_tiers_returns_seeded_preset_tiers(workflow_db):
+    await _seeded_season(workflow_db)
+
+    codes = {t.code for t in await workflow.list_tiers(GUILD)}
+    assert codes == {"t1", "t2", "t3"}
+
+
+async def test_list_tiers_empty_when_no_season(workflow_db):
+    tiers = await workflow.list_tiers(GUILD)
+    assert tiers == []
+
+
+async def test_edit_tier_updates_fields_and_preserves_role(workflow_db):
+    await _seeded_season(workflow_db)
+    await workflow.set_tier_role(guild_id=GUILD, tier_code="t1", role_id=42)
+
+    await workflow.edit_tier(
+        guild_id=GUILD, tier_code="t1",
+        label="Elite", rank_order=1, accent_color=0xE10600,
+    )
+
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    t1 = await queries.fetch_tier(workflow_db, season.id, "t1")
+    assert t1.label == "Elite"
+    assert t1.accent_color == 0xE10600
+    assert t1.tier_role_id == 42, "role must not be blanked by an edit"
+
+
+async def test_edit_tier_rejects_empty_label(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="label"):
+        await workflow.edit_tier(
+            guild_id=GUILD, tier_code="t1",
+            label="   ", rank_order=1, accent_color=None,
+        )
+
+
+async def test_edit_tier_rejects_unknown_tier(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="No tier"):
+        await workflow.edit_tier(
+            guild_id=GUILD, tier_code="nope",
+            label="X", rank_order=1, accent_color=None,
+        )
+
+
+async def test_show_config_returns_the_season_default(workflow_db):
+    await _seeded_season(workflow_db)
+    cfg = await workflow.show_config(GUILD)
+    # Preset seeds a season-default row with tier_id NULL.
+    assert cfg.tier_id is None
+    assert cfg.salary_cap == Decimal("145.00")
+
+
+async def test_show_config_raises_when_no_config(workflow_db):
+    await workflow.create_and_activate_season(guild_id=GUILD, name="empty")
+    with pytest.raises(workflow.WorkflowError, match="No league config"):
+        await workflow.show_config(GUILD)
+
+
+async def test_set_free_agency_toggles_the_flag(workflow_db):
+    await _seeded_season(workflow_db)
+    assert (await workflow.show_config(GUILD)).free_agency_open is False
+
+    await workflow.set_free_agency(guild_id=GUILD, is_open=True)
+    assert (await workflow.show_config(GUILD)).free_agency_open is True
+
+    await workflow.set_free_agency(guild_id=GUILD, is_open=False)
+    assert (await workflow.show_config(GUILD)).free_agency_open is False
+
+
+async def test_set_free_agency_rejects_missing_config_row(workflow_db):
+    await workflow.create_and_activate_season(guild_id=GUILD, name="empty")
+    with pytest.raises(workflow.WorkflowError, match="config row"):
+        await workflow.set_free_agency(guild_id=GUILD, is_open=True)

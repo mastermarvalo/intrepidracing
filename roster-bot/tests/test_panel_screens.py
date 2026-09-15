@@ -900,7 +900,51 @@ def test_setup_exposes_every_configuration_area():
         "Commissioner role",
         "Channels",
         "Boards",
+        "Free agency",
     } <= labels
+
+
+def test_seasons_embed_marks_the_active_season():
+    from bot.models import Season
+
+    now = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    embed = setup_screen._build_seasons_embed([
+        Season(id=1, guild_id=1, name="S1", is_active=True, created_at=now),
+        Season(id=2, guild_id=1, name="S2", is_active=False, created_at=now),
+    ])
+
+    assert "active" in embed.description
+    assert "S1" in embed.description
+    assert "S2" in embed.description
+
+
+def test_tiers_embed_shows_role_link_status():
+    from bot.models import Tier
+
+    embed = setup_screen._build_tiers_embed([
+        Tier(id=1, season_id=1, code="t1", label="Elite", rank_order=1,
+             tier_role_id=999),
+        Tier(id=2, season_id=1, code="t2", label="Pro", rank_order=2,
+             tier_role_id=None),
+    ])
+
+    assert "t1" in embed.description
+    assert "t2" in embed.description
+    assert "role linked" in embed.description
+    assert "no role" in embed.description
+
+
+def test_free_agency_button_is_disabled_without_a_season():
+    view = setup_screen.SetupView(
+        status=league_status(season=None, season_id=None, tiers=[], has_config=False),
+        opener_id=1,
+        on_back=noop_back,
+    )
+    by_label = {c.label: c for c in view.children if getattr(c, "label", None)}
+
+    assert by_label["Free agency"].disabled, (
+        "toggling a flag on a config row that does not exist can only fail"
+    )
 
 
 def test_channel_kind_options_match_the_workflow_list():
