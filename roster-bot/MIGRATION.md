@@ -1,5 +1,53 @@
 # Upgrade notes
 
+## Migration 013 — team budgets (Phase 7)
+
+Apply as usual; the runner picks up `013_team_budgets.sql` on the next bot
+start. Forward-only, safe to re-apply.
+
+**What it adds**
+
+- `budget_entry_kinds` — lookup of ledger kinds with a `direction`
+  (`credit`, `debit`, `either`). Seeded with `opening_balance`,
+  `rollover`, `prize_money`, `race_earnings`, `dnf_penalty`,
+  `dns_penalty`, `incident_penalty`, `adjustment`.
+- `team_budget_ledger` — append-only, one row per money movement, with
+  `season_id`, `team_id`, `kind`, `amount NUMERIC(12,2)`, optional
+  `race_result_id` / `round_id` / `from_season_id`, `is_correction`,
+  `actor_id`. A trigger rejects a row whose sign disagrees with its kind
+  unless `is_correction` is set. Partial unique indexes allow exactly one
+  `opening_balance` and one `rollover` per team per season.
+- `budget_config` — season default with optional per-tier override:
+  `enforce_budget`, `rollover_enabled`, `opening_budget`,
+  `earnings_per_point`, `dnf_penalty`, `dns_penalty`,
+  `penalty_per_incident_pt`.
+
+**What it changes in existing data**
+
+Nothing. No existing table is altered and no rows are written.
+
+**Behavioural changes to be aware of**
+
+- **Existing seasons are not enforced until you opt in.** The F1 preset
+  seeds a `budget_config` row for seasons created *after* this upgrade.
+  A season that already exists has no row, so offers, trades, and imports
+  behave exactly as before. To enable budgets on a running season, run
+  `/market-admin budget config enforce: true ...` once.
+- **Trade approval now checks the receiving team's cap and budget.**
+  Before Phase 7, `commissioner_approve_trade` executed the transfer
+  without checking payroll against the salary cap. It now refuses a trade
+  that would put the receiving team over the spending cap (always) or
+  over its budget (when enforced). This closes a pre-existing gap.
+- **Offer validation gains a rule.** `budget_headroom_ok` produces the
+  `budget_exceeded` code. When budgets are not enforced it passes with a
+  note, so existing review panels are unchanged apart from one extra line.
+
+**Preset rates are placeholders.** `earnings_per_point 0.05`,
+`dnf_penalty 0.50`, `dns_penalty 1.00`, `penalty_per_incident_pt 0.25`
+were chosen so that a full season of results moves a budget by single-
+digit millions against a $145M cap. Tune them with
+`/market-admin budget config` once you have seen a real round.
+
 ## Migration 010 — race results and normalization (Phase 6)
 
 Apply as usual; the runner picks up `010_race_results_and_normalization.sql`

@@ -145,6 +145,54 @@ def test_cap_signing_bonus_counts_against_cap():
     assert r.code == "cap_exceeded"
 
 
+# ── budget vs cap: two different walls ─────────────────────────────
+
+
+def test_budget_not_enforced_passes_when_none():
+    r = rules.budget_headroom_ok(_replace(_baseline_ok(), team_budget=None))
+    assert r.ok
+    assert r.detail["enforced"] == "false"
+
+
+def test_budget_exceeded_blocks_even_when_under_cap():
+    # Payroll after = 52, cap 145 (fine), budget 51 (not fine).
+    i = _replace(_baseline_ok(),
+                 team_payroll_before=Decimal("50.00"),
+                 salary=Decimal("2.00"), team_budget=Decimal("51.00"))
+    assert rules.cap_headroom_ok(i).ok
+    r = rules.budget_headroom_ok(i)
+    assert r.code == "budget_exceeded"
+    assert r.detail["committed_after"] == "52.00"
+    assert r.detail["short_by"] == "1.00"
+    assert not rules.validate_offer(i).ok
+
+
+def test_rich_team_is_still_blocked_by_cap():
+    # Budget 200 > cap 145: money is not the problem, the ceiling is.
+    i = _replace(_baseline_ok(),
+                 team_payroll_before=Decimal("144.00"),
+                 salary=Decimal("2.00"), team_budget=Decimal("200.00"))
+    assert rules.budget_headroom_ok(i).ok
+    assert rules.cap_headroom_ok(i).code == "cap_exceeded"
+    assert not rules.validate_offer(i).ok
+
+
+def test_budget_signing_bonus_counts_against_budget():
+    i = _replace(_baseline_ok(),
+                 team_payroll_before=Decimal("50.00"),
+                 salary=Decimal("0.50"), signing_bonus=Decimal("1.00"),
+                 team_budget=Decimal("51.00"))
+    assert rules.budget_headroom_ok(i).code == "budget_exceeded"
+
+
+def test_negative_budget_blocks_any_signing():
+    # Penalties pushed the team underwater; nothing fits until it earns back.
+    i = _replace(_baseline_ok(),
+                 team_payroll_before=Decimal("0"),
+                 salary=Decimal("1.00"), team_budget=Decimal("-3.00"))
+    assert rules.budget_headroom_ok(i).code == "budget_exceeded"
+
+
 def test_no_seat_available_blocks():
     i = _replace(_baseline_ok(),
                  active_slots_used=2, active_slots_max=2,
@@ -246,6 +294,9 @@ def test_every_documented_rule_code_is_reachable():
         _replace(_baseline_ok(), salary=Decimal("60"), max_salary=Decimal("50")),
         _replace(_baseline_ok(),
                  team_payroll_before=Decimal("144"), salary=Decimal("2")),
+        _replace(_baseline_ok(),
+                 team_payroll_before=Decimal("50"), salary=Decimal("2"),
+                 team_budget=Decimal("51")),
         _replace(_baseline_ok(),
                  active_slots_used=2, active_slots_max=2),
         _replace(_baseline_ok(), term_seasons=0),

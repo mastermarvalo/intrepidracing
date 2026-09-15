@@ -30,6 +30,7 @@ from decimal import Decimal
 import asyncpg
 
 from bot import queries
+from bot.market import budget_ops
 
 _ZERO = Decimal(0)
 
@@ -882,6 +883,8 @@ async def commissioner_approve_trade(
     _require_trade_state(trade, {"pending_approval"})
     items = await queries.fetch_trade_items(conn, trade_id)
 
+    await _require_trade_affordable(conn, trade, items)
+
     approved_ref = f"TR-S{trade.season_id}-{trade.id:04d}"
     for item in items:
         new_team_id = (
@@ -1002,6 +1005,53 @@ async def move_driver_between_tiers(
 
 
 _TERMINAL_TRADE_STATES = {"approved", "rejected", "declined", "withdrawn", "expired"}
+
+
+async def _require_trade_affordable(conn, trade, items) -> None:
+    """
+    Both teams' post-trade payroll must clear the spending cap AND
+    their own budget. The cap is the league ceiling; the budget is the
+    team's money — a trade that a rich team can afford is still blocked
+    at the cap, and a trade under the cap is still blocked if the team
+    cannot pay for it. Mirrors `cap_headroom_ok` / `budget_headroom_ok`
+    for offers; the review embed shows the same arithmetic beforehand.
+    """
+    change: dict[int, Decimal] = {
+        trade.proposing_team_id: Decimal(0),
+        trade.other_team_id: Decimal(0),
+    }
+    for item in items:
+        contract = await queries.fetch_contract_by_id(conn, item.contract_id)
+        if contract is None:
+            continue
+        to_team = (
+            trade.other_team_id if item.from_team_id == trade.proposing_team_id
+            else trade.proposing_team_id
+        )
+        change[item.from_team_id] -= contract.contract_value
+        change[to_team] += contract.contract_value
+
+    cfg = await queries.fetch_league_config_row(conn, trade.season_id, None)
+    for team_id, delta in change.items():
+        if delta <= 0:
+            continue  # shedding payroll never needs headroom
+        payroll_after = (
+            await queries.fetch_team_effective_payroll(conn, team_id, trade.season_id)
+            + delta
+        )
+        if cfg is not None and payroll_after > cfg.salary_cap:
+            raise TransitionError(
+                f"Trade would put team {team_id} at {payroll_after}, over the "
+                f"{cfg.salary_cap} spending cap."
+            )
+        snap = await budget_ops.snapshot(
+            conn, season_id=trade.season_id, tier_id=None, team_id=team_id,
+        )
+        if snap is not None and payroll_after > snap.balance:
+            raise TransitionError(
+                f"Trade would put team {team_id} at {payroll_after}, more than "
+                f"its {snap.balance} budget."
+            )
 
 
 async def _load_open_trade(conn, trade_id: int):

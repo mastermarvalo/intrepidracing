@@ -24,6 +24,7 @@ from discord.ext import commands
 from bot import db, queries, roster_ops
 from bot.contracts import render as contract_render
 from bot.contracts import service
+from bot.market import budget_ops
 
 log = logging.getLogger(__name__)
 
@@ -309,6 +310,12 @@ async def _build_trade_embed(conn, trade_id: int) -> discord.Embed:
         await queries.fetch_league_config_row(conn, trade.season_id, None)
     )
     cap = cfg.salary_cap if cfg else Decimal(0)
+    snap_p = await budget_ops.snapshot(
+        conn, season_id=trade.season_id, tier_id=None, team_id=trade.proposing_team_id,
+    )
+    snap_o = await budget_ops.snapshot(
+        conn, season_id=trade.season_id, tier_id=None, team_id=trade.other_team_id,
+    )
 
     embed = contract_render.render_trade_review(
         proposing_team_name=proposing.name if proposing else "?",
@@ -321,6 +328,8 @@ async def _build_trade_embed(conn, trade_id: int) -> discord.Embed:
         payroll_before_other=payroll_o,
         payroll_after_other=payroll_o + change_other,
         salary_cap_other=cap,
+        budget_proposing=snap_p.balance if snap_p else None,
+        budget_other=snap_o.balance if snap_o else None,
     )
     embed.set_footer(
         text=(

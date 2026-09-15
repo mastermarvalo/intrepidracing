@@ -27,7 +27,7 @@ from decimal import Decimal
 from bot import db, queries, results_ingest, sheets
 from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
-from bot.market import driver_ops
+from bot.market import budget_ops, driver_ops
 from bot.market import results as results_engine
 from bot.market import valuation as valuation_engine
 
@@ -58,6 +58,10 @@ class ImportOutcome:
     round_order: int
     written: int
     missing_drivers: list[str] = field(default_factory=list)
+    # Budget consequences of the import; None when budgets are not
+    # configured for the season so the renderer can stay silent.
+    budget: budget_ops.RoundBudgetOutcome | None = None
+    budget_unattributed: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -187,12 +191,29 @@ async def import_round(
         seen = {r["driver_id"] for r in resolved}
         missing = [d.display_name for d in drivers if d.id not in seen]
 
+        # Same transaction as the results: a round's facts and its money
+        # consequences land together or not at all.
+        budget_outcome = await budget_ops.apply_round_charges(
+            conn,
+            season_id=season.id,
+            tier_id=tier_row.id,
+            round_id=round_row["id"],
+            actor_id=user_id,
+        )
+        names_by_id = {d.id: d.display_name for d in drivers}
+        unattributed = [
+            names_by_id.get(did, str(did))
+            for did in budget_outcome.unattributed_driver_ids
+        ]
+
     return ImportOutcome(
         tier_code=tier,
         round_label=round_label,
         round_order=round_row["round_order"],
         written=written,
         missing_drivers=missing,
+        budget=budget_outcome if budget_outcome.enforced else None,
+        budget_unattributed=unattributed if budget_outcome.enforced else [],
     )
 
 
@@ -1604,6 +1625,196 @@ async def adjust_team_cap(
             actor_id=actor_id,
         )
     return delta
+
+
+# ── Team budgets (Phase 7) ───────────────────────────────────────────
+# The spending cap is a league rule; the budget is a team's money. Both
+# are enforced on every signing. These wrappers give slash commands and
+# panel screens one Discord-free entry point each.
+
+
+@dataclass(frozen=True)
+class TeamBudgetSummary:
+    team_id: int
+    team_key: str
+    team_name: str
+    season_name: str
+    salary_cap: Decimal
+    balance: Decimal
+    effective_payroll: Decimal
+    available: Decimal
+    cap_space: Decimal
+    totals_by_kind: dict[str, Decimal]
+    recent: list
+    config: budget_ops.budget_engine.BudgetConfig
+
+
+async def team_budget(*, guild_id: int, team_key: str, recent_limit: int) -> TeamBudgetSummary:
+    """A team's budget position alongside its cap position, for `budget show`."""
+    async with db.connect() as conn:
+        team = await queries.fetch_team(conn, guild_id, team_key.lower())
+        if team is None:
+            raise WorkflowError(f"No team `{team_key}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        tier_id = None  # teams are not tier-scoped in the model; season default applies
+        snap = await budget_ops.snapshot(
+            conn, season_id=season.id, tier_id=tier_id, team_id=team.id,
+        )
+        if snap is None:
+            raise WorkflowError(
+                "Budgets are not configured for this season. Run "
+                "`/market-admin budget config` to enable them."
+            )
+        league_cfg = await queries.fetch_league_config_row(conn, season.id, tier_id) \
+            or await queries.fetch_league_config_row(conn, season.id, None)
+        salary_cap = league_cfg.salary_cap if league_cfg else Decimal(0)
+        totals = await queries.fetch_budget_totals_by_kind(conn, team.id, season.id)
+        recent = await queries.fetch_budget_entries(conn, team.id, season.id, recent_limit)
+    return TeamBudgetSummary(
+        team_id=team.id,
+        team_key=team.key,
+        team_name=team.name,
+        season_name=season.name,
+        salary_cap=salary_cap,
+        balance=snap.balance,
+        effective_payroll=snap.effective_payroll,
+        available=snap.available,
+        cap_space=salary_cap - snap.effective_payroll,
+        totals_by_kind=totals,
+        recent=recent,
+        config=snap.config,
+    )
+
+
+async def award_budget(
+    *,
+    guild_id: int,
+    actor_id: int,
+    team_key: str,
+    kind: str,
+    amount: Decimal,
+    note: str,
+) -> Decimal:
+    """
+    Commissioner credit/debit to a team's budget. `kind` is `prize_money`
+    (credit only) or `adjustment` (either sign). Returns the new balance.
+    """
+    async with db.connect() as conn:
+        team = await queries.fetch_team(conn, guild_id, team_key.lower())
+        if team is None:
+            raise WorkflowError(f"No team `{team_key}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        try:
+            return await budget_ops.award(
+                conn,
+                season_id=season.id,
+                tier_id=None,
+                team_id=team.id,
+                kind=kind,
+                amount=amount,
+                note=note,
+                actor_id=actor_id,
+            )
+        except budget_ops.BudgetError as exc:
+            raise WorkflowError(str(exc)) from exc
+
+
+async def rollover_budgets(
+    *,
+    guild_id: int,
+    actor_id: int,
+    from_season_name: str,
+) -> list[budget_ops.RolloverLine]:
+    """
+    Carry every team's unspent budget from `from_season_name` into the
+    ACTIVE season. Idempotent per team. Run this once after activating
+    the new season and before opening free agency.
+    """
+    async with db.connect() as conn:
+        to_season = await queries.fetch_active_season(conn, guild_id)
+        if to_season is None:
+            raise WorkflowError("No active season to roll into. Activate the new season first.")
+        from_season = await queries.fetch_season_by_name(conn, guild_id, from_season_name)
+        if from_season is None:
+            raise WorkflowError(f"No season named `{from_season_name}`.")
+        teams = await queries.fetch_all_teams(conn, guild_id)
+        try:
+            return await budget_ops.rollover(
+                conn,
+                from_season_id=from_season.id,
+                to_season_id=to_season.id,
+                teams=[(t.id, t.name) for t in teams],
+                actor_id=actor_id,
+            )
+        except budget_ops.BudgetError as exc:
+            raise WorkflowError(str(exc)) from exc
+
+
+async def get_budget_config(*, guild_id: int, tier: str | None):
+    """Resolved budget config for the active season (tier override if any)."""
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        tier_id = None
+        if tier:
+            tier_row = await queries.fetch_tier(conn, season.id, tier)
+            if tier_row is None:
+                raise WorkflowError(f"No tier `{tier}` in **{season.name}**.")
+            tier_id = tier_row.id
+        return await queries.fetch_budget_config(conn, season.id, tier_id)
+
+
+async def set_budget_config(
+    *,
+    guild_id: int,
+    tier: str | None,
+    enforce_budget: bool,
+    rollover_enabled: bool,
+    opening_budget: Decimal,
+    earnings_per_point: Decimal,
+    dnf_penalty: Decimal,
+    dns_penalty: Decimal,
+    penalty_per_incident_pt: Decimal,
+):
+    """Create or update the budget config row for the active season / tier."""
+    for label, value in (
+        ("opening_budget", opening_budget),
+        ("earnings_per_point", earnings_per_point),
+        ("dnf_penalty", dnf_penalty),
+        ("dns_penalty", dns_penalty),
+        ("penalty_per_incident_pt", penalty_per_incident_pt),
+    ):
+        if value < 0:
+            raise WorkflowError(
+                f"`{label}` must be zero or positive (penalties are stored as magnitudes)."
+            )
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError("No active season.")
+        tier_id = None
+        if tier:
+            tier_row = await queries.fetch_tier(conn, season.id, tier)
+            if tier_row is None:
+                raise WorkflowError(f"No tier `{tier}` in **{season.name}**.")
+            tier_id = tier_row.id
+        return await queries.upsert_budget_config(
+            conn,
+            season_id=season.id,
+            tier_id=tier_id,
+            enforce_budget=enforce_budget,
+            rollover_enabled=rollover_enabled,
+            opening_budget=opening_budget,
+            earnings_per_point=earnings_per_point,
+            dnf_penalty=dnf_penalty,
+            dns_penalty=dns_penalty,
+            penalty_per_incident_pt=penalty_per_incident_pt,
+        )
 
 
 async def list_tier_choices(guild_id: int) -> list[tuple[str, str]]:

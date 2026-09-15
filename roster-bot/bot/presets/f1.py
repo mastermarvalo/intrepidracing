@@ -168,6 +168,34 @@ _DEFAULT_RESULTS_CONFIG: dict[str, object] = {
     "max_incident_points": Decimal("6.00"),
 }
 
+# Team budget defaults, in $M. These are STARTING POINTS for a league to
+# tune via /market-admin budget config, not a claim about the right
+# numbers for any given grid.
+#
+#   opening_budget = salary_cap so that, on the day this ships, a team
+#   with no prize money and no penalties can commit exactly what it
+#   could before — the budget only starts to bite once results move it.
+#
+#   earnings_per_point: a win (25 pts) earns $1.25M; a team scoring
+#   ~40 pts a round across a 12-round season banks ~$24M — meaningful
+#   against a $145M cap without making the cap irrelevant.
+#
+#   dns_penalty > dnf_penalty on purpose: not showing up costs the league
+#   a grid slot and the other teams a race, so it is priced above a
+#   retirement that at least started.
+#
+#   penalty_per_incident_pt × max_incident_points (6.00) caps a single
+#   weekend's stewarding at $1.50M.
+_DEFAULT_BUDGET_CONFIG: dict[str, object] = {
+    "enforce_budget": True,
+    "rollover_enabled": True,
+    "opening_budget": Decimal("145.00"),
+    "earnings_per_point": Decimal("0.0500"),
+    "dnf_penalty": Decimal("0.50"),
+    "dns_penalty": Decimal("1.00"),
+    "penalty_per_incident_pt": Decimal("0.2500"),
+}
+
 # F1 25/26 defaults, in $M. Commissioners override via
 # /market-admin config set. All amounts are Decimal to keep the money
 # path float-free from day 1.
@@ -202,6 +230,7 @@ async def seed_season(conn: asyncpg.Connection, season_id: int) -> None:
       - season-scoped valuation_factors
       - season-scoped position_scores (the normalization curve)
       - season-default results_config row (tier_id = NULL)
+      - season-default budget_config row (tier_id = NULL)
       - season-default league_config row (tier_id = NULL)
 
     The caller is responsible for creating the season row first and for
@@ -212,6 +241,7 @@ async def seed_season(conn: asyncpg.Connection, season_id: int) -> None:
     await _seed_valuation_factors(conn, season_id)
     await _seed_position_scores(conn, season_id)
     await _seed_default_results_config(conn, season_id)
+    await _seed_default_budget_config(conn, season_id)
     await _seed_default_config(conn, season_id)
 
 
@@ -303,6 +333,27 @@ async def _seed_default_results_config(conn: asyncpg.Connection, season_id: int)
         _DEFAULT_RESULTS_CONFIG["form_window_rounds"],
         _DEFAULT_RESULTS_CONFIG["consistency_window_rounds"],
         _DEFAULT_RESULTS_CONFIG["max_incident_points"],
+    )
+
+
+async def _seed_default_budget_config(conn: asyncpg.Connection, season_id: int) -> None:
+    await conn.execute(
+        """
+        INSERT INTO budget_config
+            (season_id, tier_id, enforce_budget, rollover_enabled,
+             opening_budget, earnings_per_point, dnf_penalty, dns_penalty,
+             penalty_per_incident_pt)
+        VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT DO NOTHING
+        """,
+        season_id,
+        _DEFAULT_BUDGET_CONFIG["enforce_budget"],
+        _DEFAULT_BUDGET_CONFIG["rollover_enabled"],
+        _DEFAULT_BUDGET_CONFIG["opening_budget"],
+        _DEFAULT_BUDGET_CONFIG["earnings_per_point"],
+        _DEFAULT_BUDGET_CONFIG["dnf_penalty"],
+        _DEFAULT_BUDGET_CONFIG["dns_penalty"],
+        _DEFAULT_BUDGET_CONFIG["penalty_per_incident_pt"],
     )
 
 

@@ -58,6 +58,13 @@ class OfferInputs:
     team_payroll_before: Decimal = _ZERO
     salary_cap: Decimal = _ZERO
 
+    # ── budget
+    # The team's budget BALANCE (sum of its budget ledger), distinct from
+    # the cap. None means budgets are not enforced for this season — the
+    # rule passes with an informational note rather than blocking, so a
+    # league that never configured budgets is unaffected.
+    team_budget: Decimal | None = None
+
     # ── slots
     active_slots_used: int = 0
     active_slots_max: int = 0
@@ -221,6 +228,52 @@ def cap_headroom_ok(inputs: OfferInputs) -> RuleResult:
     )
 
 
+def budget_headroom_ok(inputs: OfferInputs) -> RuleResult:
+    """
+    Committed payroll must also fit inside the team's budget balance.
+
+    Deliberately a separate rule from `cap_headroom_ok` with its own
+    failure code: a TP who cannot afford a driver and a TP who would
+    breach the league ceiling have hit different walls and need
+    different messages. The cap is the same for everyone; the budget is
+    what this team has earned.
+    """
+    if inputs.team_budget is None:
+        return _pass(
+            "budget_headroom_ok",
+            "Budgets are not enforced this season.",
+            detail={"enforced": "false"},
+        )
+    committed = inputs.team_payroll_before + inputs.salary + inputs.signing_bonus
+    if committed <= inputs.team_budget:
+        return _pass(
+            "budget_headroom_ok",
+            f"Payroll after signing ({committed}) fits inside the team budget "
+            f"({inputs.team_budget}).",
+            detail={
+                "payroll_before": str(inputs.team_payroll_before),
+                "salary": str(inputs.salary),
+                "signing_bonus": str(inputs.signing_bonus),
+                "committed_after": str(committed),
+                "team_budget": str(inputs.team_budget),
+            },
+        )
+    short = committed - inputs.team_budget
+    return _block(
+        "budget_exceeded",
+        f"Signing would put payroll at {committed}, {short} more than the "
+        f"team's {inputs.team_budget} budget.",
+        detail={
+            "payroll_before": str(inputs.team_payroll_before),
+            "salary": str(inputs.salary),
+            "signing_bonus": str(inputs.signing_bonus),
+            "committed_after": str(committed),
+            "team_budget": str(inputs.team_budget),
+            "short_by": str(short),
+        },
+    )
+
+
 def seat_available(inputs: OfferInputs) -> RuleResult:
     if inputs.offer_kind == "extension":
         return _pass(
@@ -339,6 +392,7 @@ _RULES = (
     no_active_contract_conflict,
     salary_within_bounds,
     cap_headroom_ok,
+    budget_headroom_ok,
     seat_available,
     term_within_bounds,
     incentives_within_cap,
@@ -372,6 +426,7 @@ def rule_codes() -> Sequence[str]:
         "salary_below_min",
         "salary_above_max",
         "cap_exceeded",
+        "budget_exceeded",
         "no_seat_available",
         "term_too_short",
         "term_below_minimum",
@@ -414,6 +469,7 @@ __all__ = [
     "no_active_contract_conflict",
     "salary_within_bounds",
     "cap_headroom_ok",
+    "budget_headroom_ok",
     "seat_available",
     "term_within_bounds",
     "incentives_within_cap",

@@ -78,6 +78,8 @@ _DEFAULT_RESULTS_RANGE = "A1:Z100"
 # Discord message limits — these govern rendering only, never league maths.
 _DISCORD_MSG_LIMIT = 1900
 _MAX_LISTED_NAMES = 8
+# Ledger rows shown by `/market-admin budget show`.
+_BUDGET_RECENT_LIMIT = 8
 _MAX_LISTED_ROUNDS = 25
 _MAX_LISTED_RESULTS = 22
 _MAX_LISTED_ERRORS = 12
@@ -143,6 +145,11 @@ class AdminMarketCog(commands.Cog):
     driver = app_commands.Group(
         name="driver",
         description="Enrol members into a tier's market",
+        parent=admin,
+    )
+    budget = app_commands.Group(
+        name="budget",
+        description="Team budgets: prize money, penalties, rollover, config",
         parent=admin,
     )
 
@@ -1469,6 +1476,7 @@ class AdminMarketCog(commands.Cog):
                 + ("\u2026" if len(missing) > _MAX_LISTED_NAMES else "")
                 + ". They will score nothing for this round."
             )
+        lines.extend(_render_budget_outcome(outcome))
         lines.append(
             f"Next: `/market-admin valuation run tier: {tier} "
             f"round_label: {round_label}` to price it (dry-run)."
@@ -1620,6 +1628,223 @@ class AdminMarketCog(commands.Cog):
             lines.append(f"…and {len(ordered) - _MAX_LISTED_RESULTS} more.")
         await interaction.followup.send("\n".join(lines)[:_DISCORD_MSG_LIMIT], ephemeral=True)
 
+    # ── /market-admin budget ─────────────────────────────────────────────
+    # The SPENDING CAP (`/market-admin config`) is the league ceiling and
+    # is the same for every team. The BUDGET is each team's own money:
+    # opening balance + prize money + race earnings − penalties, rolled
+    # over between seasons when enabled. A team may hold more budget than
+    # the cap; it may never commit payroll above either.
+
+    @budget.command(name="show", description="Show a team's budget next to its cap")
+    @app_commands.describe(team="Team key")
+    async def budget_show(self, interaction: discord.Interaction, team: str) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        try:
+            summary = await workflow.team_budget(
+                guild_id=interaction.guild_id, team_key=team, recent_limit=_BUDGET_RECENT_LIMIT,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=_render_budget_summary(summary), ephemeral=True
+        )
+
+    @budget.command(
+        name="award",
+        description="Credit prize money to a team's budget (audit-logged)",
+    )
+    @app_commands.describe(
+        team="Team key",
+        amount_m="Amount in $M (positive)",
+        note="Reason (required — audit trail), e.g. 'S7 constructors P2'",
+    )
+    async def budget_award(
+        self, interaction: discord.Interaction, team: str, amount_m: str, note: str,
+    ) -> None:
+        await self._budget_write(
+            interaction, team=team, amount_m=amount_m, note=note, kind="prize_money",
+        )
+
+    @budget.command(
+        name="adjust",
+        description="Manual budget adjustment, either sign (audit-logged)",
+    )
+    @app_commands.describe(
+        team="Team key",
+        delta_m="Adjustment in $M (positive = credit, negative = debit)",
+        note="Reason (required — audit trail)",
+    )
+    async def budget_adjust(
+        self, interaction: discord.Interaction, team: str, delta_m: str, note: str,
+    ) -> None:
+        await self._budget_write(
+            interaction, team=team, amount_m=delta_m, note=note, kind="adjustment",
+        )
+
+    async def _budget_write(
+        self,
+        interaction: discord.Interaction,
+        *,
+        team: str,
+        amount_m: str,
+        note: str,
+        kind: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        try:
+            amount = Decimal(amount_m.strip().lstrip("$").rstrip("Mm"))
+        except InvalidOperation as exc:
+            await interaction.response.send_message(
+                f"Could not parse amount: {exc}", ephemeral=True
+            )
+            return
+        try:
+            balance = await workflow.award_budget(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                team_key=team,
+                kind=kind,
+                amount=amount,
+                note=note,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+            return
+        label = "Prize money" if kind == "prize_money" else "Adjustment"
+        await interaction.response.send_message(
+            f"\u2705 {label} {format_pl(amount)} logged for `{team.lower()}`. "
+            f"Budget is now **{format_money(balance)}**.",
+            ephemeral=True,
+        )
+
+    @budget.command(
+        name="rollover",
+        description="Carry every team's unspent budget from a past season into the active one",
+    )
+    @app_commands.describe(from_season="Name of the season to roll over FROM")
+    async def budget_rollover(
+        self, interaction: discord.Interaction, from_season: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            lines = await workflow.rollover_budgets(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                from_season_name=from_season,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.followup.send(f"\u274c {exc}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            _render_rollover(from_season, lines), ephemeral=True
+        )
+
+    @budget.command(name="config", description="Show or set budget rules for the active season")
+    @app_commands.describe(
+        tier="Tier code for a tier-specific override (blank = season default)",
+        enforce="Enforce budgets on signings and trades",
+        rollover="Carry unspent budget into the next season",
+        opening_m="Opening budget per team in $M",
+        per_point_m="Race earnings per championship point in $M (e.g. 0.05)",
+        dnf_m="Penalty per DNF in $M",
+        dns_m="Penalty per no-show (DNS) in $M",
+        per_incident_pt_m="Penalty per incident point in $M",
+    )
+    async def budget_config(
+        self,
+        interaction: discord.Interaction,
+        tier: str | None = None,
+        enforce: bool | None = None,
+        rollover: bool | None = None,
+        opening_m: str | None = None,
+        per_point_m: str | None = None,
+        dnf_m: str | None = None,
+        dns_m: str | None = None,
+        per_incident_pt_m: str | None = None,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        provided = {
+            "enforce": enforce, "rollover": rollover, "opening_m": opening_m,
+            "per_point_m": per_point_m, "dnf_m": dnf_m, "dns_m": dns_m,
+            "per_incident_pt_m": per_incident_pt_m,
+        }
+        try:
+            current = await workflow.get_budget_config(
+                guild_id=interaction.guild_id, tier=tier,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+            return
+
+        if all(v is None for v in provided.values()):
+            if current is None:
+                await interaction.response.send_message(
+                    "Budgets are not configured for this season. Pass at least "
+                    "`opening_m` to create the config (other values default to "
+                    "the F1 preset when omitted).",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                embed=_render_budget_config(current, tier), ephemeral=True
+            )
+            return
+
+        def money(raw: str | None, fallback: Decimal | None) -> Decimal:
+            if raw is None:
+                if fallback is None:
+                    raise InvalidOperation("value required when no config exists yet")
+                return fallback
+            return Decimal(raw.strip().lstrip("$").rstrip("Mm"))
+
+        base = current or await workflow.get_budget_config(
+            guild_id=interaction.guild_id, tier=None,
+        )
+        try:
+            new_cfg = await workflow.set_budget_config(
+                guild_id=interaction.guild_id,
+                tier=tier,
+                enforce_budget=enforce if enforce is not None else (
+                    base.enforce_budget if base else True
+                ),
+                rollover_enabled=rollover if rollover is not None else (
+                    base.rollover_enabled if base else True
+                ),
+                opening_budget=money(opening_m, base.opening_budget if base else None),
+                earnings_per_point=money(
+                    per_point_m, base.earnings_per_point if base else None
+                ),
+                dnf_penalty=money(dnf_m, base.dnf_penalty if base else None),
+                dns_penalty=money(dns_m, base.dns_penalty if base else None),
+                penalty_per_incident_pt=money(
+                    per_incident_pt_m, base.penalty_per_incident_pt if base else None
+                ),
+            )
+        except InvalidOperation as exc:
+            await interaction.response.send_message(
+                f"Could not parse a value: {exc}", ephemeral=True
+            )
+            return
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            content="\u2705 Budget config saved.",
+            embed=_render_budget_config(new_cfg, tier),
+            ephemeral=True,
+        )
+
+
 
 def _parse_color(raw: str | None) -> int | None:
     if raw is None:
@@ -1763,6 +1988,137 @@ def _join_preview(
         )
     tail = ("\n" + "\n".join(tail_bits)) if tail_bits else ""
     return header + "\n" + "\n".join(body_lines) + tail
+
+
+def _render_budget_outcome(outcome: workflow.ImportOutcome) -> list[str]:
+    """Budget lines for the results-import receipt; empty when not enforced."""
+    b = outcome.budget
+    if b is None:
+        return []
+    lines = [
+        f"\U0001f4b0 Budgets: {b.entries_written} entr(ies) written \u2014 "
+        f"+{format_money(b.total_credited)} earned, "
+        f"\u2212{format_money(b.total_debited)} in penalties"
+        + (f", {b.corrections_written} correction(s)" if b.corrections_written else "")
+        + "."
+    ]
+    if outcome.budget_unattributed:
+        names = outcome.budget_unattributed
+        lines.append(
+            f"\u26a0 {len(names)} driver(s) had no active contract, so no team was "
+            "charged or credited: "
+            + ", ".join(names[:_MAX_LISTED_NAMES])
+            + ("\u2026" if len(names) > _MAX_LISTED_NAMES else "")
+            + "."
+        )
+    return lines
+
+
+def _render_budget_summary(s: workflow.TeamBudgetSummary) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Budget \u2014 {s.team_name}",
+        description=f"Season **{s.season_name}**",
+        colour=discord.Colour.green() if s.available >= 0 else discord.Colour.red(),
+    )
+    binding = "budget" if s.available < s.cap_space else "cap"
+    embed.add_field(
+        name="Money",
+        value="\n".join([
+            f"Budget: {format_money(s.balance)}",
+            f"Effective payroll: {format_money(s.effective_payroll)}",
+            f"Available to spend: {format_money(s.available)}",
+        ]),
+        inline=False,
+    )
+    embed.add_field(
+        name="Spending cap (league rule)",
+        value="\n".join([
+            f"Cap: {format_money(s.salary_cap)}",
+            f"Cap space: {format_money(s.cap_space)}",
+            f"Binding limit right now: **{binding}**",
+        ]),
+        inline=False,
+    )
+    if s.totals_by_kind:
+        embed.add_field(
+            name="Where the money came from",
+            value="\n".join(
+                f"{kind}: {format_pl(total)}"
+                for kind, total in sorted(s.totals_by_kind.items())
+            ),
+            inline=False,
+        )
+    if s.recent:
+        embed.add_field(
+            name=f"Last {len(s.recent)} entr(ies)",
+            value="\n".join(
+                f"{e.created_at:%m-%d} {format_pl(e.amount)} {e.kind}"
+                + (" (correction)" if e.is_correction else "")
+                + (f" \u2014 {e.note}" if e.note else "")
+                for e in s.recent
+            ),
+            inline=False,
+        )
+    embed.set_footer(
+        text=(
+            f"rollover {'on' if s.config.rollover_enabled else 'off'} \u00b7 "
+            f"DNF \u2212{format_money(s.config.dnf_penalty)} \u00b7 "
+            f"DNS \u2212{format_money(s.config.dns_penalty)} \u00b7 "
+            f"{format_money(s.config.penalty_per_incident_pt)}/incident pt \u00b7 "
+            f"{format_money(s.config.earnings_per_point)}/point"
+        )
+    )
+    return embed
+
+
+def _render_budget_config(cfg, tier: str | None) -> discord.Embed:
+    scope = f"tier `{tier}` override" if cfg.tier_id is not None else "season default"
+    if tier and cfg.tier_id is None:
+        scope = f"season default (no `{tier}` override)"
+    embed = discord.Embed(title=f"Budget config \u2014 {scope}", colour=discord.Colour.blurple())
+    embed.add_field(
+        name="Rules",
+        value="\n".join([
+            f"Enforce on signings/trades: {'yes' if cfg.enforce_budget else 'no'}",
+            f"Rollover between seasons: {'yes' if cfg.rollover_enabled else 'no'}",
+            f"Opening budget per team: {format_money(cfg.opening_budget)}",
+        ]),
+        inline=False,
+    )
+    embed.add_field(
+        name="Earnings",
+        value=f"Per championship point: {format_money(cfg.earnings_per_point)}",
+        inline=False,
+    )
+    embed.add_field(
+        name="Penalties (debited from the team budget)",
+        value="\n".join([
+            f"Per DNF: {format_money(cfg.dnf_penalty)}",
+            f"Per no-show (DNS): {format_money(cfg.dns_penalty)}",
+            f"Per incident point: {format_money(cfg.penalty_per_incident_pt)}",
+        ]),
+        inline=False,
+    )
+    embed.set_footer(text="The spending cap is separate: /market-admin config show")
+    return embed
+
+
+def _render_rollover(from_season: str, lines) -> str:
+    out = [f"\u2705 Rollover from **{from_season}** into the active season:"]
+    for line in lines:
+        if line.skipped_reason:
+            out.append(f"\u2022 {line.team_name}: skipped ({line.skipped_reason})")
+        else:
+            out.append(
+                f"\u2022 {line.team_name}: carried {format_pl(line.carried)} "
+                f"(had {format_money(line.from_balance)}, "
+                f"payroll {format_money(line.from_payroll)})"
+            )
+    out.append(
+        "Each team also received its opening balance for the new season if it "
+        "didn't have one. Award prize money with `/market-admin budget award`."
+    )
+    return "\n".join(out)
 
 
 async def setup(bot: commands.Bot) -> None:
