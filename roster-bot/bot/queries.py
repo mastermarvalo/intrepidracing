@@ -840,6 +840,44 @@ async def fetch_driver_valuations_for_run(
     )
 
 
+async def list_valuation_runs(
+    conn: asyncpg.Connection,
+    season_id: int,
+    tier_id: int | None = None,
+    limit: int = 20,
+) -> list[asyncpg.Record]:
+    """Recent runs for the season, or scoped to a tier. Newest first."""
+    if tier_id is None:
+        return list(
+            await conn.fetch(
+                """
+                SELECT vr.id, vr.round_label, vr.published, vr.created_at,
+                       t.code AS tier_code
+                  FROM valuation_runs vr
+                  JOIN tiers t ON t.id = vr.tier_id
+                 WHERE vr.season_id = $1
+                 ORDER BY vr.created_at DESC
+                 LIMIT $2
+                """,
+                season_id, limit,
+            )
+        )
+    return list(
+        await conn.fetch(
+            """
+            SELECT vr.id, vr.round_label, vr.published, vr.created_at,
+                   t.code AS tier_code
+              FROM valuation_runs vr
+              JOIN tiers t ON t.id = vr.tier_id
+             WHERE vr.season_id = $1 AND vr.tier_id = $2
+             ORDER BY vr.created_at DESC
+             LIMIT $3
+            """,
+            season_id, tier_id, limit,
+        )
+    )
+
+
 async def publish_valuation_run(conn: asyncpg.Connection, run_id: int) -> None:
     await conn.execute(
         """

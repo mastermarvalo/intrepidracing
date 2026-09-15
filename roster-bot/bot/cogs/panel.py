@@ -36,6 +36,7 @@ from bot.panel_help import COMMAND_CATALOG, build_help_embed, help_category_opti
 from bot.ui.approvals_screen import open_approvals
 from bot.ui.boards_screen import open_boards
 from bot.ui.drivers_screen import open_drivers
+from bot.ui.history_screen import open_history
 from bot.ui.setup_screen import open_setup
 
 log = logging.getLogger(__name__)
@@ -467,6 +468,7 @@ class RaceNightView(_OwnedView):
 
         for tier in status.tiers[:_MAX_TIER_BUTTONS]:
             self.add_item(_ImportTierButton(tier.code))
+        self.add_item(_BrowseHistoryButton())
         self.add_item(_BackHomeButton())
 
     def remember_sheet(self, tier: str, sheet: str) -> None:
@@ -508,6 +510,22 @@ class _BackHomeButton(discord.ui.Button):
             view=HomeView(
                 status=status, opener_id=interaction.user.id, is_admin=is_admin
             ),
+        )
+
+
+class _BrowseHistoryButton(discord.ui.Button):
+    """Race-Night-adjacent sub-panel for inspecting past runs and rounds."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Browse history",
+            style=discord.ButtonStyle.secondary,
+            emoji="📜",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await open_history(
+            interaction, opener_id=interaction.user.id, on_back=_back_to_home
         )
 
 

@@ -14,7 +14,13 @@ import discord
 import pytest
 
 from bot import approvals, workflow
-from bot.ui import approvals_screen, boards_screen, drivers_screen, setup_screen
+from bot.ui import (
+    approvals_screen,
+    boards_screen,
+    drivers_screen,
+    history_screen,
+    setup_screen,
+)
 from bot.ui.base import EMBED_FIELD_LIMIT, SELECT_MAX_OPTIONS
 
 # Discord platform limits, asserted rather than assumed.
@@ -708,6 +714,103 @@ def test_status_select_marks_the_current_status_as_default():
     defaults = [o for o in select.options if o.default]
     assert len(defaults) == 1
     assert defaults[0].value == "reserve"
+
+
+# ── history screen ───────────────────────────────────────────────────
+
+
+def _run_summary(run_id=1, *, tier="t1", label="R1", published=False):
+    return workflow.ValuationRunSummary(
+        run_id=run_id,
+        tier_code=tier,
+        round_label=label,
+        published=published,
+        created_at=datetime(2026, 9, 14, tzinfo=timezone.utc),
+    )
+
+
+def _round_summary(*, tier="t1", order=1, label="R1", held=None, count=20):
+    from datetime import date
+
+    return workflow.RaceRoundSummary(
+        tier_code=tier,
+        round_order=order,
+        round_label=label,
+        held_on=held if held is not None else date(2026, 3, 15),
+        result_count=count,
+    )
+
+
+def test_history_landing_offers_both_branches_and_back():
+    view = history_screen.HistoryView(opener_id=1, on_back=noop_back)
+    labels = {c.label for c in view.children if getattr(c, "label", None)}
+
+    assert "Valuation runs" in labels
+    assert "Race rounds" in labels
+    assert any("Back" in label for label in labels)
+
+
+def test_valuation_list_embed_shows_published_state():
+    embed = history_screen.build_valuation_list_embed(
+        [_run_summary(1, published=True), _run_summary(2, published=False)],
+        tier_filter=None,
+    )
+
+    assert "published" in embed.description
+    assert "dry-run" in embed.description
+
+
+def test_valuation_list_empty_tells_the_admin_what_to_do():
+    embed = history_screen.build_valuation_list_embed([], tier_filter="t1")
+
+    assert "no runs" in embed.description.lower() or "no runs recorded" in embed.description.lower()
+    assert "run" in embed.description.lower()
+
+
+def test_rounds_list_shows_tier_and_result_count():
+    embed = history_screen.build_rounds_list_embed(
+        [_round_summary(tier="t1", order=1, count=18)],
+        tier_filter=None,
+    )
+
+    assert "t1" in embed.description
+    assert "18" in embed.description
+
+
+def test_round_detail_marks_dnf_and_shows_exceptional_flag():
+    detail = workflow.RaceRoundDetail(
+        tier_code="t1", round_label="R1", round_order=1, held_on=None,
+        results=[
+            workflow.RoundResultRow(
+                driver_name="Alonso", finish_position=1, grid_position=1,
+                dnf=False, dns=False, fastest_lap=True, driver_of_day=False,
+                incident_points=Decimal("0"), factor_values={"wins": Decimal("1.0")},
+                exceptional=True,
+            ),
+            workflow.RoundResultRow(
+                driver_name="Sainz", finish_position=None, grid_position=3,
+                dnf=True, dns=False, fastest_lap=False, driver_of_day=False,
+                incident_points=Decimal("2"), factor_values={},
+                exceptional=False,
+            ),
+        ],
+    )
+    embed = history_screen.build_round_detail_embed(detail)
+
+    assert "DNF" in embed.description
+    assert "Alonso" in embed.description
+    assert "exceptional" in embed.description.lower()
+    assert "FL" in embed.description
+
+
+def test_valuation_preview_embed_uses_the_published_color():
+    preview = workflow.ValuationRunPreview(
+        run_id=1, tier_code="t1", round_label="R1", published=True, rows=[],
+    )
+    embed = history_screen.build_valuation_preview_embed(preview)
+
+    # Published runs use the OK color; dry-runs use INFO.
+    assert embed.color.value == history_screen.COLOR_OK.value
 
 
 # ── setup screen ─────────────────────────────────────────────────────

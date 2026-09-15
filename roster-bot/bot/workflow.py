@@ -1196,6 +1196,220 @@ async def move_driver_to_tier(
             raise WorkflowError(str(exc)) from exc
 
 
+# ── History (valuation runs + race rounds) ───────────────────────────
+#
+# Backs the Race Night → Browse history sub-panel. Mirrors
+# `/market-admin valuation list|preview` and `/market-admin results
+# list|show`; the panel uses these to let an admin inspect past runs
+# and rounds without leaving Discord.
+
+
+@dataclass(frozen=True)
+class ValuationRunSummary:
+    run_id: int
+    tier_code: str
+    round_label: str
+    published: bool
+    created_at: date
+
+
+@dataclass(frozen=True)
+class ValuationRunPreview:
+    run_id: int
+    tier_code: str
+    round_label: str
+    published: bool
+    rows: list  # list of asyncpg.Record — display_name, market_value, delta, rank_in_tier, capped
+
+
+@dataclass(frozen=True)
+class RaceRoundSummary:
+    tier_code: str
+    round_order: int
+    round_label: str
+    held_on: date | None
+    result_count: int
+
+
+@dataclass(frozen=True)
+class RoundResultRow:
+    driver_name: str
+    finish_position: int | None
+    grid_position: int | None
+    dnf: bool
+    dns: bool
+    fastest_lap: bool
+    driver_of_day: bool
+    incident_points: Decimal
+    factor_values: dict[str, Decimal]
+    exceptional: bool
+
+
+@dataclass(frozen=True)
+class RaceRoundDetail:
+    tier_code: str
+    round_label: str
+    round_order: int
+    held_on: date | None
+    results: list[RoundResultRow]
+
+
+async def list_valuations(
+    guild_id: int, *, tier_code: str | None = None, limit: int = 20
+) -> list[ValuationRunSummary]:
+    """Recent runs for the season, most recent first."""
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            return []
+        tier_id: int | None = None
+        if tier_code is not None:
+            tier = await queries.fetch_tier(conn, season.id, tier_code)
+            if tier is None:
+                raise WorkflowError(
+                    f"No tier `{tier_code}` in **{season.name}**."
+                )
+            tier_id = tier.id
+        rows = await queries.list_valuation_runs(
+            conn, season.id, tier_id=tier_id, limit=limit
+        )
+    return [
+        ValuationRunSummary(
+            run_id=r["id"],
+            tier_code=r["tier_code"],
+            round_label=r["round_label"],
+            published=r["published"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+async def preview_valuation(guild_id: int, run_id: int) -> ValuationRunPreview:
+    """Re-fetch a stored run's driver rows for re-rendering."""
+    async with db.connect() as conn:
+        run = await queries.fetch_valuation_run(conn, run_id)
+        if run is None:
+            raise WorkflowError(f"No valuation run with id `{run_id}`.")
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None or season.id != run["season_id"]:
+            raise WorkflowError(
+                "That run isn't in the currently active season."
+            )
+        tier_row = await queries.fetch_tier_by_id(conn, run["tier_id"])
+        rows = await queries.fetch_driver_valuations_for_run(conn, run_id)
+    return ValuationRunPreview(
+        run_id=run_id,
+        tier_code=tier_row.code if tier_row else "?",
+        round_label=run["round_label"],
+        published=run["published"],
+        rows=list(rows),
+    )
+
+
+async def list_rounds(
+    guild_id: int, *, tier_code: str | None = None
+) -> list[RaceRoundSummary]:
+    """Imported rounds for the season, grouped by tier + round_order asc."""
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            return []
+        tier_id: int | None = None
+        if tier_code is not None:
+            tier = await queries.fetch_tier(conn, season.id, tier_code)
+            if tier is None:
+                raise WorkflowError(
+                    f"No tier `{tier_code}` in **{season.name}**."
+                )
+            tier_id = tier.id
+        rows = await queries.list_race_rounds(conn, season.id, tier_id)
+    return [
+        RaceRoundSummary(
+            tier_code=r["tier_code"],
+            round_order=r["round_order"],
+            round_label=r["round_label"],
+            held_on=r["held_on"],
+            result_count=r["result_count"],
+        )
+        for r in rows
+    ]
+
+
+async def show_round(
+    guild_id: int, *, tier_code: str, round_label: str
+) -> RaceRoundDetail:
+    """
+    One round's raw results paired with the normalized observations the
+    valuation engine would compute for them. Mirrors
+    `/market-admin results show`.
+    """
+    async with db.connect() as conn:
+        season, tier_row = await _require_season_and_tier(conn, guild_id, tier_code)
+        round_row = await queries.fetch_race_round(
+            conn, season.id, tier_row.id, round_label
+        )
+        if round_row is None:
+            raise WorkflowError(
+                f"No round `{round_label}` imported for `{tier_code}`."
+            )
+        current = await queries.fetch_results_for_round(conn, round_row["id"])
+        scores = await queries.fetch_position_scores(conn, season.id)
+        tuning = await queries.fetch_results_tuning(conn, season.id, tier_row.id)
+        history = await queries.fetch_results_history(
+            conn,
+            season_id=season.id,
+            tier_id=tier_row.id,
+            through_round_order=round_row["round_order"],
+        )
+        drivers = await queries.fetch_drivers_in_tier(conn, tier_row.id)
+
+    names = {d.id: d.display_name for d in drivers}
+    observations = {}
+    if current and tuning is not None and scores:
+        observations = {
+            o.driver_id: o
+            for o in results_engine.build_observations(
+                current=current,
+                history=history,
+                position_scores=scores,
+                tuning=tuning,
+            )
+        }
+
+    ordered = sorted(
+        current,
+        key=lambda r: (
+            r.finish_position is None,
+            r.finish_position or 0,
+        ),
+    )
+    result_rows: list[RoundResultRow] = []
+    for r in ordered:
+        obs = observations.get(r.driver_id)
+        result_rows.append(
+            RoundResultRow(
+                driver_name=names.get(r.driver_id, f"driver {r.driver_id}"),
+                finish_position=r.finish_position,
+                grid_position=r.grid_position,
+                dnf=r.dnf,
+                dns=r.dns,
+                fastest_lap=r.fastest_lap,
+                driver_of_day=r.driver_of_day,
+                incident_points=r.incident_points,
+                factor_values=dict(obs.factor_values) if obs else {},
+                exceptional=bool(obs and obs.exceptional),
+            )
+        )
+    return RaceRoundDetail(
+        tier_code=tier_row.code,
+        round_label=round_row["round_label"],
+        round_order=round_row["round_order"],
+        held_on=round_row["held_on"],
+        results=result_rows,
+    )
+
+
 async def list_tier_choices(guild_id: int) -> list[tuple[str, str]]:
     """
     `(code, label)` pairs for the active season's tiers, in rank order.

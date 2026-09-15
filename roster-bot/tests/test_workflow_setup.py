@@ -734,3 +734,145 @@ async def test_move_driver_to_tier_rejects_unknown_tier(workflow_db):
             driver_id=ids["driver_id"], new_tier_code="does-not-exist",
             note=None,
         )
+
+
+# ── history (valuation + race-round browsing) ────────────────────────
+
+
+async def test_list_valuations_returns_newest_first(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    tier = await queries.fetch_tier(workflow_db, season.id, "t1")
+    # Two runs so ordering matters.
+    await queries.insert_valuation_run(
+        workflow_db, season_id=season.id, tier_id=tier.id,
+        round_label="R1", created_by=1, published=False,
+    )
+    r2 = await queries.insert_valuation_run(
+        workflow_db, season_id=season.id, tier_id=tier.id,
+        round_label="R2", created_by=1, published=True,
+    )
+
+    runs = await workflow.list_valuations(GUILD)
+
+    assert runs[0].run_id == r2, "newest run must lead"
+    assert runs[0].published is True
+    assert runs[0].tier_code == "t1"
+    assert ids is not None
+
+
+async def test_list_valuations_scoped_to_tier(workflow_db):
+    await _seeded_season(workflow_db)
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    t1 = await queries.fetch_tier(workflow_db, season.id, "t1")
+    t2 = await queries.fetch_tier(workflow_db, season.id, "t2")
+    await queries.insert_valuation_run(
+        workflow_db, season_id=season.id, tier_id=t1.id,
+        round_label="R1", created_by=1, published=False,
+    )
+    await queries.insert_valuation_run(
+        workflow_db, season_id=season.id, tier_id=t2.id,
+        round_label="R1", created_by=1, published=False,
+    )
+
+    runs = await workflow.list_valuations(GUILD, tier_code="t1")
+
+    assert len(runs) == 1
+    assert runs[0].tier_code == "t1"
+
+
+async def test_preview_valuation_rejects_unknown_run(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="No valuation run"):
+        await workflow.preview_valuation(GUILD, run_id=99999)
+
+
+async def test_preview_valuation_returns_driver_rows(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    tier = await queries.fetch_tier(workflow_db, season.id, "t1")
+    run_id = await queries.insert_valuation_run(
+        workflow_db, season_id=season.id, tier_id=tier.id,
+        round_label="R1", created_by=1, published=False,
+    )
+    await queries.insert_driver_valuations(
+        workflow_db, run_id,
+        [{
+            "driver_id": ids["driver_id"],
+            "market_value": Decimal("12.00"),
+            "previous_value": Decimal("10.00"),
+            "delta": Decimal("2.00"),
+            "rank_in_tier": 1,
+            "capped": False,
+            "breakdown": "[]",
+        }],
+    )
+
+    preview = await workflow.preview_valuation(GUILD, run_id)
+
+    assert preview.run_id == run_id
+    assert preview.tier_code == "t1"
+    assert len(preview.rows) == 1
+    assert preview.rows[0]["market_value"] == Decimal("12.00")
+
+
+async def test_list_rounds_reflects_imports(workflow_db):
+    await _seeded_season(workflow_db)
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    tier = await queries.fetch_tier(workflow_db, season.id, "t1")
+    await queries.upsert_race_round(
+        workflow_db,
+        season_id=season.id, tier_id=tier.id,
+        round_label="R1 Bahrain", held_on=None,
+        imported_by=1, source="test",
+    )
+
+    rounds = await workflow.list_rounds(GUILD)
+
+    assert len(rounds) == 1
+    assert rounds[0].tier_code == "t1"
+    assert rounds[0].round_label == "R1 Bahrain"
+
+
+async def test_show_round_returns_ordered_results(workflow_db):
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+    season = await queries.fetch_active_season(workflow_db, GUILD)
+    tier = await queries.fetch_tier(workflow_db, season.id, "t1")
+    round_row = await queries.upsert_race_round(
+        workflow_db,
+        season_id=season.id, tier_id=tier.id,
+        round_label="R1", held_on=None, imported_by=1, source="test",
+    )
+    await queries.upsert_race_results(
+        workflow_db,
+        round_id=round_row["id"],
+        rows=[{
+            "driver_id": ids["driver_id"],
+            "finish_position": 3,
+            "grid_position": 5,
+            "dnf": False, "dns": False,
+            "fastest_lap": False, "driver_of_day": False,
+            "incident_points": Decimal("0"),
+            "note": None,
+        }],
+    )
+
+    detail = await workflow.show_round(
+        GUILD, tier_code="t1", round_label="R1"
+    )
+
+    assert detail.tier_code == "t1"
+    assert detail.round_label == "R1"
+    assert len(detail.results) == 1
+    assert detail.results[0].finish_position == 3
+
+
+async def test_show_round_rejects_unknown_round(workflow_db):
+    await _seeded_season(workflow_db)
+    with pytest.raises(workflow.WorkflowError, match="No round"):
+        await workflow.show_round(
+            GUILD, tier_code="t1", round_label="never-imported"
+        )
