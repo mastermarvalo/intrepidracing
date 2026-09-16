@@ -685,6 +685,10 @@ class _OfferModal(base.PanelModal):
             payroll_before = await queries.fetch_team_effective_payroll(
                 conn, self._team.id, self._season_id,
             )
+            # G18: cap_adjustment rows move this team's ceiling.
+            cap_adjustment = await queries.fetch_cap_adjustment_total(
+                conn, self._season_id, self._team.id,
+            )
             budget_snap = await budget_ops.snapshot(
                 conn, season_id=self._season_id, tier_id=self._tier.id,
                 team_id=self._team.id, actor_id=interaction.user.id,
@@ -722,6 +726,7 @@ class _OfferModal(base.PanelModal):
             max_incentive_pct=cfg.max_incentive_pct,
             team_payroll_before=payroll_before,
             salary_cap=cfg.salary_cap,
+            cap_adjustment=cap_adjustment,
             team_budget=budget_snap.balance if budget_snap else None,
             active_slots_used=slots_used,
             active_slots_max=cfg.active_driver_slots,
@@ -927,6 +932,10 @@ class _CounterModal(base.PanelModal):
             payroll_before = await queries.fetch_team_effective_payroll(
                 conn, self._owner.team_id, self._owner.season_id,
             )
+            # G18: the counter is validated against the same ceiling.
+            cap_adjustment = await queries.fetch_cap_adjustment_total(
+                conn, self._owner.season_id, self._owner.team_id,
+            )
             budget_snap = await budget_ops.snapshot(
                 conn, season_id=self._owner.season_id, tier_id=self._owner.tier_id,
                 team_id=self._owner.team_id, actor_id=interaction.user.id,
@@ -958,6 +967,7 @@ class _CounterModal(base.PanelModal):
                 max_incentive_pct=cfg.max_incentive_pct,
                 team_payroll_before=payroll_before,
                 salary_cap=cfg.salary_cap,
+                cap_adjustment=cap_adjustment,
                 team_budget=budget_snap.balance if budget_snap else None,
                 active_slots_used=slots_used,
                 active_slots_max=cfg.active_driver_slots,

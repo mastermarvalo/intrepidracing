@@ -537,13 +537,17 @@ covers harder cases.
 Honest list, verified against the current code. Full detail, with
 status per item, is in [`docs/audit/`](docs/audit/README.md).
 
-- **Cap adjustments are an audit note only.** They record in the ledger
-  and do not change what a team may spend, though two of the older
-  typed commands still claim enforcement is coming.
-- **Some typed commands are thinner than the panel.** Board add and
-  refresh report success without fully confirming it, and a few season
-  commands skip the next-step hint. The panel paths are the reliable
-  ones — which is the general rule here: **prefer `/league`.**
+- **The earnings and penalty rates are placeholders.** The per-point
+  earnings, DNF, DNS and incident-point figures ship sized against the
+  $145.00M cap, not against your league's actual points system. Run
+  your first season with budget enforcement **off**, watch what the
+  numbers do over a few rounds, then turn it on. This is the one
+  setting you should expect to tune yourself.
+- **One step still needs a typed command.** Recovering a team whose
+  database row was lost but whose roster message survives is
+  `/roster relink`. Discord does not allow one dialog to open another
+  and that flow starts with a dialog, so the Teams screen hands you the
+  exact command instead.
 
 ---
 
@@ -555,7 +559,8 @@ the CI guards enforce — read it before changing anything under
 `bot/market/`, `bot/contracts/` or `bot/valuation.py`, which are not
 allowed to contain literal numbers.
 [`docs/ADR-001-f1-with-generic-future.md`](docs/ADR-001-f1-with-generic-future.md)
-explains why. [`docs/audit/`](docs/audit/README.md) records 26 defects
+explains why. [`docs/audit/`](docs/audit/README.md) records 27 defects
 traced from click to database write, with current status — useful
-context for why several screens are shaped the way they are. Every
-high-severity one is now fixed; what remains is listed above.
+context for why several screens are shaped the way they are. All 27
+are now fixed; what remains above is tuning and one Discord platform
+limit, not known defects.

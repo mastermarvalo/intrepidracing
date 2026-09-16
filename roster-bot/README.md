@@ -164,7 +164,7 @@ t3 Tier 3 · 0 driver(s)
 
 [ 📅 Season ]  [ 🧱 Tier ]  [ 💰 Cap & rules ]  [ 🌱 Seed settings ]
 [ 🏷 Tier role ]  [ 🧑‍⚖️ Commissioner role ]  [ 📣 Channels ]
-[ 📊 Boards ]  [ ◀ Back to home ]
+[ 📊 Boards ]  [ 🏎 Teams ]  [ 🚦 Free agency ]  [ ◀ Back to home ]
 ```
 
 | Button | Replaces |
@@ -177,6 +177,32 @@ t3 Tier 3 · 0 driver(s)
 | Commissioner role | `config role` |
 | Channels | `config channel` |
 | Boards | `board add` / `remove` / `refresh` / `list` |
+| Teams | `/roster create` / `edit` / `remove` + `market-admin adjust-cap` |
+| Free agency | `config edit free_agency_open:` |
+
+##### Teams
+
+Everything a team needs, without a command. **Create team** opens the
+same nine-step wizard `/roster create` does — name, colour, roles,
+staff slots and driver slots — with the team key as one extra field,
+because Discord will not let one dialog open another. **Edit** reopens
+that wizard on an existing team, **Adjust cap** moves one team's
+effective spending ceiling, and **Delete** removes a team and its
+roster message.
+
+Deleting is refused for any team that has ever signed a driver:
+
+```text
+McLaren cannot be deleted — it still has 3 contracts, 12 budget ledger
+rows. Deleting it would take the league's money history with it.
+
+Release or trade its drivers first, or leave the team in place: a team
+with no drivers signed costs nothing and keeps the records intact.
+```
+
+That used to be a raw database error with no explanation. Contracts,
+offers, trades, dead money and the budget ledger all point at the team
+row, and none of them cascade.
 
 Buttons for steps that cannot work yet are greyed out — you can't add a
 tier before a season exists. **Seed settings** is the inverse: it is
@@ -280,9 +306,27 @@ is a three-step wizard (kind → tier → channel) that refuses the invalid
 combinations: tier boards must have a tier, the cross-tier dashboard
 must not.
 
+#### Google Sheets boards
+
+The same screen has a **Google Sheets boards** button leading to the
+*other* kind of board — the ones that mirror a spreadsheet you already
+maintain into a Discord message and refresh it every ten minutes. Add
+one by pasting the sheet link and picking a channel; the link is
+validated before you are asked where to put it. A board whose first
+read of the sheet fails is still created and says so, rather than
+reporting success:
+
+```text
+⚠️ Standings was created in #stats, but the first read of the sheet
+failed. The posted message shows why. Check that the sheet is shared
+publicly (or with the bot's service account) and press Refresh all.
+```
+
+`/sheets add|remove|list|refresh` still work and drive the same code.
+
 Everything the panel does is also still a slash command, and the panel
 calls the same code as the commands — nothing was removed or renamed.
-All 84 commands are still there. Setup, Approvals and Boards route
+All 88 commands are still there. Setup, Approvals and Boards route
 through `bot/workflow.py` and `bot/approvals.py`, which the
 `/market-admin` commands now call too, so there is one code path per
 operation regardless of which route you take.
@@ -299,10 +343,10 @@ grouped by job.
 
 | Command | Description |
 |---|---|
-| `/roster create <name>` | Open the 7-step setup flow for a new team |
+| `/roster create <name>` | Open the 9-step setup flow for a new team (also `/league` → Setup → Teams → **Create team**) |
 | `/roster edit <name>` | Re-open the setup flow, pre-filled with current values |
 | `/roster list` | List all teams configured in this server |
-| `/roster remove <name>` | Delete a team and its roster message |
+| `/roster remove <name>` | Delete a team and its roster message. Refused if the team has contracts, offers, trades, dead money or budget history — those do not cascade, and deleting the team would take the league's money history with it |
 | `/roster config` | Set the server-wide Free Agent role |
 
 ### Sign / drop (require Manage Server **or** the team's principal role)

@@ -487,3 +487,60 @@ async def test_trade_approves_when_both_clear(pg_conn_migrated):
     await service.commissioner_approve_trade(pg_conn_migrated, trade_id, actor_id=1)
     moved = await queries.fetch_contract_by_id(pg_conn_migrated, ctx["c_b"])
     assert moved.team_id == ctx["team_a"]
+
+
+# ── G18: cap_adjustment rows are read back as a net total ────────────
+
+
+@pytest.mark.asyncio
+async def test_cap_adjustment_total_nets_grants_against_docks(
+    pg_conn_migrated,
+):
+    """
+    The reader G18 added. Rows accumulate, so a league that grants 10
+    and later docks 4 leaves the team 6 above the league cap.
+    """
+    ctx = await _bootstrap(pg_conn_migrated)
+    season_id, tier_id, team = ctx["season_id"], ctx["tier_id"], ctx["team_a"]
+
+    assert await queries.fetch_cap_adjustment_total(
+        pg_conn_migrated, season_id, team
+    ) == Decimal("0")
+
+    for delta in (Decimal("10.00"), Decimal("-4.00")):
+        await queries.append_ledger(
+            pg_conn_migrated, season_id=season_id, tier_id=tier_id,
+            team_id=team, kind="cap_adjustment", amount=delta,
+            detail={"note": "test"}, actor_id=1,
+        )
+
+    assert await queries.fetch_cap_adjustment_total(
+        pg_conn_migrated, season_id, team
+    ) == Decimal("6.00")
+
+
+@pytest.mark.asyncio
+async def test_cap_adjustment_total_ignores_other_teams_and_other_kinds(
+    pg_conn_migrated,
+):
+    """
+    Adjustments are per-team and the ledger is shared with every other
+    contract event, so the filter has to be tight on both axes.
+    """
+    ctx = await _bootstrap(pg_conn_migrated)
+    season_id, tier_id = ctx["season_id"], ctx["tier_id"]
+
+    await queries.append_ledger(
+        pg_conn_migrated, season_id=season_id, tier_id=tier_id,
+        team_id=ctx["team_b"], kind="cap_adjustment", amount=Decimal("50.00"),
+        detail={}, actor_id=1,
+    )
+    await queries.append_ledger(
+        pg_conn_migrated, season_id=season_id, tier_id=tier_id,
+        team_id=ctx["team_a"], kind="contract_signed", amount=Decimal("99.00"),
+        detail={}, actor_id=1,
+    )
+
+    assert await queries.fetch_cap_adjustment_total(
+        pg_conn_migrated, season_id, ctx["team_a"]
+    ) == Decimal("0")

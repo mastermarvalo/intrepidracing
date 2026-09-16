@@ -59,6 +59,10 @@ class OfferInputs:
     # ── cap
     team_payroll_before: Decimal = _ZERO
     salary_cap: Decimal = _ZERO
+    # Net of the team's `cap_adjustment` ledger rows: positive grants
+    # extra room, negative docks it. Defaults to zero so a league that
+    # has never adjusted a cap behaves exactly as before.
+    cap_adjustment: Decimal = _ZERO
 
     # ── budget
     # The team's budget BALANCE (sum of its budget ledger), distinct from
@@ -220,33 +224,56 @@ def salary_within_bounds(inputs: OfferInputs) -> RuleResult:
 
 
 def cap_headroom_ok(inputs: OfferInputs) -> RuleResult:
+    """
+    Committed payroll must fit under the team's effective cap.
+
+    The effective cap is the league cap plus the net of this team's
+    `cap_adjustment` ledger rows (G18). Those rows used to be an audit
+    note with no reader, so a commissioner who docked a team's cap saw
+    the entry recorded and the team carry on spending to the full league
+    ceiling. Both writers even promised enforcement was coming.
+
+    The adjustment is reported separately from the base cap in every
+    result, because "you are over a 145.00 cap" and "you are over a
+    145.00 cap the league reduced by 10.00" need different answers from
+    the Team Principal reading it.
+    """
     committed = inputs.team_payroll_before + inputs.salary + inputs.signing_bonus
-    if committed <= inputs.salary_cap:
+    effective_cap = inputs.salary_cap + inputs.cap_adjustment
+    detail = {
+        "payroll_before": str(inputs.team_payroll_before),
+        "salary": str(inputs.salary),
+        "signing_bonus": str(inputs.signing_bonus),
+        "committed_after": str(committed),
+        "salary_cap": str(inputs.salary_cap),
+        "cap_adjustment": str(inputs.cap_adjustment),
+        "effective_cap": str(effective_cap),
+    }
+    if inputs.cap_adjustment == _ZERO:
+        cap_phrase = f"the {inputs.salary_cap} cap"
+    elif inputs.cap_adjustment > _ZERO:
+        cap_phrase = (
+            f"the {effective_cap} effective cap "
+            f"({inputs.salary_cap} + {inputs.cap_adjustment} granted)"
+        )
+    else:
+        cap_phrase = (
+            f"the {effective_cap} effective cap "
+            f"({inputs.salary_cap} less {-inputs.cap_adjustment} docked)"
+        )
+
+    if committed <= effective_cap:
         return _pass(
             "cap_headroom_ok",
-            f"Payroll after signing ({committed}) fits under the cap "
-            f"({inputs.salary_cap}).",
-            detail={
-                "payroll_before": str(inputs.team_payroll_before),
-                "salary": str(inputs.salary),
-                "signing_bonus": str(inputs.signing_bonus),
-                "committed_after": str(committed),
-                "salary_cap": str(inputs.salary_cap),
-            },
+            f"Payroll after signing ({committed}) fits under {cap_phrase}.",
+            detail=detail,
         )
-    over = committed - inputs.salary_cap
+    over = committed - effective_cap
     return _block(
         "cap_exceeded",
-        f"Signing would put payroll at {committed}, {over} over the "
-        f"{inputs.salary_cap} cap.",
-        detail={
-            "payroll_before": str(inputs.team_payroll_before),
-            "salary": str(inputs.salary),
-            "signing_bonus": str(inputs.signing_bonus),
-            "committed_after": str(committed),
-            "salary_cap": str(inputs.salary_cap),
-            "over_cap": str(over),
-        },
+        f"Signing would put payroll at {committed}, {over} over "
+        f"{cap_phrase}.",
+        detail={**detail, "over_cap": str(over)},
     )
 
 

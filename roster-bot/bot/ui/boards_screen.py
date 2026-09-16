@@ -166,8 +166,19 @@ def build_added_board_note(
     )
 
 
-def build_refresh_all_note(boards: list[workflow.BoardInfo]) -> str:
-    """Per-board outcome for Refresh all, read back from board state."""
+def build_refresh_all_note(
+    boards: list[workflow.BoardInfo],
+    outcomes: list[workflow.BoardRefresh] | None = None,
+) -> str:
+    """
+    Per-board outcome for Refresh all.
+
+    `boards` is the state afterwards. `outcomes` is what the refresh
+    pass itself reported (G20) — supplying it lets this say "posted, but
+    Discord rejected the edit", which board state alone cannot show. It
+    stays optional so a caller without outcomes degrades to the old
+    state-only report plus its caveat.
+    """
     if not boards:
         return "No boards to refresh — nothing was posted or changed."
 
@@ -190,12 +201,32 @@ def build_refresh_all_note(boards: list[workflow.BoardInfo]) -> str:
             lines.append(
                 f"• …and {extra} more, marked ⚠ not yet posted in the list."
             )
-    lines.append(_EDIT_CAVEAT)
+    if outcomes is None:
+        lines.append(_EDIT_CAVEAT)
+        return "\n".join(lines)
+
+    rejected = [
+        o for o in outcomes
+        if o.action in workflow.BOARD_FAILED_ACTIONS and o.posted
+    ]
+    if rejected:
+        lines.append(
+            f"❌ {len(rejected)} board(s) are posted but Discord refused "
+            "the update, so they are showing stale numbers:"
+        )
+        for o in rejected[:_MAX_LISTED_FAILURES]:
+            lines.append(f"• {workflow.describe_refresh(o)}")
+        lines.append(f"Grant the bot {_PERMISSION_HINT} and refresh again.")
+    elif not failed:
+        lines.append("_Every board was rebuilt and Discord accepted each edit._")
     return "\n".join(lines)
 
 
 def build_refresh_one_note(
-    board: workflow.BoardInfo | None, *, board_id: int
+    board: workflow.BoardInfo | None,
+    *,
+    board_id: int,
+    outcome: workflow.BoardRefresh | None = None,
 ) -> str:
     if board is None:
         return (
@@ -203,6 +234,20 @@ def build_refresh_one_note(
             "have been removed. Nothing was posted."
         )
     if board.healthy:
+        if outcome is not None and outcome.action in workflow.BOARD_FAILED_ACTIONS:
+            return (
+                f"❌ Board `{board_id}` is posted in <#{board.channel_id}> "
+                f"but the update was refused — "
+                f"{workflow.boards_action_label(outcome.action)}. It is "
+                f"showing stale numbers. Grant the bot {_PERMISSION_HINT} "
+                "there and refresh again."
+            )
+        if outcome is not None:
+            return (
+                f"✅ Board `{board_id}` was "
+                f"{workflow.boards_action_label(outcome.action)} in "
+                f"<#{board.channel_id}>."
+            )
         return (
             f"✅ Board `{board_id}` is posted in <#{board.channel_id}>.\n"
             f"{_EDIT_CAVEAT}"
@@ -520,6 +565,7 @@ class BoardsView(AdminOwnedView):
         self.add_item(_AddBoardButton(row=2))
         if boards:
             self.add_item(_RefreshBoardsButton(row=2))
+        self.add_item(_StatBoardsButton(row=2))
         self.add_item(BackButton(on_back, row=2))
 
         if pages > 1:
@@ -605,14 +651,18 @@ class _RefreshBoardsButton(discord.ui.Button):
         view = self.view
         assert isinstance(view, BoardsView)
         try:
-            await workflow.refresh_boards(interaction.client, board_id=None)
+            outcomes = await workflow.refresh_boards(
+                interaction.client, board_id=None
+            )
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
-        # A refresh pass swallows per-board permission failures, so the
-        # only honest report is the state the boards are in afterwards.
+        # Board state afterwards plus what the pass itself reported: the
+        # second half is what makes a rejected edit visible (G20).
         boards = await workflow.list_boards(interaction.guild_id)
-        await view.reload(interaction, note=build_refresh_all_note(boards))
+        await view.reload(
+            interaction, note=build_refresh_all_note(boards, outcomes)
+        )
 
 
 class _RefreshOneSelect(discord.ui.Select):
@@ -643,13 +693,20 @@ class _RefreshOneSelect(discord.ui.Select):
         await interaction.response.defer(ephemeral=True)
         board_id = int(self.values[0])
         try:
-            await workflow.refresh_boards(interaction.client, board_id=board_id)
+            outcomes = await workflow.refresh_boards(
+                interaction.client, board_id=board_id
+            )
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
         board = await _reread(interaction.guild_id, board_id)
         await self._owner.reload(
-            interaction, note=build_refresh_one_note(board, board_id=board_id)
+            interaction,
+            note=build_refresh_one_note(
+                board,
+                board_id=board_id,
+                outcome=outcomes[0] if outcomes else None,
+            ),
         )
 
 
@@ -663,3 +720,34 @@ async def open_boards(
         embed=build_boards_embed(boards), view=view
     )
     await view.bind_message(interaction)
+
+
+class _StatBoardsButton(discord.ui.Button):
+    """
+    Route to the *other* kind of board.
+
+    Market boards are rendered by the bot from its own data. Stat boards
+    mirror an external Google Sheet. Both used to be called "boards",
+    and only one of them had a panel at all.
+    """
+
+    def __init__(self, *, row: int) -> None:
+        super().__init__(
+            label="Google Sheets boards",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f4c8",
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from bot.ui import stat_boards_screen
+
+        parent = self.view
+        assert parent is not None
+
+        async def _back(inner: discord.Interaction) -> None:
+            await parent.reload(inner)
+
+        await stat_boards_screen.open_stat_boards(
+            interaction, opener_id=parent.opener_id, on_back=_back
+        )

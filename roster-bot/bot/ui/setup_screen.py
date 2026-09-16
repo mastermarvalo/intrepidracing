@@ -1202,61 +1202,243 @@ class _TeamsButton(discord.ui.Button):
 
 class _TeamsView(AdminOwnedView):
     """
-    List teams with current payroll, and offer per-team cap adjustment.
+    The whole team lifecycle in one screen: create, edit, relink,
+    delete, and per-team cap adjustment.
 
-    Cap adjustments are audit-ledger writes (Phase 4 records only —
-    enforcement lands later per the underlying command's own docstring),
-    so this screen is intentionally read-heavy with one write action.
+    It used to list teams and adjust caps only, telling an admin with no
+    teams to go and run `/roster create` — the one command a brand-new
+    league cannot avoid. `/roster create|edit|relink` all open the same
+    nine-step wizard, so the buttons here hand straight off to it rather
+    than duplicating any of it.
     """
 
     def __init__(self, *, parent: SetupView) -> None:
         super().__init__(opener_id=parent.opener_id)
         self.parent = parent
 
-    async def render(self, interaction: discord.Interaction) -> None:
+    async def render(
+        self, interaction: discord.Interaction, note: str | None = None
+    ) -> None:
         teams = await workflow.list_teams(interaction.guild_id)
         self.clear_items()
+        self.add_item(_CreateTeamButton())
         if teams:
+            self.add_item(_EditTeamSelect(self, teams))
             self.add_item(_AdjustCapSelect(self, teams))
-        self.add_item(BackButton(self._back))
-        embed = _build_teams_embed(teams)
+            self.add_item(_DeleteTeamSelect(self, teams))
+        self.add_item(_RelinkTeamButton())
+        self.add_item(BackButton(self._back, row=4))
+        embed = _build_teams_embed(teams, note=note)
         if interaction.response.is_done():
             await interaction.edit_original_response(embed=embed, view=self)
         else:
             await interaction.response.edit_message(embed=embed, view=self)
 
+    async def reload(
+        self, interaction: discord.Interaction, note: str | None = None
+    ) -> None:
+        await self.render(interaction, note=note)
+
     async def _back(self, interaction: discord.Interaction) -> None:
         await self.parent.reload(interaction)
 
 
-def _build_teams_embed(teams) -> discord.Embed:
+class _CreateTeamButton(discord.ui.Button):
+    """
+    Opens the same nine-step wizard as `/roster create`.
+
+    Discord forbids opening a modal from a modal submit, so the wizard's
+    first modal carries the team key as an extra field
+    (`flow.PanelCreateModal`) instead of taking it as a command
+    argument.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Create team",
+            style=discord.ButtonStyle.success,
+            emoji="\u2795",
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from bot import flow
+
+        await flow.start_create_from_panel(interaction)
+
+
+class _RelinkTeamButton(discord.ui.Button):
+    """
+    Recovery for a team whose database row was lost but whose roster
+    message still exists. Rare, and hard to find when you need it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Recover a lost team",
+            style=discord.ButtonStyle.secondary,
+            emoji="\U0001f9ef",
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(_RelinkKeyModal())
+
+
+class _RelinkKeyModal(base.PanelModal, title="Recover a lost team"):
+    """
+    Asks only for the key, then points at `/roster relink`.
+
+    The relink wizard opens with a modal of its own and Discord will not
+    let this one chain into it, so this validates the key and hands over
+    the exact command instead of dead-ending.
+    """
+
+    team_key = discord.ui.TextInput(
+        label="Team key (short id)", placeholder="red bull", max_length=32
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        key = str(self.team_key.value).strip().lower()
+        await interaction.response.send_message(
+            f"Run `/roster relink name:{key}` to rebuild **{key}** from its "
+            "existing roster message.\n\nDiscord does not allow one form to "
+            "open another, and relink starts with a form of its own — this "
+            "is the one step that still needs the typed command.",
+            ephemeral=True,
+        )
+
+
+class _EditTeamSelect(discord.ui.Select):
+    """Re-opens the wizard on an existing team, as `/roster edit` does."""
+
+    def __init__(self, parent: _TeamsView, teams) -> None:
+        super().__init__(
+            placeholder="Edit a team\u2019s name, colour, slots\u2026",
+            options=[
+                discord.SelectOption(
+                    label=f"{t.name}"[:100],
+                    value=t.key,
+                    description=f"key: {t.key}"[:100],
+                )
+                for t in teams[:SELECT_MAX_OPTIONS]
+            ],
+            row=1,
+        )
+        self._owner = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        from bot import flow
+
+        await flow.start_edit(interaction, team_key=self.values[0])
+
+
+class _DeleteTeamSelect(discord.ui.Select):
+    """Delete a team, behind a confirmation and a reference check."""
+
+    def __init__(self, parent: _TeamsView, teams) -> None:
+        super().__init__(
+            placeholder="Delete a team\u2026",
+            options=[
+                discord.SelectOption(
+                    label=f"{t.name}"[:100],
+                    value=t.key,
+                    description=f"payroll ${t.payroll:,.2f}M"[:100],
+                )
+                for t in teams[:SELECT_MAX_OPTIONS]
+            ],
+            row=3,
+        )
+        self._owner = parent
+        self._by_key = {t.key: t for t in teams}
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        team = self._by_key[self.values[0]]
+        await interaction.response.send_message(
+            f"Delete **{team.name}** (`{team.key}`) and its roster message?\n"
+            "This cannot be undone. A team that has ever signed a driver "
+            "will be refused, to protect the league\u2019s money history.",
+            view=_ConfirmDeleteTeamView(self._owner, team),
+            ephemeral=True,
+        )
+
+
+class _ConfirmDeleteTeamView(AdminOwnedView):
+    def __init__(self, parent: _TeamsView, team) -> None:
+        super().__init__(opener_id=parent.opener_id)
+        self._owner = parent
+        self._team = team
+
+    @discord.ui.button(label="Delete team", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            name = await workflow.remove_team(
+                interaction.client,
+                guild_id=interaction.guild_id,
+                team_key=self._team.key,
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        await interaction.edit_original_response(
+            content=f"\u2705 **{name}** deleted.", view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Cancelled — nothing was deleted.", view=None
+        )
+        self.stop()
+
+
+def _build_teams_embed(teams, note: str | None = None) -> discord.Embed:
     if not teams:
-        return discord.Embed(
+        embed = discord.Embed(
             title="🏎 Teams",
             description=(
-                "No teams yet. Create one with `/roster create` — the "
-                "roster commands remain the source of truth for team "
-                "membership."
+                "No teams yet. Press **Create team** to set one up — name, "
+                "colour, roles and driver slots, in one pass.\n\n"
+                "You need one team per entry on the grid before anyone can "
+                "be signed."
             ),
             color=COLOR_INFO,
         )
+        if note:
+            embed.add_field(name="\u200b", value=note, inline=False)
+        return embed
     lines = [
         f"**{t.name}** (`{t.key}`) — payroll ${t.payroll:,.2f}M"
         for t in teams
     ]
-    return discord.Embed(
+    # A three-tier league can field 30 teams. `truncate_field`'s 1024
+    # ceiling is the *field* limit, not the description limit, and would
+    # silently drop the tail of the list.
+    embed = discord.Embed(
         title="🏎 Teams",
-        description=truncate_field("\n".join(lines)),
+        description=truncate_field(
+            "\n".join(lines), limit=base.EMBED_DESCRIPTION_LIMIT
+        ),
         color=COLOR_INFO,
     ).set_footer(
-        text="Cap adjustments write an audit-ledger row · "
-             "equivalent: /market-admin adjust-cap"
+        text=f"{len(teams)} team(s) · cap adjustments move a team\u2019s "
+             "effective ceiling and are audited"
     )
+    if note:
+        embed.add_field(name="\u200b", value=note, inline=False)
+    return embed
 
 
 class _AdjustCapSelect(discord.ui.Select):
     def __init__(self, parent: _TeamsView, teams) -> None:
         super().__init__(
+            row=2,
             placeholder="Adjust cap for which team?",
             options=[
                 discord.SelectOption(
@@ -1325,6 +1507,7 @@ class _CapAdjustModal(base.PanelModal, title="Adjust team cap"):
         await self._owner.render(interaction)
         await interaction.followup.send(
             f"✅ Cap adjustment for **{self._team.name}**: {sign}${recorded}M. "
-            f"(Ledger only — enforcement lands in Phase 5.)",
+            f"Their effective cap moves by that much and every signing is "
+            f"validated against it.",
             ephemeral=True,
         )

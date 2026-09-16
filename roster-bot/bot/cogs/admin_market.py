@@ -66,7 +66,7 @@ from bot.contracts import service as contracts_service
 from bot.market import driver_ops
 from bot.market import results as results_engine
 from bot.market.money import format_money, format_pl
-from bot.ui import receipts
+from bot.ui import offseason_screen, receipts
 from bot.ui.config_modal import ConfigSectionView, build_config_embed
 
 log = logging.getLogger(__name__)
@@ -84,6 +84,9 @@ _BUDGET_RECENT_LIMIT = 8
 _MAX_LISTED_ROUNDS = 25
 _MAX_LISTED_RESULTS = 22
 _MAX_LISTED_ERRORS = 12
+# Discord accepts at most 25 autocomplete choices.
+_AUTOCOMPLETE_MAX = 25
+_MAX_LISTED_OVER_CAP = 6
 
 
 def _render_import_errors(headline: str, errors: list[str]) -> str:
@@ -92,6 +95,84 @@ def _render_import_errors(headline: str, errors: list[str]) -> str:
     if len(errors) > _MAX_LISTED_ERRORS:
         body += f"\n• …and {len(errors) - _MAX_LISTED_ERRORS} more."
     return f"❌ {headline}\n{body}"[:_DISCORD_MSG_LIMIT]
+
+
+def _render_carry_preview(preview) -> str:
+    """
+    A dry run of carry-over (G21). Deliberately spells out that nothing
+    was written, because the same command with `preview:False` is
+    irreversible.
+    """
+    lines = [
+        f"🔍 **Carry-over preview — {preview.from_season_name} → "
+        f"{preview.to_season_name}**",
+        "_Nothing was written. Re-run without `preview` to apply it._",
+        "",
+        f"• Contracts that would carry across: **{preview.to_carry}** "
+        f"({format_money(preview.carried_value)} of salary)",
+        f"• Contracts that would expire: **{preview.to_expire}** "
+        f"({format_money(preview.expiring_value)} freed up)",
+    ]
+    if preview.to_carry == 0 and preview.to_expire == 0:
+        lines.append(
+            "• Nothing to do — that season holds no active contracts."
+        )
+    if preview.over_cap:
+        lines.append("")
+        lines.append(
+            f"⚠ These teams would still be over the "
+            f"{format_money(preview.salary_cap)} cap afterwards:"
+        )
+        for name, projected, cap in preview.over_cap[:_MAX_LISTED_OVER_CAP]:
+            lines.append(
+                f"• {name} — {format_money(projected)} of "
+                f"{format_money(cap)}"
+            )
+        extra = len(preview.over_cap) - _MAX_LISTED_OVER_CAP
+        if extra > 0:
+            lines.append(f"• …and {extra} more.")
+        lines.append(
+            "Carry-over does not block on this; release or trade the "
+            "excess afterwards."
+        )
+    return "\n".join(lines)[:_DISCORD_MSG_LIMIT]
+
+
+async def _carry_over_order_blocker(
+    guild_id: int, from_season: str
+) -> str | None:
+    """
+    Refuse an out-of-order carry-over, naming the season to do first.
+
+    Carrying the newest past season first would leave older contracts
+    stranded as active rows in a season nobody is playing. The Offseason
+    panel only ever offers the oldest pending season; this keeps the
+    typed command from being the one way to get it wrong (G21).
+    """
+    try:
+        state = await offseason_screen.load_offseason_state(guild_id)
+    except Exception:
+        # A read failure here must not block a legitimate carry-over;
+        # the workflow does its own validation.
+        log.debug("carry-over ordering check failed", exc_info=True)
+        return None
+    pending = state.pending_carry
+    if not pending:
+        return None
+    oldest = pending[0]
+    if oldest.name.casefold() == from_season.casefold():
+        return None
+    if not any(s.name.casefold() == from_season.casefold() for s in pending):
+        # Unknown or already-resolved season: let the workflow explain.
+        return None
+    return (
+        f"\u274c **{oldest.name}** still holds "
+        f"{oldest.unresolved_contracts} active contract(s) and is older "
+        f"than **{from_season}**.\n"
+        f"Carry it over first, otherwise those contracts are stranded in "
+        f"a season nobody is racing:\n"
+        f"`/market-admin season carry-over from_season:{oldest.name}`"
+    )
 
 
 def _is_admin(interaction: discord.Interaction) -> bool:
@@ -117,6 +198,40 @@ def _fmt_money(value: Decimal | None) -> str:
 
 def _fmt_pct(value: Decimal) -> str:
     return f"{value * Decimal('100'):.1f}%"
+
+
+def _render_refresh_outcomes(
+    outcomes: list[workflow.BoardRefresh],
+) -> str:
+    """
+    Say what the refresh actually did (G20).
+
+    This command used to reply "✅ Refreshed all market boards" whether
+    it had edited every board, been refused by Discord in every channel,
+    or found no boards at all.
+    """
+    if not outcomes:
+        return (
+            "No market boards are configured, so nothing was refreshed. "
+            "Add one with `/market-admin board add` or from "
+            "**/league → Boards**."
+        )
+    failed = [o for o in outcomes if o.action in workflow.BOARD_FAILED_ACTIONS]
+    if not failed:
+        return f"\u2705 Refreshed {len(outcomes)} market board(s)."
+    lines = [
+        f"\u26a0 Refreshed {len(outcomes) - len(failed)} of "
+        f"{len(outcomes)} market board(s). These did not update:"
+    ]
+    lines.extend(f"\u2022 {workflow.describe_refresh(o)}" for o in failed)
+    lines.append(
+        "Fix the channel permissions (**Send Messages** + **Embed Links**) "
+        "and run this again."
+    )
+    return "\n".join(lines)
+
+
+
 
 
 class AdminMarketCog(commands.Cog):
@@ -275,22 +390,64 @@ class AdminMarketCog(commands.Cog):
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
+        # G21: activating a season used to be a dead end. The two jobs
+        # that must follow it are not discoverable from anywhere else.
         await interaction.response.send_message(
-            f"\u2705 **{name}** is now the active season.", ephemeral=True
+            f"\u2705 **{name}** is now the active season.\n\n"
+            "**Next, in this order:**\n"
+            "1. `/market-admin season carry-over from_season:<last season>` "
+            "— moves multi-race contracts across and expires the rest. "
+            "Add `preview:True` first to see what it would do.\n"
+            "2. `/market-admin budget rollover` — carries team cash "
+            "forward if rollover is enabled.\n"
+            "Both are also on the **Offseason** screen of `/league`, "
+            "which walks the checklist for you.",
+            ephemeral=True,
         )
 
     @season.command(
         name="carry-over",
         description="Carry active contracts from a past season into the active one",
     )
-    @app_commands.describe(from_season="Name of the season that just finished")
+    @app_commands.describe(
+        from_season="Name of the season that just finished",
+        preview="Show what would happen and write nothing (default: off)",
+    )
     async def season_carry_over(
-        self, interaction: discord.Interaction, from_season: str,
+        self,
+        interaction: discord.Interaction,
+        from_season: str,
+        preview: bool = False,
     ) -> None:
         if not await _admin_or_deny(interaction):
             return
         assert interaction.guild is not None
         await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # G21: this command took a free-text season name, ran an
+        # irreversible carry-over, and had no way to look first. The
+        # Offseason panel already previews and only ever offers the
+        # oldest pending season; the typed command now matches it.
+        if preview:
+            try:
+                shown = await offseason_screen.preview_carry_over(
+                    interaction.guild.id, from_season
+                )
+            except workflow.WorkflowError as exc:
+                await interaction.followup.send(f"\u274c {exc}", ephemeral=True)
+                return
+            await interaction.followup.send(
+                _render_carry_preview(shown), ephemeral=True
+            )
+            return
+
+        blocker = await _carry_over_order_blocker(
+            interaction.guild.id, from_season
+        )
+        if blocker is not None:
+            await interaction.followup.send(blocker, ephemeral=True)
+            return
+
         try:
             result = await approvals.carry_over_season(
                 guild=interaction.guild,
@@ -303,6 +460,39 @@ class AdminMarketCog(commands.Cog):
         await interaction.followup.send(
             embed=_render_carry_over(result), ephemeral=True
         )
+
+    @season_carry_over.autocomplete("from_season")
+    async def _carry_over_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """
+        Offer past seasons that still hold active contracts, oldest
+        first, so the admin never has to remember a season's exact name.
+        """
+        if interaction.guild_id is None:
+            return []
+        try:
+            state = await offseason_screen.load_offseason_state(
+                interaction.guild_id
+            )
+        except Exception:  # autocomplete must never raise at the user
+            log.debug("carry-over autocomplete failed", exc_info=True)
+            return []
+        needle = current.casefold()
+        out: list[app_commands.Choice[str]] = []
+        for season in state.pending_carry:
+            if needle and needle not in season.name.casefold():
+                continue
+            label = (
+                f"{season.name} — {season.unresolved_contracts} "
+                f"contract(s) to resolve"
+            )
+            out.append(
+                app_commands.Choice(name=label[:100], value=season.name)
+            )
+            if len(out) >= _AUTOCOMPLETE_MAX:
+                break
+        return out
 
     @season.command(name="list", description="List all seasons for this server")
     async def season_list(self, interaction: discord.Interaction) -> None:
@@ -953,15 +1143,12 @@ class AdminMarketCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
         try:
-            await workflow.refresh_boards(self.bot, board_id=board_id)
+            outcomes = await workflow.refresh_boards(self.bot, board_id=board_id)
         except workflow.WorkflowError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
         await interaction.followup.send(
-            "\u2705 Refreshed all market boards."
-            if board_id is None
-            else f"\u2705 Refreshed board `{board_id}`.",
-            ephemeral=True,
+            _render_refresh_outcomes(outcomes), ephemeral=True
         )
 
     @board.command(name="list", description="List market boards for the active season")
@@ -1330,7 +1517,7 @@ class AdminMarketCog(commands.Cog):
 
     @admin.command(
         name="adjust-cap",
-        description="Log a cap adjustment for a team (audit trail only in Phase 4)",
+        description="Grant or dock a team's spending cap (audited)",
     )
     @app_commands.describe(
         team="Team key",
@@ -1386,7 +1573,8 @@ class AdminMarketCog(commands.Cog):
         await interaction.response.send_message(
             f"✅ Cap adjustment logged for **{team_row.name}**: {sign}{delta}$M.\n"
             f"Note: {note}\n"
-            "*(Phase 4 records this in the ledger only; enforcement lands in Phase 5.)*",
+            "Their effective cap moves by that much and every signing is "
+            "validated against it.",
             ephemeral=True,
         )
 

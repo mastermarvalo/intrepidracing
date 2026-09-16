@@ -25,6 +25,7 @@ indices.
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 import discord
 from discord.ext import commands
@@ -37,8 +38,64 @@ from bot.models import MarketBoard
 log = logging.getLogger(__name__)
 
 
-async def refresh_all_boards(bot: commands.Bot) -> None:
-    """Refresh every market board across every guild the bot is in."""
+class BoardRefresh(NamedTuple):
+    """
+    What one refresh pass actually did (G20).
+
+    `refresh_board` used to return `None` and log permission failures at
+    warning level, so a caller could only re-read `message_id` — which
+    distinguishes "never posted" from "posted", but not "posted earlier,
+    and today's edit was rejected". Commands replied ✅ regardless.
+
+    `posted` means a message exists in the channel now. `action` names
+    the path taken so a caller can tell a silent failure from a success.
+    """
+
+    board_id: int
+    posted: bool
+    action: str
+
+
+#: Every value `BoardRefresh.action` can take. Callers that render an
+#: outcome should handle all of them; `ACTION_LABELS` keeps the wording
+#: in one place.
+ACTION_SENT = "sent"
+ACTION_EDITED = "edited"
+ACTION_MESSAGE_MISSING = "message_missing"
+ACTION_SKIPPED_NO_CHANNEL = "skipped_no_channel"
+ACTION_SKIPPED_FORBIDDEN = "skipped_forbidden"
+ACTION_SKIPPED_NO_DATA = "skipped_no_data"
+
+ACTION_LABELS = {
+    ACTION_SENT: "posted for the first time",
+    ACTION_EDITED: "updated in place",
+    ACTION_MESSAGE_MISSING: "its message was deleted — will repost next refresh",
+    ACTION_SKIPPED_NO_CHANNEL: "its channel is gone or not visible to the bot",
+    ACTION_SKIPPED_FORBIDDEN: "the bot lacks permission in that channel",
+    ACTION_SKIPPED_NO_DATA: "there is nothing to show yet",
+}
+
+#: Actions that mean the refresh did not do what the operator asked.
+FAILED_ACTIONS = (
+    ACTION_MESSAGE_MISSING,
+    ACTION_SKIPPED_NO_CHANNEL,
+    ACTION_SKIPPED_FORBIDDEN,
+)
+
+
+def describe_refresh(outcome: BoardRefresh) -> str:
+    """One human line for a refresh outcome."""
+    label = ACTION_LABELS.get(outcome.action, outcome.action)
+    return f"Board `{outcome.board_id}` — {label}"
+
+
+async def refresh_all_boards(bot: commands.Bot) -> list[BoardRefresh]:
+    """
+    Refresh every market board across every guild the bot is in.
+
+    Returns one outcome per board so callers can report honestly.
+    """
+    out: list[BoardRefresh] = []
     for guild in bot.guilds:
         async with db.connect() as conn:
             season = await queries.fetch_active_season(conn, guild.id)
@@ -46,7 +103,8 @@ async def refresh_all_boards(bot: commands.Bot) -> None:
                 continue
             boards = await queries.fetch_market_boards_in_season(conn, season.id)
         for board in boards:
-            await refresh_board(bot, board)
+            out.append(await refresh_board(bot, board))
+    return out
 
 
 async def refresh_boards_for_tier(
@@ -55,7 +113,7 @@ async def refresh_boards_for_tier(
     guild_id: int,
     season_id: int,
     tier_id: int | None,
-) -> None:
+) -> list[BoardRefresh]:
     """
     Refresh every board scoped to a specific tier PLUS every cross-tier
     board (dashboards) in the same season. Called after a publish so a
@@ -69,36 +127,41 @@ async def refresh_boards_for_tier(
             [] if tier_id is None
             else await queries.fetch_market_boards_for_tier(conn, season_id, None)
         )
-    for board in list(tier_boards) + list(cross):
+    return [
         await refresh_board(bot, board)
+        for board in list(tier_boards) + list(cross)
+    ]
 
 
-async def refresh_board(bot: commands.Bot, board: MarketBoard) -> None:
+async def refresh_board(
+    bot: commands.Bot, board: MarketBoard
+) -> BoardRefresh:
     """
     Rebuild `board`'s embed and edit the stored message. Clears
-    `message_id` if the message is gone; logs (but does not raise) on
-    permission errors so one broken channel doesn't take out the
-    refresh pass for the rest.
+    `message_id` if the message is gone; still does not raise on
+    permission errors, so one broken channel doesn't take out the
+    refresh pass for the rest — but now reports what happened instead of
+    letting the caller assume success (G20).
     """
     embed = await build_board_embed(board)
     if embed is None:
-        return
+        return BoardRefresh(board.id, False, ACTION_SKIPPED_NO_DATA)
     channel = bot.get_channel(board.channel_id)
     if not isinstance(channel, discord.TextChannel):
         log.warning(
             "Board %s: channel %s unavailable", board.id, board.channel_id
         )
-        return
+        return BoardRefresh(board.id, False, ACTION_SKIPPED_NO_CHANNEL)
 
     if board.message_id is None:
         try:
             msg = await channel.send(embed=embed)
         except discord.Forbidden:
             log.warning("Board %s: no permission to post in channel", board.id)
-            return
+            return BoardRefresh(board.id, False, ACTION_SKIPPED_FORBIDDEN)
         async with db.connect() as conn:
             await queries.set_market_board_message_id(conn, board.id, msg.id)
-        return
+        return BoardRefresh(board.id, True, ACTION_SENT)
 
     try:
         msg = await channel.fetch_message(board.message_id)
@@ -110,18 +173,25 @@ async def refresh_board(bot: commands.Bot, board: MarketBoard) -> None:
         )
         async with db.connect() as conn:
             await queries.set_market_board_message_id(conn, board.id, None)
+        return BoardRefresh(board.id, False, ACTION_MESSAGE_MISSING)
     except discord.Forbidden:
         log.warning(
             "Board %s: no permission to edit message in channel %s",
             board.id, board.channel_id,
         )
+        # The stale message is still sitting in the channel showing old
+        # numbers. `message_id IS NOT NULL` would read as healthy, which
+        # is exactly the lie G20 was about.
+        return BoardRefresh(board.id, True, ACTION_SKIPPED_FORBIDDEN)
+    return BoardRefresh(board.id, True, ACTION_EDITED)
 
 
 async def build_board_embed(board: MarketBoard) -> discord.Embed | None:
     """
     Return the current embed for `board.kind`, or None if the kind is
-    unknown / not yet implemented (e.g. cap/surplus/underwater land in
-    Phase 4).
+    unknown or the season behind it has gone. Every kind the board
+    picker offers (market, movers, dashboard, surplus, underwater) is
+    handled below.
     """
     async with db.connect() as conn:
         season = await queries.fetch_season_by_id(conn, board.season_id)
