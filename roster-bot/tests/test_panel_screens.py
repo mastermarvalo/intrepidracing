@@ -1413,8 +1413,25 @@ def test_setup_mentions_the_145m_cap_for_the_preset():
 def test_setup_ticks_off_what_is_done():
     embed = setup_screen.build_setup_embed(league_status())
 
-    assert embed.description.count("✅") == 3
+    # Season, tiers, league settings, drivers.
+    assert embed.description.count("✅") == 4
     assert_embed_within_limits(embed)
+
+
+def test_setup_checklist_shows_league_settings_as_its_own_line():
+    """
+    G2: `setup_complete` has always required a league_config row, but
+    the checklist never showed it. A season with tiers and drivers but
+    no settings rendered three ticks and an amber embed with nothing
+    saying what was missing, while every command refused to run.
+    """
+    seeded = setup_screen.build_setup_embed(league_status())
+    missing = setup_screen.build_setup_embed(league_status(has_config=False))
+
+    assert "**League settings**" in seeded.description
+    assert "**League settings**" in missing.description
+    assert "not seeded yet" in missing.description
+    assert missing.description.count("✅") == 3
 
 
 def test_setup_shows_which_tiers_have_a_linked_role():
@@ -1455,8 +1472,34 @@ def test_everything_unlocks_once_tiers_exist():
         status=league_status(), opener_id=1, on_back=noop_back
     )
 
-    assert not any(getattr(c, "disabled", False) for c in view.children)
+    # "Seed settings" is the one deliberate exception: on a fully set-up
+    # season it is not an action, it is a way to wipe the cap and the
+    # valuation factors. Asserted directly below.
+    enabled_only = [c for c in view.children if c.label != "Seed settings"]
+    assert not any(getattr(c, "disabled", False) for c in enabled_only)
     assert_view_within_limits(view)
+
+
+def test_the_seed_button_is_offered_only_while_settings_are_missing():
+    """
+    G2: the escape hatch has to be reachable from the panel two separate
+    error messages point at, and unreachable once pressing it would
+    reset a live season.
+    """
+    missing = setup_screen.SetupView(
+        status=league_status(has_config=False), opener_id=1, on_back=noop_back
+    )
+    seeded = setup_screen.SetupView(
+        status=league_status(), opener_id=1, on_back=noop_back
+    )
+
+    def seed_button(view):
+        found = [c for c in view.children if c.label == "Seed settings"]
+        assert found, "the Setup panel must expose the G2 escape hatch"
+        return found[0]
+
+    assert seed_button(missing).disabled is False
+    assert seed_button(seeded).disabled is True
 
 
 def test_setup_exposes_every_configuration_area():

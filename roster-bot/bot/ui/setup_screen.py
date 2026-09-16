@@ -62,6 +62,12 @@ def build_setup_embed(status: workflow.LeagueStatus) -> discord.Embed:
             if status.has_tiers
             else "none yet"
         ),
+        f"{done if status.has_config else todo} **League settings** — "
+        + (
+            "cap, valuation factors and scoring table seeded"
+            if status.has_config
+            else "not seeded yet — press **Seed settings**"
+        ),
         f"{done if status.has_drivers else todo} **Drivers** — "
         + (
             f"{sum(t.driver_count for t in status.tiers)} across all tiers"
@@ -111,12 +117,32 @@ def build_setup_embed(status: workflow.LeagueStatus) -> discord.Embed:
             name="Next step",
             value=(
                 "This season has no tiers. If you skipped the F1 preset "
-                "when you created it, run `/market-admin season "
-                f"seed-preset name:{status.season_name}` to add "
+                "when you created it, press **Seed settings** to add "
                 "three tiers, the scoring table, the valuation factors "
-                "and the default $145.00M cap at once.\n"
-                "To build it by hand instead, press **Tier** \u2014 but "
-                "you will also need to set the league config yourself."
+                "and the default $145.00M cap at once — the typed "
+                "equivalent is `/market-admin season seed-preset "
+                f"name:{status.season_name}`.\n"
+                "To build it by hand instead, press **Tier** \u2014 then "
+                "come back and press **Seed settings** to fill in the "
+                "league settings around your own tiers."
+            ),
+            inline=False,
+        )
+    elif not status.has_config:
+        # G2: tiers built by hand leave the season with no league_config
+        # row, and every downstream command — valuations, offers, the cap
+        # panel — refuses until one exists. Nothing else on this screen
+        # used to say so.
+        embed.add_field(
+            name="Next step",
+            value=(
+                "This season has tiers but no league settings, so "
+                "valuations, offers and the cap panel will all refuse to "
+                "run. Press **Seed settings** to add the scoring table, "
+                "the valuation factors and the default $145.00M cap — "
+                f"your {len(status.tiers)} tier(s) are kept exactly as "
+                "they are. The typed equivalent is `/market-admin season "
+                f"seed-preset name:{status.season_name}`."
             ),
             inline=False,
         )
@@ -552,6 +578,14 @@ class SetupView(AdminOwnedView):
         self.add_item(_SeasonButton(row=0))
         self.add_item(_TierButton(row=0, enabled=has_season))
         self.add_item(_ConfigButton(row=0, enabled=has_season))
+        # Only offered while it is the thing to do: seeding over an
+        # existing config row would reset the cap and the valuation
+        # factors underneath signed contracts, and workflow refuses it.
+        self.add_item(
+            _SeedSettingsButton(
+                row=0, enabled=has_season and not status.has_config
+            )
+        )
         self.add_item(_TierRoleButton(row=1, enabled=status.has_tiers))
         self.add_item(_CommissionerButton(row=1, enabled=has_season))
         self.add_item(_ChannelsButton(row=1, enabled=has_season))
@@ -628,6 +662,51 @@ class _TierButton(discord.ui.Button):
         view = self.view
         assert isinstance(view, SetupView)
         await view.open_tier_menu(interaction)
+
+
+class _SeedSettingsButton(discord.ui.Button):
+    """
+    The one-press way out of a season with no league settings (G2).
+
+    Before this existed the only route was the typed `/market-admin
+    season seed-preset`, while two separate error messages told admins
+    to open this panel instead — advice the panel could not honour.
+    """
+
+    def __init__(self, *, row: int, enabled: bool) -> None:
+        super().__init__(
+            label="Seed settings", style=_style(enabled), emoji="🌱", row=row,
+            disabled=not enabled,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, SetupView)
+        if view.status.season_name is None:
+            await report_error(interaction, "No active season to seed into.")
+            return
+        await interaction.response.defer()
+        try:
+            result = await workflow.seed_preset_into_season(
+                guild_id=interaction.guild_id, name=view.status.season_name
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        if result.settings_only:
+            note = (
+                f"\u2705 Seeded league settings into **{result.name}** — "
+                f"scoring table, valuation factors and the default "
+                f"$145.00M cap. Your {result.tiers_kept} existing tier(s) "
+                f"were left untouched."
+            )
+        else:
+            note = (
+                f"\u2705 Seeded the F1 preset into **{result.name}**: "
+                f"{result.tiers_created} tier(s), the scoring table, the "
+                f"valuation factors and the default $145.00M cap."
+            )
+        await view.reload(interaction, note=note)
 
 
 class _ConfigButton(discord.ui.Button):

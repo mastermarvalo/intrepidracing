@@ -153,6 +153,7 @@ no argument names, no channel or role ids to copy.
 ⚙️ League setup
 ✅ Season — Season 7 is active
 ✅ Tiers — 3 configured (t1, t2, t3)
+✅ League settings — cap, valuation factors and scoring table seeded
 ⬜ Drivers — none yet — bulk-enrol with /market-admin driver sync-all,
    or press Drivers
 
@@ -161,7 +162,7 @@ t1 Tier 1 · 0 driver(s) · 🏷 role linked
 t2 Tier 2 · 0 driver(s)
 t3 Tier 3 · 0 driver(s)
 
-[ 📅 Season ]  [ 🧱 Tier ]  [ 💰 Cap & rules ]
+[ 📅 Season ]  [ 🧱 Tier ]  [ 💰 Cap & rules ]  [ 🌱 Seed settings ]
 [ 🏷 Tier role ]  [ 🧑‍⚖️ Commissioner role ]  [ 📣 Channels ]
 [ 📊 Boards ]  [ ◀ Back to home ]
 ```
@@ -171,13 +172,19 @@ t3 Tier 3 · 0 driver(s)
 | Season | `season create` + `season activate` |
 | Tier | `tier add` |
 | Cap & rules | `config edit` |
+| Seed settings | `season seed-preset` |
 | Tier role | `tier edit role:` |
 | Commissioner role | `config role` |
 | Channels | `config channel` |
 | Boards | `board add` / `remove` / `refresh` / `list` |
 
 Buttons for steps that cannot work yet are greyed out — you can't add a
-tier before a season exists. Roles and channels use Discord's own
+tier before a season exists. **Seed settings** is the inverse: it is
+offered only while the season has no league settings, and greys out once
+it does, because seeding over a live config row would reset the cap and
+the valuation factors underneath contracts already signed. It fills in
+the settings around tiers you have already built by hand, leaving those
+tiers untouched. Roles and channels use Discord's own
 pickers, so ids are never typed by hand. Choosing the **f1** preset when
 creating a season seeds three tiers, the scoring table, the valuation
 factors and the default **$145.00M** salary cap in one step.

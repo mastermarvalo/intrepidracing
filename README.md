@@ -199,16 +199,23 @@ types, the valuation factors, the points table, and a league config with
 the $145M cap. A season created without it is an empty shell you would
 have to configure by hand.
 
-If you did create one without the preset, you are not stuck:
+If you did create one without the preset, you are not stuck. Open
+`/league` → **Setup** and press **Seed settings**, or type:
 
 ```text
 /market-admin season seed-preset name: "Season 9"
 ```
 
-It refuses once a season has tiers or settings, because re-seeding a
+Either route works whether or not you have already added tiers by hand.
+If you have, your tiers are kept exactly as you built them and only the
+missing settings — the scoring table, the valuation factors and the
+$145M cap — are filled in.
+
+It refuses once a season already has settings, because re-seeding a
 running season would reset the valuation factors and the cap underneath
-contracts already signed against them. It is a recovery path for an
-empty season, not a reset button.
+contracts already signed against them. It is a recovery path, not a
+reset button. To change settings on a running season, use **Cap &
+rules** on the Setup screen.
 
 Name your tiers and attach the roles:
 

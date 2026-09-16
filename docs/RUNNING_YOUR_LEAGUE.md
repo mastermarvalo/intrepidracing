@@ -306,17 +306,27 @@ stuck. Previously the preset could only be applied at creation, so a
 season made without one had no tiers and no league config and nothing
 could give it either — every command failed with advice to "create a
 season with the preset", which you could not do for the season you had
-already named. Recover with:
+already named. Recover from `/league` → **Setup** by pressing **Seed
+settings**, or type:
 
 ```text
 /market-admin season seed-preset name: "Season 8"
 ```
 
-It refuses to run once the season has tiers or a config row, because
-re-seeding a live season would reset the valuation factors and the cap
-underneath contracts already signed against them. It is a recovery path
-for an empty season, not a reset button. To change settings on a season
-that is already running, use the config panel instead.
+**This works even if you have already added tiers by hand.** That was
+the last corner of the same problem: adding a tier through Setup →
+**Tiers** does not create the league config row, so a season could end
+up with tiers but no settings — and seeding used to refuse the moment
+any tier existed, while the config panel it redirected you to had no row
+to edit. Now the tiers are kept exactly as you built them and only the
+missing settings are filled in. The Setup checklist has a **League
+settings** line so you can see at a glance whether the row exists.
+
+It refuses to run once the season has a config row, because re-seeding a
+live season would reset the valuation factors and the cap underneath
+contracts already signed against them. It is a recovery path, not a
+reset button. To change settings on a season that is already running,
+use the config panel instead.
 
 Name tiers and attach roles and colours:
 

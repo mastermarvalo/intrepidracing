@@ -971,8 +971,22 @@ async def test_show_config_returns_the_season_default(workflow_db):
 
 async def test_show_config_raises_when_no_config(workflow_db):
     await workflow.create_and_activate_season(guild_id=GUILD, name="empty")
-    with pytest.raises(workflow.WorkflowError, match="No league config"):
+    with pytest.raises(workflow.WorkflowError, match="No league settings"):
         await workflow.show_config(GUILD)
+
+
+async def test_show_config_tells_you_how_to_get_a_config(workflow_db):
+    """
+    G2: it used to say "Create a season with the F1 preset to seed one"
+    — which cannot be done for the season already named and activated.
+    """
+    await workflow.create_and_activate_season(guild_id=GUILD, name="empty")
+    with pytest.raises(workflow.WorkflowError) as exc:
+        await workflow.show_config(GUILD)
+    message = str(exc.value)
+    assert "seed-preset" in message
+    assert "empty" in message, "name the season so it is copy-pasteable"
+    assert "Create a season" not in message
 
 
 async def test_set_free_agency_toggles_the_flag(workflow_db):

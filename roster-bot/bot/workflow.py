@@ -285,7 +285,11 @@ async def run_valuation(
             cfg = await queries.fetch_league_config_row(conn, season.id, None)
         if cfg is None:
             raise WorkflowError(
-                "No league config for that scope. Seed one with the F1 preset first."
+                f"**{season.name}** has no league settings yet, so there is "
+                f"nothing to value against. Seed them with "
+                f"`/market-admin season seed-preset name:{season.name}`, or "
+                f"open `/league` \u2192 Setup, which offers the same thing. "
+                f"Any tiers and drivers you have already added are kept."
             )
 
         factor_rows = await queries.fetch_valuation_factors(conn, season.id)
@@ -566,6 +570,8 @@ class PresetSeeded:
     season_id: int
     name: str
     tiers_created: int
+    tiers_kept: int = 0
+    settings_only: bool = False
 
 
 async def seed_preset_into_season(
@@ -581,10 +587,18 @@ async def seed_preset_into_season(
     season with the preset" — advice that could not be followed for the
     season they had already named and possibly activated.
 
-    Refuses to run once the season has tiers or a config row. Re-seeding
-    a live season would reset valuation factors and the spending cap
-    underneath contracts already signed against them, so this is a
-    recovery path for an empty season only, never a reset button.
+    Refuses only once the season has a config row. Re-seeding over one
+    would reset valuation factors and the spending cap underneath
+    contracts already signed against them, so this is a recovery path,
+    never a reset button.
+
+    Tiers alone do not block it. They used to, which was the second half
+    of G2: a season created without a preset, then given a tier through
+    Setup → Tiers, had tiers but no config row. Seeding refused because
+    tiers existed, and the config panel it redirected to refused because
+    there was no row to edit. The season was unusable and nothing in the
+    bot could rescue it. When tiers exist, the settings are seeded and
+    the tiers are left exactly as the commissioner built them.
     """
     if preset != "f1":
         raise WorkflowError(f"Unknown preset `{preset}`.")
@@ -595,23 +609,40 @@ async def seed_preset_into_season(
             raise WorkflowError(f"No season named **{name}** in this server.")
 
         tiers = await queries.fetch_all_tiers(conn, season.id)
-        if tiers:
-            codes = ", ".join(f"`{t.code}`" for t in tiers)
-            raise WorkflowError(
-                f"**{season.name}** already has tiers ({codes}), so it is "
-                f"already set up. Seeding a preset now would overwrite its "
-                f"valuation factors and spending cap underneath any "
-                f"contracts already signed. Edit settings from the config "
-                f"panel instead."
-            )
         cfg = await queries.fetch_league_config_row(conn, season.id, None)
+
+        # The config row is the thing worth protecting: it carries the
+        # spending cap and the valuation factors that live contracts
+        # were priced against.
         if cfg is not None:
+            if tiers:
+                codes = ", ".join(f"`{t.code}`" for t in tiers)
+                raise WorkflowError(
+                    f"**{season.name}** is already set up — tiers ({codes}) "
+                    f"and league settings both. Seeding again would "
+                    f"overwrite its valuation factors and spending cap "
+                    f"underneath any contracts already signed. Edit "
+                    f"settings from the config panel instead."
+                )
             raise WorkflowError(
-                f"**{season.name}** already has a league config row. Edit it "
+                f"**{season.name}** already has league settings. Edit them "
                 f"from the config panel rather than re-seeding."
             )
 
         from bot.presets import f1 as f1_preset
+
+        if tiers:
+            # Tiers by hand, settings never seeded. Fill in the missing
+            # half and keep the tiers — seeding t1/t2/t3 alongside them
+            # would duplicate rank orders the panel refuses to create.
+            await f1_preset.seed_settings_only(conn, season.id)
+            return PresetSeeded(
+                season_id=season.id,
+                name=season.name,
+                tiers_created=0,
+                tiers_kept=len(tiers),
+                settings_only=True,
+            )
 
         await f1_preset.seed_season(conn, season.id)
         seeded = await queries.fetch_all_tiers(conn, season.id)
@@ -1705,8 +1736,10 @@ async def show_config(guild_id: int, *, tier_code: str | None = None):
     if cfg is None:
         scope = f"tier `{tier_code}`" if tier_code else "the season default"
         raise WorkflowError(
-            f"No league config row for {scope}. Create a season with the "
-            "F1 preset to seed one."
+            f"No league settings for {scope} yet. Seed them into this "
+            f"season with `/market-admin season seed-preset "
+            f"name:{season.name}`, or open `/league` \u2192 Setup. Creating "
+            f"a new season is not necessary, and your tiers are kept."
         )
     return cfg
 

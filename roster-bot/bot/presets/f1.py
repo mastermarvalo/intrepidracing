@@ -262,6 +262,28 @@ async def seed_season(conn: asyncpg.Connection, season_id: int) -> None:
     """
     await _seed_global_lookups(conn)
     await _seed_tiers(conn, season_id)
+    await _seed_settings(conn, season_id)
+
+
+async def seed_settings_only(conn: asyncpg.Connection, season_id: int) -> None:
+    """
+    Seed everything `seed_season` does except the tiers.
+
+    For a season whose tiers were built by hand before any preset was
+    applied. Re-running `_seed_tiers` there would add t1/t2/t3 alongside
+    the commissioner's own tiers, and `queries.insert_tier` bypasses the
+    rank-order conflict guard that `workflow.add_tier` applies — so a
+    hand-built `pro` tier at rank 1 would end up sharing rank 1 with a
+    freshly seeded `t1`, a state the panel otherwise refuses to create.
+
+    Idempotent, like everything else here.
+    """
+    await _seed_global_lookups(conn)
+    await _seed_settings(conn, season_id)
+
+
+async def _seed_settings(conn: asyncpg.Connection, season_id: int) -> None:
+    """The season-scoped settings, with no opinion about tiers."""
     await _seed_valuation_factors(conn, season_id)
     await _seed_position_scores(conn, season_id)
     await _seed_default_results_config(conn, season_id)
