@@ -45,6 +45,12 @@ KIND_SALARY_ESCROW = "salary_escrow"
 KIND_ESCROW_RETURN = "escrow_return"
 KIND_ESCROW_PL = "escrow_pl"
 
+# Declared as a transaction kind by migration 015 and, until now, never
+# written by anything. A term ending is a contract event rather than a
+# money event, which is why it belongs in `contract_ledger` and not in
+# the budget ledger.
+KIND_TERM_COMPLETED = "term_completed"
+
 REASON_TERM_COMPLETE = "term_complete"
 REASON_RELEASE = "release"
 REASON_BUYOUT = "buyout"
@@ -168,6 +174,45 @@ async def open_for_contract(
     return escrow_id
 
 
+async def record_race_served(
+    conn: asyncpg.Connection,
+    *,
+    contract: Contract,
+    round_id: int,
+    amount: Decimal,
+) -> int | None:
+    """
+    Count one race against a contract's term. Nothing to do with money.
+
+    Serving a race is a *league* fact: the driver turned up for a round
+    the contract covers, and the term is one race shorter. That is true
+    whether or not the league models team cash, so this is deliberately
+    independent of `escrow_enabled`.
+
+    Keeping it separate fixes a real bug. The service row used to be
+    written only inside `charge_race`, which returns early when escrow is
+    off — so an escrow-off league recorded no service at all,
+    `races_served` never advanced, and a race-based term never completed.
+    Contracts stayed active forever and had to be ended by hand.
+
+    `amount` is what was escrowed for this race, and is zero when no
+    money moved. It is informational: `races_served` counts rows, never
+    sums amounts, so a zero here still advances the term.
+
+    Returns the new row's id, or None if this (contract, round) was
+    already counted — the guard that makes a re-imported round safe.
+    """
+    if contract.term_races is None:
+        return None
+    return await queries.record_race_service(
+        conn,
+        contract_id=contract.id,
+        round_id=round_id,
+        team_id=contract.team_id,
+        amount=amount,
+    )
+
+
 async def charge_race(
     conn: asyncpg.Connection,
     *,
@@ -176,6 +221,7 @@ async def charge_race(
     races_per_season: int,
     tier_id: int | None = None,
     actor_id: int | None = None,
+    service_counted: bool = False,
 ) -> RaceCharge | None:
     """
     Debit one race's share of salary from the team into escrow.
@@ -190,6 +236,14 @@ async def charge_race(
     (and makes re-imports safe), `contract_escrow.amount_held` says what
     the team can get back, and `team_budget_ledger` says where the money
     went.
+
+    `service_counted` tells this function the caller already wrote the
+    service row, so it must not try again and must not read a conflict as
+    "already served". `charge_round_for_tier` records service itself —
+    unconditionally, because a term advances whether or not escrow is on
+    — and then calls here for the money. A direct caller leaves the flag
+    alone and gets the self-contained behaviour, including the re-import
+    guard.
     """
     if contract.term_races is None:
         return None
@@ -203,15 +257,12 @@ async def charge_race(
 
     share = escrow_engine.per_race_share(contract.contract_value, races_per_season)
 
-    counted = await queries.record_race_service(
-        conn,
-        contract_id=contract.id,
-        round_id=round_id,
-        team_id=contract.team_id,
-        amount=share,
-    )
-    if counted is None:
-        return None
+    if not service_counted:
+        counted = await record_race_served(
+            conn, contract=contract, round_id=round_id, amount=share,
+        )
+        if counted is None:
+            return None
 
     total_held = holding["amount_held"]
     if share > _ZERO:
@@ -426,14 +477,20 @@ class RoundEscrowOutcome:
     `charges` and `settlements` are parallel to what a receipt needs to
     show: money taken into escrow for races served, and money paid back
     for terms that ended. `skipped` counts contracts nothing happened to
-    — already counted for this round, or no live holding — so a receipt
+    — already counted for this round, or no term to serve — so a receipt
     can distinguish "nothing to do" from "nothing happened".
+
+    `advanced` counts terms that moved one race closer to ending. With
+    escrow on it tracks `charges`; with escrow off it is the only sign
+    the import did anything, because no money moves and `charges` stays
+    empty while terms still run down and still complete.
     """
 
     charges: list[RaceCharge] = field(default_factory=list)
     settlements: list[SettlementResult] = field(default_factory=list)
     completed_contract_ids: list[int] = field(default_factory=list)
     skipped: int = 0
+    advanced: int = 0
 
     @property
     def total_charged(self) -> Decimal:
@@ -468,33 +525,72 @@ async def charge_round_for_tier(
     deferring it would leave a team unable to spend cash it had earned
     until some other event happened to run.
 
-    Safe to re-run. `charge_race` returns None for a round already
-    counted against a contract, so a re-imported sheet advances no term
-    and takes no second payment.
+    Serving the race and paying for it are two separate steps here, in
+    that order, and the order matters. A term advances because a round
+    was imported, not because money moved: an escrow-off league still
+    runs its contracts down and still ends them. Recording service first
+    — unconditionally — is what makes that true. Charging is then an
+    extra that happens only when escrow is on and the contract has a
+    live holding.
+
+    That also fixes the narrower case of a contract signed while escrow
+    was off and raced after it was switched on, or the reverse: it has no
+    holding, so no money moves, but its term still completes on schedule
+    instead of never.
+
+    Safe to re-run. The service row is unique per (contract, round), so a
+    re-imported sheet advances no term and takes no second payment.
     """
     charges: list[RaceCharge] = []
     settlements: list[SettlementResult] = []
     completed: list[int] = []
     skipped = 0
+    advanced = 0
+    escrow_on = await is_enabled(conn, season_id=season_id, tier_id=tier_id)
     contracts = await queries.fetch_active_contracts_for_tier(
         conn, season_id, tier_id
     )
     for contract in contracts:
-        charge = await charge_race(
-            conn,
-            contract=contract,
-            round_id=round_id,
-            races_per_season=races_per_season,
-            tier_id=tier_id,
-            actor_id=actor_id,
-        )
-        if charge is None:
+        if contract.term_races is None:
             skipped += 1
             continue
-        charges.append(charge)
 
-        if contract.term_races is None:
+        # Is there money to move for this contract? Escrow can be on for
+        # the season while an individual contract has no holding, and
+        # then the term must still run.
+        holding = None
+        if escrow_on:
+            holding = await queries.fetch_held_escrow(conn, contract.id)
+        share = (
+            escrow_engine.per_race_share(contract.contract_value, races_per_season)
+            if holding is not None
+            else _ZERO
+        )
+
+        # Step one: count the race. None means this round was already
+        # counted for this contract, so the whole contract is a no-op.
+        if await record_race_served(
+            conn, contract=contract, round_id=round_id, amount=share,
+        ) is None:
+            skipped += 1
             continue
+        advanced += 1
+
+        # Step two: take the money, if there is any to take.
+        if holding is not None:
+            charge = await charge_race(
+                conn,
+                contract=contract,
+                round_id=round_id,
+                races_per_season=races_per_season,
+                tier_id=tier_id,
+                actor_id=actor_id,
+                service_counted=True,
+            )
+            if charge is not None:
+                charges.append(charge)
+
+        # Step three: end the term if it is done, escrow or no escrow.
         served = await races_served(conn, contract)
         if not escrow_engine.is_term_complete(
             term_races=contract.term_races, races_served=served
@@ -506,6 +602,25 @@ async def charge_round_for_tier(
         # gone and `settle_holding` would return None anyway.
         if not await queries.complete_contract(conn, contract.id):
             continue
+        completed.append(contract.id)
+        # Recorded even when no money settles, so that a contract ending
+        # is never invisible. With escrow off this is the only trace in
+        # the ledger that the term ran out.
+        await queries.append_ledger(
+            conn,
+            season_id=contract.season_id,
+            tier_id=contract.tier_id,
+            driver_id=contract.driver_id,
+            team_id=contract.team_id,
+            contract_id=contract.id,
+            kind=KIND_TERM_COMPLETED,
+            detail={
+                "races_served": str(served),
+                "term_races": str(contract.term_races),
+                "round_id": str(round_id),
+            },
+            actor_id=actor_id,
+        )
         settlement = await settle_holding(
             conn,
             contract=contract,
@@ -513,7 +628,6 @@ async def charge_round_for_tier(
             actor_id=actor_id,
             note=f"Term complete after {served} race(s)",
         )
-        completed.append(contract.id)
         if settlement is not None:
             settlements.append(settlement)
     return RoundEscrowOutcome(
@@ -521,4 +635,5 @@ async def charge_round_for_tier(
         settlements=settlements,
         completed_contract_ids=completed,
         skipped=skipped,
+        advanced=advanced,
     )

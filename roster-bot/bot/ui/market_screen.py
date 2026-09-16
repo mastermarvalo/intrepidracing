@@ -57,6 +57,13 @@ from bot.ui.base import (
     truncate_field,
 )
 
+# A driver with no recorded earnings reads as $0.00M, which here is a
+# true zero (nothing paid yet), not an unknown.
+_CARD_NO_EARNINGS = Decimal("0")
+
+# Ceiling on the earnings leaderboard read, matching `/market earnings`.
+EARNINGS_MAX_ROWS = 500
+
 # A select holds 25 options, so every picker pages at 25 and says so.
 ITEMS_PER_PAGE = SELECT_MAX_OPTIONS
 
@@ -81,6 +88,7 @@ VIEW_MOVERS = "movers"
 VIEW_SURPLUS = "surplus"
 VIEW_UNDERWATER = "underwater"
 VIEW_DASHBOARD = "dashboard"
+VIEW_EARNINGS = "earnings"
 
 _VIEW_LABELS = {
     VIEW_TABLE: "Market table",
@@ -88,13 +96,23 @@ _VIEW_LABELS = {
     VIEW_SURPLUS: "Surplus (best P/L)",
     VIEW_UNDERWATER: "Underwater (worst P/L)",
     VIEW_DASHBOARD: "Cross-tier dashboard",
+    VIEW_EARNINGS: "Career earnings leaderboard",
 }
 
 _TIER_VIEWS = (VIEW_TABLE, VIEW_MOVERS, VIEW_SURPLUS, VIEW_UNDERWATER)
 
+# Views that page. Earnings joins the market table here; the cross-tier
+# dashboard and the two P/L lists are fixed-length by design.
+_PAGED_VIEWS = (VIEW_TABLE, VIEW_EARNINGS)
+
+# Career earnings are guild-wide and outlive any one season, so this
+# view must render in the off-season when `season_id` is None — it is
+# the one view that does not need an active season.
+_SEASONLESS_VIEWS = (VIEW_EARNINGS,)
+
 _FOOTER = (
     "Read-only · equivalent commands: /market view · movers · driver · "
-    "team · surplus · underwater · dashboard"
+    "team · surplus · underwater · dashboard · earnings"
 )
 
 
@@ -250,6 +268,10 @@ class DriverCard:
     contract_term: str | None
     open_offers: int
     history: list
+    # Lifetime salary credited to this member across every season.
+    # Defaulted so existing constructions stay valid; it is a record of
+    # what they have been paid, not a balance they can spend.
+    career_earnings: Decimal = _CARD_NO_EARNINGS
 
 
 async def load_market_state(guild_id: int) -> MarketState:
@@ -375,6 +397,9 @@ async def load_driver_card(guild_id: int, driver_id: int) -> DriverCard | None:
             else None
         )
         offers = await queries.fetch_open_offers_for_driver(conn, driver_id)
+        career = await queries.fetch_career_earnings(
+            conn, driver.member_id, guild_id
+        )
 
     latest = next(
         (row for row in table if row["driver_id"] == driver_id), None
@@ -403,6 +428,7 @@ async def load_driver_card(guild_id: int, driver_id: int) -> DriverCard | None:
         contract_term=term,
         open_offers=len(offers),
         history=history,
+        career_earnings=career,
     )
 
 
@@ -660,6 +686,8 @@ def build_driver_card_embed(card: DriverCard) -> discord.Embed:
         f"Term: {card.contract_term or UNKNOWN}",
         f"P/L: {pl_or_unknown(card.market_value, card.contract_value)}",
         f"Open offers: {card.open_offers}",
+        "",
+        f"Career earnings: {format_money(card.career_earnings)}",
     ]
     if card.market_value is None:
         lines.append("")
@@ -791,6 +819,38 @@ def build_cap_sheet_embed(sheet: TeamCapSheet) -> discord.Embed:
 # ── main view ────────────────────────────────────────────────────────
 
 
+async def build_earnings_embed(guild_id: int, *, page: int) -> discord.Embed:
+    """
+    Career-earnings leaderboard for the panel.
+
+    Reuses the command renderer so the panel and `/market earnings` can
+    never disagree, then adds this screen's explicit "page X of Y +
+    total" field on top (design rule: a bare `Page 2/7` footer does not
+    tell a reader how many drivers were left out — G16).
+
+    Live Discord display names are not resolved here: `build_embed` is
+    handed a guild id, not an interaction, and the stored driver name is
+    a correct fallback. The `<@id>` last resort still renders as a name.
+    """
+    async with db.connect() as conn:
+        rows = await queries.fetch_earnings_leaderboard(
+            conn, guild_id=guild_id, season_id=None, limit=EARNINGS_MAX_ROWS
+        )
+    embed = market_render.render_earnings_leaderboard(
+        rows=rows, page=page + 1, season_label=None
+    )
+    pages = page_count(len(rows), per_page=limits.EARNINGS_PAGE_SIZE)
+    _add_field(
+        embed,
+        name="Showing",
+        value=(
+            f"Page {min(page + 1, pages)} of {pages} · "
+            f"{len(rows)} driver(s) with earnings"
+        ),
+    )
+    return embed
+
+
 class MarketView(OwnedView):
     """
     View select · tier select · page buttons · driver and team pickers.
@@ -838,7 +898,12 @@ class MarketView(OwnedView):
                     1, disabled=self.tier_page >= tier_pages - 1, row=2
                 )
             )
-        if view_kind == VIEW_TABLE and tier_code is not None:
+        # The market table pages only once a tier is chosen; earnings
+        # are guild-wide and page immediately.
+        pages_here = view_kind in _PAGED_VIEWS and (
+            view_kind != VIEW_TABLE or tier_code is not None
+        )
+        if pages_here:
             self.add_item(_PageButton(-1, disabled=page == 0, row=3))
             self.add_item(_PageButton(1, row=3))
         self.add_item(
@@ -873,6 +938,8 @@ class MarketView(OwnedView):
 
     async def build_embed(self, guild_id: int) -> discord.Embed:
         state = self.state
+        if self.view_kind in _SEASONLESS_VIEWS:
+            return await build_earnings_embed(guild_id, page=self.page)
         if state.season_id is None:
             return build_no_season_embed()
         if not state.tiers:

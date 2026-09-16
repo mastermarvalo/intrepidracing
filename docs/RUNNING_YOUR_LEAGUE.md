@@ -50,6 +50,7 @@ precision; press buttons when you want speed.
 17. [Day-to-day admin jobs](#17-day-to-day-admin-jobs)
 18. [When something looks wrong](#18-when-something-looks-wrong)
 19. [Things to decide before you launch](#19-things-to-decide-before-you-launch)
+20. [Driver career earnings](#20-driver-career-earnings)
 
 ---
 
@@ -383,8 +384,26 @@ Then the cash rules:
 > let them block signings.** Nobody has calibrated them against your
 > points system.
 
+All of these are also on `/league → Money → Budget settings`, where
+enforcement, rollover, and escrow are toggles and the rates open in a
+modal. Omitting an option on the command leaves that setting untouched,
+so editing a rate will not move your escrow or rollover decision.
+
 A season with no budget config behaves exactly like a cap-only league.
 Turning cash on later is one command; you lose nothing by waiting.
+
+> **Escrow defaults to on.** Every season whose budget config you create
+> from now on starts with escrow enabled — including season one of a
+> brand new install, which has no earlier season to inherit a setting
+> from. If your league runs commitment-only, where a contract counts
+> against the cap and nothing leaves the balance, set `escrow: false`
+> explicitly. It will not stay off by itself.
+>
+> The only seasons that begin with escrow **off** are ones that already
+> existed inside the bot before the update that added it.
+>
+> Turning escrow on never charges retroactively — contracts already
+> running simply start being debited from the next race imported.
 
 ---
 
@@ -664,6 +683,15 @@ Every settlement writes two ledger rows — the escrow return and the P/L
 receipt shows what was held, the driver's value, the P/L, races served,
 and the reason.
 
+**Terms end whether or not escrow is on.** A contract's term is counted
+in races imported, not in money moved, so a commitment-only league still
+sees its deals run down and close on schedule. There is simply nothing
+to settle: the receipt says the contract closed and that no escrow was
+held against it, and the ledger records the term completing. The same
+applies to a contract signed before you switched escrow on — it has no
+holding, so no money comes back, but it still ends on time rather than
+running forever.
+
 ---
 
 ## 15. The offseason
@@ -760,6 +788,10 @@ before the market opens.
 
 The realistic case: your server has run for seasons on spreadsheets and
 you're adding the bot now. You do **not** need to backfill history.
+
+Career earnings are the one place you *may* optionally want to, if you
+want your pre-bot seasons on the leaderboard — see §20. Everything else
+below assumes a clean start, which is the recommended route.
 
 ### Option A — clean slate, rewarded teams (recommended)
 
@@ -922,3 +954,115 @@ rules you never published.
 - **Who approves what.** Contracts and trades both need a commissioner.
   If that's only you, you are a bottleneck on race night — give a second
   person the role.
+- **Whether to seed career earnings** from seasons you raced before the
+  bot. Optional; see §20.
+
+---
+
+## 20. Driver career earnings
+
+This is the one money number that belongs to the **driver** instead of
+the team, and it is the simplest thing in the bot: drivers keep what
+they are paid, forever.
+
+### What happens
+
+Every time you import a race, each driver under contract is credited one
+race's share of their salary. A driver on a $24.00M contract in a
+24-race season earns $1.00M per race, and it is added to a lifetime
+total that never resets.
+
+That share is calculated by the same code that charges the team side, so
+the driver's credit and the team's debit can never disagree.
+
+### Where to see it
+
+```text
+/league → Market → "Career earnings leaderboard"
+```
+
+| Route | Shows |
+|---|---|
+| `/market earnings` | The leaderboard. Defaults to all-time; a scope option narrows it to the active season |
+| `/market my-earnings [@driver]` | Career total, season total, and recent pay lines |
+| Driver card | A career-earnings line alongside market value and P/L |
+| Race-night receipt | What the round paid out, and a reminder that no team budget moved |
+
+The leaderboard is the only market view that works with no active
+season, because career totals outlive seasons. You can read it in the
+offseason.
+
+### What it costs the teams
+
+**Nothing.** This is the point most worth publishing to your league,
+because it is the first thing a Team Principal will ask.
+
+Career earnings are a *record* of money already accounted for, not a
+second payment. Adding this changed no team budget, no cap arithmetic,
+no escrow behaviour and no P/L figure. A team that signs a driver for
+$24.00M pays exactly what it paid before.
+
+Nor can a driver spend the total. There is no shop, no transfer, no
+mechanism at all — it is a leaderboard number today. It is stored as
+real money, to the cent, so that if you later decide drivers should be
+able to buy something with it, the history is already there and nothing
+needs rebuilding.
+
+### It does not depend on escrow
+
+Earnings accrue whether escrow is on or off. A driver earned their race
+salary regardless of whether your league models team cash, so this runs
+as its own step rather than as part of the escrow charge. A league that
+never turns escrow on still gets a complete leaderboard.
+
+### It carries forward by itself
+
+A driver's earnings are keyed to their **Discord account**, not their
+seat. A new season, a move to another team, a promotion to another tier,
+even deleting an old season — none of it affects their career total.
+
+There is no offseason step for this. §15 gains nothing to do.
+
+### Pay is per round, not per finish
+
+Everyone under contract is credited once per imported round, including a
+driver who did not show up. That is deliberate: it mirrors what the team
+is charged, so the two sides reconcile.
+
+If your league would rather not pay a no-show, dock it by hand:
+
+```text
+/market-admin earnings adjust @driver -0.50 "DNS, R4 Suzuka"
+```
+
+Decide this before season one and publish it either way.
+
+### Optional: seeding seasons you raced before the bot
+
+On a fresh install every driver starts at **$0.00M** and the board fills
+in from your first imported race. That is the clean default and needs no
+setup.
+
+If your league has history you want on the board, seed each driver an
+opening total:
+
+```text
+/market-admin earnings carry-in @driver 180.00 "S1–S7 total, from the standings sheet"
+/market-admin earnings adjust  @driver -12.50 "S4 double-counted"
+```
+
+Both require a reason, both are logged against your user id, and both
+are additive — a carry-in does not overwrite, so a driver already
+accruing this season keeps accruing on top of the seeded figure.
+
+> **This needs your verification, not the bot's.** The bot has no way to
+> know what your league paid before it was installed. A carry-in figure
+> is only as good as the spreadsheet you take it from. Check it against
+> your own records before entering it — you can correct it afterwards,
+> but the ledger keeps both rows, and the second one is a correction in
+> public.
+
+A reasonable middle ground, if your old records are patchy: skip the
+seeding and let the leaderboard be an honest record of the bot era.
+Announce it as starting fresh and nobody has to trust a reconstructed
+number.
