@@ -24,6 +24,10 @@ class _FakeOutcome:
     budget = None
     budget_unattributed: list[str] = []
     escrow = None
+    # Phase 10. Mirrors the real `ImportOutcome` field so this stub
+    # keeps standing in for it; the driver-earnings line is covered in
+    # `test_driver_earnings.py`.
+    earnings = None
 
 
 def _charge(amount: str) -> escrow_ops.RaceCharge:

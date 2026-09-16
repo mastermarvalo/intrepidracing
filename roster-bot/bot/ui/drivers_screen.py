@@ -862,7 +862,7 @@ class _VoidNoteModal(base.PanelModal, title="Void contract"):
         await interaction.response.defer(ephemeral=True)
         note = str(self.note.value).strip() or None
         try:
-            await workflow.void_active_contract(
+            outcome = await workflow.void_active_contract(
                 guild_id=interaction.guild_id,
                 actor_id=interaction.user.id,
                 driver_id=self.parent.detail.driver_id,
@@ -871,9 +871,27 @@ class _VoidNoteModal(base.PanelModal, title="Void contract"):
         except workflow.WorkflowError as exc:
             await report_error(interaction, str(exc))
             return
+        # A void frees the driver, so the team role has to come off —
+        # release and buyout already do this. Report it either way: a
+        # driver left wearing the role still looks signed to the server.
+        from bot import roster_ops
+        failure = await roster_ops.drop_from_team_best_effort(
+            guild=interaction.guild,
+            member_id=outcome.member_id,
+            team=outcome.team,
+            actor=interaction.user,
+            reason=f"Contract {outcome.contract_id} voided",
+        )
+        where = f" and removed the {outcome.team_name} role" if (
+            failure is None and outcome.team_name is not None
+        ) else ""
+        tail = f"\n⚠ Team role not removed: {failure}" if failure else ""
         await self.parent.refresh(
             interaction,
-            note=f"✅ Voided **{self.parent.detail.display_name}**'s contract.",
+            note=(
+                f"✅ Voided **{outcome.display_name}**'s contract"
+                f"{where}.{tail}"
+            ),
         )
 
 

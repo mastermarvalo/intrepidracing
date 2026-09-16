@@ -627,6 +627,32 @@ async def test_void_active_contract_flips_state_and_logs(workflow_db):
     assert kinds[0]["kind"] == "contract_voided"
 
 
+async def test_void_active_contract_reports_the_team_for_the_role_drop(workflow_db):
+    """
+    G6: void settled the money but returned None, so no caller had the
+    team needed to strip the Discord role and the driver still looked
+    signed. workflow.py stays Discord-free, so it hands the caller what
+    it needs instead of doing it.
+    """
+    await _seeded_season(workflow_db)
+    ids = await _driver_with_contract(workflow_db)
+
+    outcome = await workflow.void_active_contract(
+        guild_id=GUILD, actor_id=42,
+        driver_id=ids["driver_id"], note=None,
+    )
+
+    assert outcome.contract_id == ids["contract_id"]
+    assert outcome.member_id == 100
+    assert outcome.display_name == "Alonso"
+    # The team is read before the void, while the contract still points
+    # at it — afterwards there is nothing to resolve the role from.
+    assert outcome.team is not None
+    assert outcome.team.id == ids["team_id"]
+    assert outcome.team.team_role_id == 1000
+    assert outcome.team_name == "Mercedes"
+
+
 async def test_void_active_contract_raises_when_none_active(workflow_db):
     await _seeded_season(workflow_db)
     # Driver with no contract at all.

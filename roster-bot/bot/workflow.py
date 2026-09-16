@@ -28,7 +28,7 @@ from bot import db, queries, results_ingest, sheets
 from bot.contracts import carryover as contract_carryover
 from bot.contracts import service as contracts_service
 from bot.market import boards as market_boards
-from bot.market import budget_ops, driver_ops, escrow_ops
+from bot.market import budget_ops, driver_ops, earnings_ops, escrow_ops
 from bot.market import results as results_engine
 from bot.market import valuation as valuation_engine
 
@@ -67,6 +67,11 @@ class ImportOutcome:
     # before this update — so the renderer stays silent rather than
     # reporting a round that escrowed nothing.
     escrow: escrow_ops.RoundEscrowOutcome | None = None
+    # Phase 10. Driver-side career earnings for this round. Unlike
+    # `escrow` above this does NOT follow `escrow_enabled`, so it is
+    # populated in both escrow modes; None only when the season has no
+    # league config and there is no races_per_season to divide by.
+    earnings: earnings_ops.RoundEarningsOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -220,9 +225,24 @@ async def import_round(
         if cfg is None:
             cfg = await queries.fetch_league_config_row(conn, season.id, None)
         escrow_outcome = None
+        earnings_outcome = None
         if cfg is not None:
             escrow_outcome = await escrow_ops.charge_round_for_tier(
                 conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                round_id=round_row["id"],
+                races_per_season=cfg.races_per_season,
+                actor_id=user_id,
+            )
+
+            # The driver side of the same salary. Separate from the
+            # escrow call above and NOT gated on escrow_enabled: a
+            # driver earned their salary whether or not the league
+            # models team cash. Nothing here debits a team.
+            earnings_outcome = await earnings_ops.credit_round_for_tier(
+                conn,
+                guild_id=guild_id,
                 season_id=season.id,
                 tier_id=tier_row.id,
                 round_id=round_row["id"],
@@ -236,6 +256,7 @@ async def import_round(
         round_order=round_row["round_order"],
         written=written,
         escrow=escrow_outcome,
+        earnings=earnings_outcome,
         missing_drivers=missing,
         budget=budget_outcome if budget_outcome.enforced else None,
         budget_unattributed=unattributed if budget_outcome.enforced else [],
@@ -1231,16 +1252,37 @@ async def fetch_driver_detail(guild_id: int, driver_id: int) -> DriverForPanel:
         return await _driver_for_panel(conn, driver, tier)
 
 
+@dataclass
+class VoidOutcome:
+    """
+    What a void did, and what the caller still has to do about it.
+
+    `team` is the team the driver was signed to, carried out so the
+    Discord-facing caller can strip the role. This module cannot do it
+    itself — it has no `discord` import by design — so a void that left
+    the role in place was invisible to every caller until they were
+    handed the team to act on.
+    """
+    contract_id: int
+    member_id: int
+    display_name: str
+    team: object | None
+    team_name: str | None
+
+
 async def void_active_contract(
     *,
     guild_id: int,
     actor_id: int,
     driver_id: int,
     note: str | None,
-) -> None:
+) -> VoidOutcome:
     """
     Void a driver's active contract. Raises WorkflowError if the driver
     has no active contract in the current season.
+
+    Returns the detail the caller needs to drop the team role, which is
+    the caller's job rather than this module's.
     """
     async with db.connect() as conn:
         driver = await queries.fetch_driver_by_id(conn, driver_id)
@@ -1256,12 +1298,22 @@ async def void_active_contract(
             raise WorkflowError(
                 f"{driver.display_name} has no active contract to void."
             )
+        # Read the team before the void, while the contract still
+        # points at it.
+        team = await queries.fetch_team_by_id(conn, contract.team_id)
         try:
             await contracts_service.void_contract(
                 conn, contract.id, actor_id=actor_id, note=note
             )
         except contracts_service.TransitionError as exc:
             raise WorkflowError(str(exc)) from exc
+    return VoidOutcome(
+        contract_id=contract.id,
+        member_id=driver.member_id,
+        display_name=driver.display_name,
+        team=team,
+        team_name=team.name if team is not None else None,
+    )
 
 
 async def set_driver_status(
@@ -1960,8 +2012,14 @@ async def set_budget_config(
     dnf_penalty: Decimal,
     dns_penalty: Decimal,
     penalty_per_incident_pt: Decimal,
+    escrow_enabled: bool | None = None,
 ):
-    """Create or update the budget config row for the active season / tier."""
+    """
+    Create or update the budget config row for the active season / tier.
+
+    `escrow_enabled` None leaves the stored setting untouched, so a caller
+    editing rates or enforcement cannot move escrow by accident.
+    """
     for label, value in (
         ("opening_budget", opening_budget),
         ("earnings_per_point", earnings_per_point),
@@ -1994,6 +2052,7 @@ async def set_budget_config(
             dnf_penalty=dnf_penalty,
             dns_penalty=dns_penalty,
             penalty_per_incident_pt=penalty_per_incident_pt,
+            escrow_enabled=escrow_enabled,
         )
 
 
@@ -2010,3 +2069,60 @@ async def list_tier_choices(guild_id: int) -> list[tuple[str, str]]:
             return []
         tiers = await queries.fetch_all_tiers(conn, season.id)
     return [(t.code, f"{t.code} — {t.label}") for t in tiers]
+
+
+async def adjust_driver_earnings(
+    *,
+    guild_id: int,
+    actor_id: int,
+    member_id: int,
+    kind: str,
+    amount: Decimal,
+    note: str,
+) -> Decimal:
+    """
+    Commissioner credit/debit to a driver's career earnings. Returns the
+    new career total.
+
+    `kind` is `carry_in` (seeding a league that raced before earnings
+    were tracked) or `adjustment` (either sign). Deliberately does NOT
+    require an active season: a league seeding seven seasons of history
+    may well do it before creating season 9, and the season link is only
+    provenance. When a season IS active it is recorded.
+    """
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        try:
+            return await earnings_ops.adjust_career_total(
+                conn,
+                guild_id=guild_id,
+                member_id=member_id,
+                amount=amount,
+                note=note,
+                kind=kind,
+                season_id=season.id if season is not None else None,
+                actor_id=actor_id,
+            )
+        except earnings_ops.EarningsError as exc:
+            raise WorkflowError(str(exc)) from exc
+
+
+async def get_driver_earnings(
+    *, guild_id: int, member_id: int
+) -> tuple[Decimal, Decimal | None, str | None]:
+    """
+    A driver's (career total, active-season total, season name).
+
+    The season parts are None when no season is active, so a caller can
+    show a career total in the off-season without inventing a zero for a
+    season that does not exist.
+    """
+    async with db.connect() as conn:
+        career = await queries.fetch_career_earnings(conn, member_id, guild_id)
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            return (career, None, None)
+        season_total = await queries.fetch_season_earnings(
+            conn, member_id, season.id
+        )
+        return (career, season_total, season.name)

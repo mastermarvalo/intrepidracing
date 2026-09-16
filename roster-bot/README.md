@@ -89,6 +89,30 @@ uv run ruff check bot/
    - Manage Messages (to delete roster messages on `/roster remove`)
 4. Make sure the bot's role sits **above all team roles** in Server Settings → Roles, otherwise it won't be able to assign them
 
+## What a fresh install starts with
+
+If this is the bot's first run on your server, it is worth knowing what
+you are and are not inheriting. The bot has **no knowledge of seasons
+your league raced before you installed it** — however many that is.
+
+| On a fresh install | State |
+|---|---|
+| Driver market values | Empty until you publish a baseline valuation per tier |
+| Career earnings | Every driver at $0.00M; fills in from your first imported race |
+| Contracts | None; every driver is a free agent until signed in the bot |
+| Team budgets | No ledger rows until the first thing that touches a budget |
+| Salary escrow | **On.** New seasons default to escrow enabled |
+| Carry-over | Nothing to carry; your first season has no prior season |
+
+Nothing needs backfilling and no catch-up commands need running. Call
+your first season in the bot whatever you like — if your league is
+really on its eighth, name it "Season 8" and the bot will happily treat
+it as season one of its own records.
+
+The only optional catch-up step is seeding historical driver earnings,
+covered under
+[Driver career earnings](#driver-career-earnings-phase-10).
+
 ## The control panel — start here
 
 Two commands cover everything an admin actually needs day to day:
@@ -462,6 +486,8 @@ in Phase 3 + 4: `market`, `movers`, `dashboard`, `surplus`,
 | `/market surplus <tier>` | Drivers with the biggest positive P/L (market − contract) |
 | `/market underwater <tier>` | Drivers with the biggest negative P/L |
 | `/market dashboard` | Cross-tier top-of-tier summary (display only) |
+| `/market earnings [scope] [page]` | Driver career-earnings leaderboard, all time or this season |
+| `/market my-earnings [@member]` | One driver's career total, season total, and recent pay |
 
 ### `/contract` (open to everyone; TP / driver / commissioner scopes)
 
@@ -567,6 +593,11 @@ actor; nothing is overwritten.
 | `incident_penalty` | debit | results import — incident points × `per_incident_pt_m` |
 | `adjustment` | either | `/market-admin budget adjust` |
 
+> `race_earnings` here is **team** prize money for championship points.
+> It is unrelated to a driver's career earnings, which live in their own
+> ledger and never touch a team budget — see
+> [Driver career earnings](#driver-career-earnings-phase-10).
+
 Charges land on the team the driver is **contracted to at import time**.
 A free agent's DNF is reported in the import receipt but charges nobody.
 Re-importing a round is safe: the bot compares what the round *should*
@@ -640,16 +671,88 @@ lands over the spending cap is called out in the receipt for the
 commissioner to resolve through a release, buyout, or trade before that
 team signs anyone new.
 
-**Payroll now has a season boundary.** Before Phase 8 nothing ever moved
-a contract out of `active`, so Season 7 deals kept counting against
-Season 8 payroll forever. After the first carry-over, live payroll
+**Payroll has a season boundary.** Live payroll
 (`fetch_team_payroll`, the signing rule's input) reflects only current
-obligations. If you have already been running the bot across a season
-boundary without this feature, run `carry-over` once for each past
-season, oldest first.
+obligations, because carry-over is what moves a finished contract out of
+`active`.
+
+On a **fresh install there is nothing to carry over** — your first
+season in the bot has no prior season to inherit from, so you will not
+touch `carry-over` until the end of it. The only case that needs a
+catch-up run is a bot that was already importing races across a season
+boundary before this feature existed; then run `carry-over` once per
+past season, oldest first.
 
 An **extension** starts a new term: `update_contract_terms` resets
 `season_index` to 1 alongside the new `term_seasons`.
+
+### Driver career earnings (Phase 10)
+
+Drivers **keep** what they are paid. Every time you import a race, each
+driver under contract is credited one race's share of their salary —
+the same figure the team side is charged — and that amount is added to a
+lifetime total that never resets.
+
+```text
+/league  →  Market  →  "Career earnings leaderboard"
+```
+
+or `/market earnings`. `/market my-earnings` shows one driver their
+career total, their total this season, and their recent pay lines. A
+driver's career total also appears on their driver card.
+
+**This takes nothing extra from any team.** Career earnings are a
+record of what a driver has been paid, not a second transfer of money.
+Team budgets, the spending cap, escrow and every P/L figure behave
+exactly as they did before this feature existed. Nothing in the bot
+lets a driver spend the total — it is a leaderboard number for now, and
+it is stored as real money so it can become spendable later without a
+migration.
+
+**It works with escrow on or off.** A driver earned their race salary
+whether or not your league models team cash, so earnings are credited on
+a separate pass and do not follow the `escrow_enabled` switch. A league
+that has never turned escrow on still builds a full leaderboard.
+
+**It carries forward by itself.** A driver's identity for earnings is
+their Discord account, not their driver row, so a new season, a new
+tier, or a new team changes nothing. There is no carry-over step to run
+and nothing to remember at the season boundary. Deleting an old season
+does not erase career history either — the season link is provenance
+only, and it is cleared rather than cascaded.
+
+**Pay is per round, not per finish.** Every active contract in the tier
+is credited once per imported round, including a driver who did not show
+up, because that mirrors what the team is charged. If you would rather
+dock a no-show, use `/market-admin earnings adjust` with a negative
+amount — it is audit-logged with your reason.
+
+#### Optional: seeding seasons you raced before the bot
+
+On a fresh install every driver starts at **$0.00M** and the leaderboard
+fills in from your first imported race. That is the clean default and it
+needs no setup at all.
+
+If your league raced seasons before the bot existed and you want that
+history on the leaderboard, you can seed each driver an opening total by
+hand. This is entirely optional and skipping it costs you nothing but
+historical flavour.
+
+| Command | What it does |
+|---|---|
+| `/market-admin earnings carry-in <@member> <amount_m> <note>` | Sets a driver's opening career total from your old records |
+| `/market-admin earnings adjust <@member> <delta_m> <note>` | Corrects a total, either direction |
+
+Both require a reason, both are written to the ledger with your user id
+against them, and both are additive — a carry-in does not overwrite
+anything, so a driver who has already been paid this season keeps
+accruing on top of the figure you seed.
+
+> **Verify before you seed.** The bot has no way to know what your
+> league paid in earlier seasons, so a carry-in figure is only as good
+> as the spreadsheet you take it from. Check it against your own records
+> before entering it; correcting it later is possible but the ledger
+> keeps both rows.
 
 ### The weekly race-night loop
 

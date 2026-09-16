@@ -153,6 +153,11 @@ class AdminMarketCog(commands.Cog):
         description="Team budgets: prize money, penalties, rollover, config",
         parent=admin,
     )
+    earnings = app_commands.Group(
+        name="earnings",
+        description="Driver career earnings: seed past seasons, correct totals",
+        parent=admin,
+    )
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -1219,6 +1224,17 @@ class AdminMarketCog(commands.Cog):
         if not await _admin_or_deny(interaction):
             return
         async with db.connect() as conn:
+            # Read the contract first: after the void it no longer
+            # points anywhere useful for stripping the role.
+            contract = await queries.fetch_contract_by_id(conn, contract_id)
+            team = (
+                await queries.fetch_team_by_id(conn, contract.team_id)
+                if contract is not None else None
+            )
+            driver = (
+                await queries.fetch_driver_by_id(conn, contract.driver_id)
+                if contract is not None else None
+            )
             try:
                 await contracts_service.void_contract(
                     conn, contract_id, actor_id=interaction.user.id, note=note
@@ -1226,8 +1242,24 @@ class AdminMarketCog(commands.Cog):
             except contracts_service.TransitionError as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
+        # Same role drop release and buyout perform. The money is
+        # already committed; a role failure is reported, not rolled back.
+        failure: str | None = None
+        if driver is not None:
+            from bot import roster_ops
+            failure = await roster_ops.drop_from_team_best_effort(
+                guild=interaction.guild,
+                member_id=driver.member_id,
+                team=team,
+                actor=interaction.user,
+                reason=f"Contract {contract_id} voided",
+            )
+        where = f" and removed the {team.name} role" if (
+            failure is None and team is not None
+        ) else ""
+        tail = f"\n⚠ Team role not removed: {failure}" if failure else ""
         await interaction.response.send_message(
-            f"✅ Voided contract `{contract_id}`.", ephemeral=True
+            f"✅ Voided contract `{contract_id}`{where}.{tail}", ephemeral=True
         )
 
     @admin.command(name="set-status", description="Set a driver's status")
@@ -1754,6 +1786,91 @@ class AdminMarketCog(commands.Cog):
             interaction, team=team, amount_m=delta_m, note=note, kind="adjustment",
         )
 
+    # ── /market-admin earnings ───────────────────────────────────────
+
+    @earnings.command(
+        name="carry-in",
+        description="Seed a driver's opening career earnings from past seasons",
+    )
+    @app_commands.describe(
+        member="The driver",
+        amount_m="Career earnings to date, in $M (positive)",
+        note="Where the figure came from (required — audit trail)",
+    )
+    async def earnings_carry_in(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount_m: str,
+        note: str,
+    ) -> None:
+        await self._earnings_write(
+            interaction, member=member, amount_m=amount_m, note=note,
+            kind="carry_in",
+        )
+
+    @earnings.command(
+        name="adjust",
+        description="Correct a driver's career earnings, either sign (audit-logged)",
+    )
+    @app_commands.describe(
+        member="The driver",
+        delta_m="Adjustment in $M (positive = credit, negative = debit)",
+        note="Reason (required — audit trail)",
+    )
+    async def earnings_adjust(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        delta_m: str,
+        note: str,
+    ) -> None:
+        await self._earnings_write(
+            interaction, member=member, amount_m=delta_m, note=note,
+            kind="adjustment",
+        )
+
+    async def _earnings_write(
+        self,
+        interaction: discord.Interaction,
+        *,
+        member: discord.Member,
+        amount_m: str,
+        note: str,
+        kind: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        try:
+            amount = Decimal(amount_m.strip().lstrip("$").rstrip("Mm"))
+        except InvalidOperation as exc:
+            await interaction.response.send_message(
+                f"Could not parse amount: {exc}", ephemeral=True
+            )
+            return
+        try:
+            total = await workflow.adjust_driver_earnings(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                member_id=member.id,
+                kind=kind,
+                amount=amount,
+                note=note,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        verb = "Seeded" if kind == "carry_in" else "Adjusted"
+        await interaction.response.send_message(
+            f"{verb} **{member.display_name}**'s career earnings by "
+            f"{_fmt_money(amount)}.\n"
+            f"New career total: **{_fmt_money(total)}**\n"
+            f"\u2014 {note}",
+            ephemeral=True,
+        )
+
     async def _budget_write(
         self,
         interaction: discord.Interaction,
@@ -1827,6 +1944,7 @@ class AdminMarketCog(commands.Cog):
         dnf_m="Penalty per DNF in $M",
         dns_m="Penalty per no-show (DNS) in $M",
         per_incident_pt_m="Penalty per incident point in $M",
+        escrow="Charge salary from team cash race by race (off = commitment only)",
     )
     async def budget_config(
         self,
@@ -1834,6 +1952,7 @@ class AdminMarketCog(commands.Cog):
         tier: str | None = None,
         enforce: bool | None = None,
         rollover: bool | None = None,
+        escrow: bool | None = None,
         opening_m: str | None = None,
         per_point_m: str | None = None,
         dnf_m: str | None = None,
@@ -1846,7 +1965,7 @@ class AdminMarketCog(commands.Cog):
         provided = {
             "enforce": enforce, "rollover": rollover, "opening_m": opening_m,
             "per_point_m": per_point_m, "dnf_m": dnf_m, "dns_m": dns_m,
-            "per_incident_pt_m": per_incident_pt_m,
+            "per_incident_pt_m": per_incident_pt_m, "escrow": escrow,
         }
         try:
             current = await workflow.get_budget_config(
@@ -1899,6 +2018,7 @@ class AdminMarketCog(commands.Cog):
                 penalty_per_incident_pt=money(
                     per_incident_pt_m, base.penalty_per_incident_pt if base else None
                 ),
+                escrow_enabled=escrow,
             )
         except InvalidOperation as exc:
             await interaction.response.send_message(
@@ -2144,6 +2264,9 @@ def _render_budget_config(cfg, tier: str | None) -> discord.Embed:
         value="\n".join([
             f"Enforce on signings/trades: {'yes' if cfg.enforce_budget else 'no'}",
             f"Rollover between seasons: {'yes' if cfg.rollover_enabled else 'no'}",
+            "Escrow (salary charged race by race): " + (
+                "yes" if cfg.escrow_enabled else "no \u2014 commitment only"
+            ),
             f"Opening budget per team: {format_money(cfg.opening_budget)}",
         ]),
         inline=False,
