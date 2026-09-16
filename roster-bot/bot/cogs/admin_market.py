@@ -1827,6 +1827,7 @@ class AdminMarketCog(commands.Cog):
         dnf_m="Penalty per DNF in $M",
         dns_m="Penalty per no-show (DNS) in $M",
         per_incident_pt_m="Penalty per incident point in $M",
+        escrow="Charge salary from team cash race by race (off = commitment only)",
     )
     async def budget_config(
         self,
@@ -1834,6 +1835,7 @@ class AdminMarketCog(commands.Cog):
         tier: str | None = None,
         enforce: bool | None = None,
         rollover: bool | None = None,
+        escrow: bool | None = None,
         opening_m: str | None = None,
         per_point_m: str | None = None,
         dnf_m: str | None = None,
@@ -1846,7 +1848,7 @@ class AdminMarketCog(commands.Cog):
         provided = {
             "enforce": enforce, "rollover": rollover, "opening_m": opening_m,
             "per_point_m": per_point_m, "dnf_m": dnf_m, "dns_m": dns_m,
-            "per_incident_pt_m": per_incident_pt_m,
+            "per_incident_pt_m": per_incident_pt_m, "escrow": escrow,
         }
         try:
             current = await workflow.get_budget_config(
@@ -1899,6 +1901,7 @@ class AdminMarketCog(commands.Cog):
                 penalty_per_incident_pt=money(
                     per_incident_pt_m, base.penalty_per_incident_pt if base else None
                 ),
+                escrow_enabled=escrow,
             )
         except InvalidOperation as exc:
             await interaction.response.send_message(
@@ -2144,6 +2147,9 @@ def _render_budget_config(cfg, tier: str | None) -> discord.Embed:
         value="\n".join([
             f"Enforce on signings/trades: {'yes' if cfg.enforce_budget else 'no'}",
             f"Rollover between seasons: {'yes' if cfg.rollover_enabled else 'no'}",
+            "Escrow (salary charged race by race): " + (
+                "yes" if cfg.escrow_enabled else "no \u2014 commitment only"
+            ),
             f"Opening budget per team: {format_money(cfg.opening_budget)}",
         ]),
         inline=False,
