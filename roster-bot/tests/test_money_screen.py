@@ -240,8 +240,11 @@ def test_embed_carries_the_header_and_the_cap_note():
     embed = money_screen.build_money_embed(state(row()))
 
     assert money_screen.budgets_header(state(row())) in embed.description
-    assert "audit note only" in embed.description
-    assert "they do not change the cap" in embed.description
+    # G18 made cap adjustments real. This screen used to say they were
+    # "an audit note only" and did "not change the cap", which was true
+    # when written and is now the opposite of what the code does.
+    assert "change what this team may spend" in embed.description
+    assert "audit note only" not in embed.description
     assert_embed_within_limits(embed)
 
 
@@ -721,7 +724,11 @@ async def test_a_zero_adjustment_is_refused_rather_than_written(money_db):
 # ── behaviour: G18, a cap adjustment changes nothing ─────────────────
 
 
-async def test_cap_adjustment_step_says_it_changes_nothing(money_db):
+async def test_cap_adjustment_step_says_it_changes_spending(money_db):
+    """
+    G18: this step used to promise the adjustment changed nothing, and
+    it now changes the ceiling every signing is validated against.
+    """
     await seed_league(money_db)
     loaded = await money_screen.load_money_state(GUILD)
     parent = money_screen.MoneyView(state=loaded, opener_id=7, on_back=noop_back)
@@ -731,12 +738,17 @@ async def test_cap_adjustment_step_says_it_changes_nothing(money_db):
     await flow.render(interaction)
 
     description = interaction.edits()[0]["embed"].description
-    assert "audit note only" in description
-    assert "will **not** let a team sign" in description
+    assert "change what this team may spend" in description
+    assert "validated against the adjusted ceiling" in description
+    assert "audit note only" not in description
+    assert "will **not** let a team sign" not in description
     assert "Phase 5" not in description
+    # It must still distinguish itself from the two things it is not.
+    assert "Cap & rules" in description
+    assert "Manual budget" in description
 
 
-async def test_cap_adjustment_confirm_restates_the_unchanged_cap(money_db):
+async def test_cap_adjustment_confirm_shows_the_new_effective_cap(money_db):
     await seed_league(money_db)
     loaded = await money_screen.load_money_state(GUILD)
     parent = money_screen.MoneyView(state=loaded, opener_id=7, on_back=noop_back)
@@ -749,11 +761,16 @@ async def test_cap_adjustment_confirm_restates_the_unchanged_cap(money_db):
     await modal.on_submit(interaction)
 
     embed = interaction.edits()[0]["embed"]
-    assert "Cap stays $145.00M" in embed.description
-    assert "Nothing about what this team can spend changes" in embed.description
+    # The confirm step used to say the cap stayed put and nothing about
+    # spending changed — directly contradicting the note beneath it once
+    # G18 made adjustments real.
+    assert "Nothing about what this team can spend changes" not in embed.description
+    assert "League cap $145.00M" in embed.description
+    assert "Adjustments already applied" in embed.description
+    assert "Effective cap after this change $142.50M" in embed.description
 
 
-async def test_confirming_a_cap_note_leaves_the_cap_and_cap_space_alone(money_db):
+async def test_confirming_a_cap_adjustment_moves_the_effective_cap(money_db):
     await seed_league(money_db)
     loaded = await money_screen.load_money_state(GUILD)
     parent = money_screen.MoneyView(state=loaded, opener_id=7, on_back=noop_back)
@@ -768,11 +785,22 @@ async def test_confirming_a_cap_note_leaves_the_cap_and_cap_space_alone(money_db
     await interaction.edits()[0]["view"].run(confirm)
 
     after = await money_screen.load_money_state(GUILD)
+    # The league cap itself is untouched — adjustments are per-team
+    # ledger rows, not an edit to the season's cap.
     assert after.cap == CAP
     assert after.row("mcl").cap == CAP
-    assert after.row("mcl").cap_space == loaded.row("mcl").cap_space
+    # But the team's own ceiling and cap space must both move, which is
+    # exactly what this screen used to get wrong: the offer check
+    # enforced the adjustment (G18) while the screen kept showing the
+    # unadjusted figure.
+    assert after.row("mcl").cap_adjustment == Decimal("-2.50")
+    assert after.row("mcl").effective_cap == CAP - Decimal("2.50")
+    assert after.row("mcl").cap_space == (
+        loaded.row("mcl").cap_space - Decimal("2.50")
+    )
     note = confirm.notes()[0]
-    assert "read by nothing that enforces anything" in note
+    assert "read by nothing that enforces anything" not in note
+    assert "Effective cap is now $142.50M" in note
 
 
 async def test_a_zero_cap_note_records_nothing(money_db):

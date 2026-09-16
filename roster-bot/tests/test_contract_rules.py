@@ -395,3 +395,117 @@ def _replace(inputs: rules.OfferInputs, **kw) -> rules.OfferInputs:
     """dataclass replace, avoiding an extra import at every call site."""
     from dataclasses import replace
     return replace(inputs, **kw)
+
+
+# ── G18: cap adjustments move the ceiling ────────────────────────────
+#
+# `cap_adjustment` ledger rows had writers and no reader. A commissioner
+# could dock a team's cap, see the row recorded, and watch the team keep
+# spending to the full league ceiling — while two screens promised
+# enforcement was "coming in Phase 5". There is no Phase 5.
+
+
+def test_cap_headroom_is_unchanged_when_no_adjustment_exists():
+    """The common case must behave exactly as it did before G18."""
+    inputs = _replace(_baseline_ok(), 
+        team_payroll_before=Decimal("140.00"), salary=Decimal("5.00")
+    )
+    result = rules.cap_headroom_ok(inputs)
+    assert result.ok is True
+    assert result.detail["effective_cap"] == "145.00"
+    # No adjustment means no confusing arithmetic in the message.
+    assert "effective cap" not in result.message
+
+
+def test_a_granted_adjustment_allows_a_signing_the_cap_would_block():
+    over = _replace(_baseline_ok(), 
+        team_payroll_before=Decimal("144.00"), salary=Decimal("5.00")
+    )
+    assert rules.cap_headroom_ok(over).ok is False
+
+    granted = _replace(_baseline_ok(), 
+        team_payroll_before=Decimal("144.00"),
+        salary=Decimal("5.00"),
+        cap_adjustment=Decimal("10.00"),
+    )
+    result = rules.cap_headroom_ok(granted)
+    assert result.ok is True
+    assert result.detail["effective_cap"] == "155.00"
+    assert "granted" in result.message
+
+
+def test_a_docked_adjustment_blocks_a_signing_the_cap_would_allow():
+    """The half that was actually dangerous: a penalty that did nothing."""
+    fits = _replace(_baseline_ok(), 
+        team_payroll_before=Decimal("140.00"), salary=Decimal("4.00")
+    )
+    assert rules.cap_headroom_ok(fits).ok is True
+
+    docked = _replace(_baseline_ok(), 
+        team_payroll_before=Decimal("140.00"),
+        salary=Decimal("4.00"),
+        cap_adjustment=Decimal("-10.00"),
+    )
+    result = rules.cap_headroom_ok(docked)
+    assert result.ok is False
+    assert result.code == "cap_exceeded"
+    assert result.detail["effective_cap"] == "135.00"
+    assert result.detail["over_cap"] == "9.00"
+
+
+def test_a_docked_cap_says_it_was_docked_and_by_how_much():
+    """
+    "You are 9.00 over the 145.00 cap" would be arithmetic the TP cannot
+    reproduce. The message has to name the adjustment.
+    """
+    result = rules.cap_headroom_ok(
+        _replace(_baseline_ok(), 
+            team_payroll_before=Decimal("140.00"),
+            salary=Decimal("4.00"),
+            cap_adjustment=Decimal("-10.00"),
+        )
+    )
+    assert "135.00" in result.message
+    assert "145.00" in result.message
+    assert "10.00" in result.message
+    assert "docked" in result.message
+
+
+def test_the_signing_bonus_counts_against_the_adjusted_cap_too():
+    result = rules.cap_headroom_ok(
+        _replace(_baseline_ok(), 
+            team_payroll_before=Decimal("130.00"),
+            salary=Decimal("4.00"),
+            signing_bonus=Decimal("2.00"),
+            cap_adjustment=Decimal("-10.00"),
+        )
+    )
+    assert result.ok is False
+    assert result.detail["committed_after"] == "136.00"
+
+
+def test_the_cap_detail_always_reports_base_adjustment_and_effective():
+    """
+    Whatever renders a validation result can show the breakdown without
+    recomputing it, and the ledger keeps all three.
+    """
+    for adjustment in (Decimal("0"), Decimal("10.00"), Decimal("-10.00")):
+        detail = rules.cap_headroom_ok(
+            _replace(_baseline_ok(), cap_adjustment=adjustment)
+        ).detail
+        assert detail["salary_cap"] == "145.00"
+        assert detail["cap_adjustment"] == str(adjustment)
+        assert detail["effective_cap"] == str(Decimal("145.00") + adjustment)
+
+
+def test_full_offer_validation_blocks_on_a_docked_cap():
+    """The rule is actually wired into validate_offer, not just callable."""
+    validation = rules.validate_offer(
+        _replace(_baseline_ok(), 
+            team_payroll_before=Decimal("140.00"),
+            salary=Decimal("4.00"),
+            cap_adjustment=Decimal("-10.00"),
+        )
+    )
+    assert validation.ok is False
+    assert any(r.code == "cap_exceeded" for r in validation.results)

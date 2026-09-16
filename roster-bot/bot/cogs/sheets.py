@@ -13,6 +13,7 @@ from discord.ext import commands, tasks
 
 from bot import db, queries, sheets
 from bot.queries import fetch_forum_thread_for_channel, set_stat_board_forum_thread_id
+from bot.sheet_boards import _get_forum_thread, _rerender_board
 
 log = logging.getLogger(__name__)
 
@@ -21,85 +22,6 @@ def _is_admin(interaction: discord.Interaction) -> bool:
     if not isinstance(interaction.user, discord.Member):
         return False
     return interaction.user.guild_permissions.manage_guild
-
-
-async def _get_forum_thread(
-    bot: commands.Bot, channel: discord.ForumChannel, thread_id: int
-) -> discord.Thread | None:
-    thread = bot.get_channel(thread_id)
-    if isinstance(thread, discord.Thread):
-        return thread
-    try:
-        thread = await bot.fetch_channel(thread_id)
-        return thread if isinstance(thread, discord.Thread) else None
-    except (discord.NotFound, discord.Forbidden):
-        return None
-
-
-async def _rerender_board(bot: commands.Bot, board) -> None:  # type: ignore[type-arg]
-    embed = await sheets.fetch_and_build_embed(board.title, board.sheet_id, board.sheet_range)
-
-    channel = bot.get_channel(board.channel_id)
-    if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
-        log.warning("Stat board %r: channel %s unavailable", board.title, board.channel_id)
-        return
-
-    needs_post = board.message_id is None
-
-    # Try to edit the existing message
-    if not needs_post:
-        try:
-            if isinstance(channel, discord.TextChannel):
-                msg = await channel.fetch_message(board.message_id)
-                await msg.edit(embed=embed)
-                return
-            else:
-                thread = (
-                    await _get_forum_thread(bot, channel, board.forum_thread_id)
-                    if board.forum_thread_id
-                    else None
-                )
-                if thread is not None:
-                    msg = await thread.fetch_message(board.message_id)
-                    await msg.edit(embed=embed)
-                    return
-                needs_post = True
-        except discord.NotFound:
-            log.info("Stat board %r: message gone — re-posting", board.title)
-            needs_post = True
-        except discord.Forbidden:
-            log.warning(
-                "Stat board %r: no permission to edit in channel %s",
-                board.title, board.channel_id,
-            )
-            return
-
-    # Post (or re-post): for forum channels reuse the existing thread where possible
-    try:
-        if isinstance(channel, discord.ForumChannel):
-            thread = (
-                await _get_forum_thread(bot, channel, board.forum_thread_id)
-                if board.forum_thread_id
-                else None
-            )
-            if thread is not None:
-                msg = await thread.send(embed=embed)
-            else:
-                thread, msg = await channel.create_thread(name=board.title, embed=embed)
-            async with db.connect() as conn:
-                await queries.set_stat_board_message_id(conn, board.id, msg.id)
-                await set_stat_board_forum_thread_id(conn, board.id, thread.id)
-        else:
-            msg = await channel.send(embed=embed)
-            async with db.connect() as conn:
-                await queries.set_stat_board_message_id(conn, board.id, msg.id)
-    except discord.Forbidden:
-        log.warning(
-            "Stat board %r: no permission to post in channel %s",
-            board.title, board.channel_id,
-        )
-        return
-    log.info("Stat board %r: posted as message %s", board.title, msg.id)
 
 
 class SheetsCog(commands.Cog):

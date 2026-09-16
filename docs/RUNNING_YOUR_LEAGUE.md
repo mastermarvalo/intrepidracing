@@ -1,6 +1,8 @@
 # Running your league — the owner's runbook
 
-**Version 2.** Covers the race-term and escrow economics.
+**Version 3.** Covers the race-term and escrow economics, the full
+team lifecycle in the panel, enforced cap adjustments, honest board
+reporting, and the carry-over ordering guard.
 
 This is the operator guide. It takes you from an empty server to a
 running driver market, then through a race night, then through the end
@@ -225,8 +227,18 @@ and reload the client.
 
 ## 4. Google Sheets access
 
-Needed for `/market-admin results import` and `/sheets` boards. Use a
-**service account** — API keys only work on publicly shared sheets.
+Needed for `/market-admin results import` and for Google Sheets stat
+boards. Use a **service account** — API keys only work on publicly
+shared sheets.
+
+> Two different things in this guide are called boards. **Market
+> boards** are rendered by the bot from its own data — driver values,
+> movers, the cross-tier dashboard. **Google Sheets boards** mirror a
+> spreadsheet you maintain yourself into a Discord message and refresh
+> it every ten minutes. Both live under `/league` → Setup → **Boards**;
+> the Google Sheets ones are behind the **Google Sheets boards**
+> button there, or `/sheets add|remove|list|refresh`. Only the Google
+> Sheets kind needs anything from this section.
 
 1. <https://console.cloud.google.com> → new project.
 2. Enable the **Google Sheets API**.
@@ -348,14 +360,64 @@ Point the bot at your channels and commissioner role:
 /market-admin config role role: @Commissioner
 ```
 
-Create teams:
+Create teams. `/league` → **Setup** → **Teams** → **Create team**:
 
 ```text
-/roster create name: Mercedes
+🏎 Teams
+
+No teams yet. Press Create team to set one up — name, colour, roles
+and driver slots, in one pass.
+
+You need one team per entry on the grid before anyone can be signed.
+
+[ ➕ Create team ]  [ 🧯 Recover a lost team ]  [ ◀ Back ]
 ```
 
-A guided flow — it asks for the team role and the channel for the roster
-embed. Repeat per team, then `/roster list` to check.
+It is a nine-step wizard: key and display name, colour, team role,
+principal role, staff slots, driver slots, then the channel for the
+roster embed. The same wizard is `/roster create name: Mercedes` if you
+prefer typing. Repeat per team.
+
+Once teams exist, the same screen grows the rest of the lifecycle:
+
+```text
+🏎 Teams
+Mercedes (mercedes) — payroll $0.00M
+Red Bull (red bull) — payroll $0.00M
+
+[ ➕ Create team ]
+[ Edit a team's name, colour, slots…            ▼ ]
+[ Adjust cap for which team?                    ▼ ]
+[ Delete a team…                                ▼ ]
+[ 🧯 Recover a lost team ]  [ ◀ Back ]
+```
+
+**Edit** reopens the wizard on an existing team with the current values
+filled in. **Adjust cap** raises or lowers one team's effective
+spending ceiling — see §7. **Delete** removes a team and its roster
+embed, and is refused for any team that has ever signed a driver:
+
+```text
+Mercedes cannot be deleted — it still has 3 contracts, 12 budget ledger
+rows. Deleting it would take the league's money history with it.
+
+Release or trade its drivers first, or leave the team in place: a team
+with no drivers signed costs nothing and keeps the records intact.
+```
+
+That refusal is deliberate and it is the right answer. Contracts,
+offers, trades, dead money and the budget ledger all point at the team
+row. If a team folds mid-league, the clean move is to release its
+drivers into free agency and leave the empty team in place. It costs
+nothing and your transaction history stays readable.
+
+**Recover a lost team** is for the rare case where the database row is
+gone but the roster embed still exists. It hands you
+`/roster relink name: <key>` — the one step in this whole guide that
+still needs a typed command, because Discord will not let one dialog
+open another and relink starts with a dialog.
+
+Check your work with `/roster list`.
 
 ---
 
@@ -731,6 +793,20 @@ and a fresh season takes preset defaults, not last season's edits.
 /market-admin season carry-over from_season: "Season 8"
 ```
 
+Run it with `preview: true` first. That does the whole calculation and
+shows you the receipt without writing anything:
+
+```text
+/market-admin season carry-over from_season: "Season 8" preview: true
+```
+
+Seasons must be carried over **oldest first**. If you skip one, the bot
+refuses and names the one that should go first, because carrying Season
+9 before Season 8 would strand Season 8's contracts with no season to
+land in. The `from_season` field autocompletes with exactly the seasons
+that still have unresolved contracts, oldest at the top, so in practice
+the right answer is the first one offered.
+
 A term is a real commitment, and this is the command that honours it.
 For every active contract in the finished season:
 
@@ -868,12 +944,33 @@ one model, enter the whole grid fresh at a season boundary.
 | Buy a driver out | `/contract buyout <contract_id> <buyout_m> <note>` |
 | Move a driver up or down a tier, contract included | `/market-admin promote` / `relegate` |
 | Correct a team's cash | `/market-admin budget adjust <team> <delta_m> <note>` |
-| Log a cap note that moves no money | `/market-admin adjust-cap <team> <delta_m> <note>` |
-| Repost or fix the boards | `/league` → Boards, or `/market-admin board refresh` |
+| Change one team's spending ceiling | `/market-admin adjust-cap <team> <delta_m> <note>`, or `/league` → Setup → Teams |
+| Repost or fix the market boards | `/league` → Boards, or `/market-admin board refresh` |
+| Add or fix a Google Sheets board | `/league` → Setup → Boards → Google Sheets boards |
+| Create, edit or delete a team | `/league` → Setup → Teams |
 | Stop mid-season poaching | `/market-admin config free-agency state: closed` |
 
-`budget adjust` moves money. `adjust-cap` only writes an audit note.
-They are not interchangeable.
+`budget adjust` changes how much cash a team **has**. `adjust-cap`
+changes how much it may **commit** in salary. They are not
+interchangeable.
+
+Both are real now. Cap adjustments used to write a ledger row that
+nothing read, and three screens said enforcement was coming; an owner
+could grant Williams an extra $5.00M and watch the bot refuse a
+$3.00M offer anyway. Today a cap adjustment moves the team's effective
+cap and the offer check tests against it:
+
+```text
+❌ Over the cap
+Salary cap            $145.00M
+Cap adjustment         +$5.00M  (granted 2026-09-14: "backmarker relief")
+Effective cap         $150.00M
+Payroll if signed     $151.25M
+```
+
+Adjustments are cumulative per season and every one writes an audit
+row, so a grant made three months ago still shows up in the arithmetic
+with its note attached.
 
 ---
 
@@ -885,8 +982,36 @@ role failures are reported, never rolled back. Fix the hierarchy and
 assign the role by hand once.
 
 **A board is empty or missing.** The bot lacks **Send Messages** or
-**Embed Links** in that channel. `/league` → Boards flags boards with no
-message.
+**Embed Links** in that channel. `/league` → Boards flags boards with
+no message.
+
+**A board refresh said it worked and nothing changed.** It no longer
+can. Refresh used to report success for every board it touched,
+including ones whose edit Discord rejected — the single failure you
+most need to see was the one case invisible from the board's own
+state. Refresh now names each outcome:
+
+```text
+Refreshed 6 board(s).
+✅ 4 edited
+📮 1 posted (message was missing)
+🚫 1 skipped — Discord refused the edit in #market-t3
+```
+
+If a board reports **refused**, the bot lost a permission in that
+channel after the board was created. Re-grant **Send Messages** and
+**Embed Links** and refresh again.
+
+**A team can't be deleted.** It has contracts, offers, trades, dead
+money or budget history pointing at it, and deleting it would take
+that history with it. Release or trade its drivers, or just leave the
+empty team in place — see §6.
+
+**A stat board stopped updating.** Those are the Google Sheets boards
+(`/league` → Setup → Boards → **Google Sheets boards**), not market
+boards. The usual cause is the sheet's sharing being changed. Open the
+screen; a board that failed its last read says so on the posted
+message. Fix the sharing and press **Refresh all**.
 
 **Results import says permission denied.** The sheet isn't shared with
 the service account email. §4, step 5.

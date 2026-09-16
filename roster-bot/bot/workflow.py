@@ -894,16 +894,35 @@ async def remove_board(client, *, board_id: int) -> None:
         log.debug("Could not delete board message for board %s", board_id, exc_info=True)
 
 
-async def refresh_boards(client, *, board_id: int | None = None) -> None:
-    """Re-render one board, or every board when `board_id` is None."""
+# Re-exported so panel screens and cogs can annotate refresh outcomes
+# without importing `bot.market` directly (CLAUDE.md keeps the UI layer
+# talking to `workflow`).
+BoardRefresh = market_boards.BoardRefresh
+describe_refresh = market_boards.describe_refresh
+BOARD_FAILED_ACTIONS = market_boards.FAILED_ACTIONS
+
+
+def boards_action_label(action: str) -> str:
+    """Human wording for one `BoardRefresh.action` value."""
+    return market_boards.ACTION_LABELS.get(action, action)
+
+
+async def refresh_boards(
+    client, *, board_id: int | None = None
+) -> list[BoardRefresh]:
+    """
+    Re-render one board, or every board when `board_id` is None.
+
+    Returns one outcome per board refreshed (G20) so callers can say
+    what happened instead of replying ✅ unconditionally.
+    """
     if board_id is None:
-        await market_boards.refresh_all_boards(client)
-        return
+        return await market_boards.refresh_all_boards(client)
     async with db.connect() as conn:
         board_row = await queries.fetch_market_board_by_id(conn, board_id)
     if board_row is None:
         raise WorkflowError(f"No board with id `{board_id}`.")
-    await market_boards.refresh_board(client, board_row)
+    return [await market_boards.refresh_board(client, board_row)]
 
 
 CHANNEL_KINDS = ("market", "transactions", "approvals")
@@ -1805,6 +1824,58 @@ async def list_teams(guild_id: int) -> list[TeamForPanel]:
     return out
 
 
+async def remove_team(client, *, guild_id: int, team_key: str) -> str:
+    """
+    Delete a team and best-effort delete its roster message.
+
+    Refuses when anything references the team. `contracts`, offers,
+    trades, dead money and the budget ledger all reference `teams(id)`
+    WITHOUT `ON DELETE CASCADE`, so deleting a team that ever signed
+    anyone used to surface a raw `ForeignKeyViolationError` to the
+    admin. A league's money history is not something to delete by
+    accident, so the refusal is the correct behaviour — it just has to
+    be explained.
+
+    Returns the removed team's display name.
+    """
+    async with db.connect() as conn:
+        team = await queries.fetch_team(conn, guild_id, team_key.lower())
+        if team is None:
+            raise WorkflowError(f"No team `{team_key}` in this server.")
+        blockers = await queries.fetch_team_delete_blockers(conn, team.id)
+        if blockers:
+            detail = ", ".join(
+                f"{count} {label}" for label, count in blockers.items()
+            )
+            raise WorkflowError(
+                f"**{team.name}** cannot be deleted — it still has "
+                f"{detail}. Deleting it would take the league's money "
+                f"history with it.\n\nRelease or trade its drivers "
+                f"first, or leave the team in place: a team with no "
+                f"drivers signed costs nothing and keeps the records "
+                f"intact."
+            )
+        message_id, channel_id = team.message_id, team.channel_id
+        name = team.name
+        await queries.delete_team(conn, team.id)
+
+    # Duck-typed on purpose: this module must not import `discord`
+    # (CLAUDE.md), so the message clean-up mirrors `remove_board` —
+    # best-effort, and never a reason to fail a completed delete.
+    if message_id:
+        channel = client.get_channel(channel_id)
+        if channel is not None:
+            try:
+                msg = await channel.fetch_message(message_id)
+                await msg.delete()
+            except Exception:
+                log.debug(
+                    "Could not delete roster message for team %s", name,
+                    exc_info=True,
+                )
+    return name
+
+
 async def adjust_team_cap(
     *,
     guild_id: int,
@@ -1817,8 +1888,10 @@ async def adjust_team_cap(
     Append a `cap_adjustment` ledger row for the team.
 
     Returns the delta as recorded so the caller can echo the sign back.
-    Mirrors `/market-admin adjust-cap` — Phase 4 records this in the
-    ledger only; enforcement lands later.
+    Mirrors `/market-admin adjust-cap`. The row is both the audit trail
+    and the mechanism: `rules.cap_headroom_ok` sums these rows into the
+    team's effective cap, so a dock really does reduce what they can
+    spend (G18).
     """
     if not note.strip():
         raise WorkflowError("Cap adjustments require a note for the audit trail.")

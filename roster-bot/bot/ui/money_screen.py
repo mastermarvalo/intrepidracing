@@ -15,10 +15,11 @@ Two numbers, deliberately kept apart (CLAUDE.md §3, money invariant 9):
   * the BUDGET is the team's own money, and only bites when
     `budget_config.enforce_budget` is on.
 
-`cap_adjustment` ledger rows are **audit notes only**. `rg
-'cap_adjustment' bot/` finds writers and no readers: no cap or payroll
-computation consults them (G18). This screen says so at every point where
-one can be written, and makes no promise about a future phase.
+`cap_adjustment` ledger rows are **enforced** (G18, fixed 2026-09-16).
+`rules.cap_headroom_ok` adds the net of a team's rows to the league cap
+and validates every signing against that effective ceiling, so the rows
+are both the audit trail and the mechanism. They used to be writers with
+no reader, while two screens promised enforcement was coming.
 
 Reads that have no `workflow` wrapper yet (per-team dead money, active
 slot count, budget balance) are composed here from `bot.queries` inside a
@@ -62,10 +63,12 @@ _FILTER_NEGATIVE = "__negative__"
 
 _CREDIT = "credit"
 _DEBIT = "debit"
+_ZERO = Decimal("0")
 
 _CAP_NOTE = (
-    "Cap adjustments are an **audit note only — they do not change the "
-    "cap.** Nothing in signing, trade or import enforcement reads them."
+    "Cap adjustments **change what this team may spend.** A positive "
+    "delta grants extra room above the league cap, a negative one docks "
+    "it, and every signing is validated against the adjusted ceiling."
 )
 
 
@@ -88,10 +91,25 @@ class TeamMoneyRow:
     slots_total: int
     balance: Decimal | None
     available: Decimal | None
+    #: Season-to-date total of this team's cap adjustments. Positive
+    #: grants room above the league cap, negative docks it.
+    cap_adjustment: Decimal = Decimal("0")
+
+    @property
+    def effective_cap(self) -> Decimal:
+        """
+        What this team may actually commit.
+
+        G18 made adjustments enforceable in `bot/contracts/rules.py`.
+        This screen went on showing the unadjusted league cap, so a
+        team granted relief still read as having no room while the
+        offer check let the signing through.
+        """
+        return self.cap + self.cap_adjustment
 
     @property
     def cap_space(self) -> Decimal:
-        return self.cap - self.effective_payroll
+        return self.effective_cap - self.effective_payroll
 
     @property
     def over_cap(self) -> bool:
@@ -152,6 +170,9 @@ async def load_money_state(guild_id: int) -> MoneyState:
             payroll = await queries.fetch_team_payroll(conn, team.id)
             dead = await queries.fetch_dead_money_total(conn, team.id, season.id)
             slots = await queries.fetch_team_active_slot_count(conn, team.id)
+            adjustment = await queries.fetch_cap_adjustment_total(
+                conn, season.id, team.id
+            )
             balance: Decimal | None = None
             available: Decimal | None = None
             if budget_cfg is not None:
@@ -170,6 +191,7 @@ async def load_money_state(guild_id: int) -> MoneyState:
                     slots_total=slots_total,
                     balance=balance,
                     available=available,
+                    cap_adjustment=adjustment,
                 )
             )
 
@@ -1427,14 +1449,14 @@ class _CapAdjustFlow(AdminOwnedView):
             )
         self.add_item(BackButton(self._cancel, label="Cancel", row=2))
         embed = discord.Embed(
-            title="📝 Cap adjustment — audit note only",
+            title="📝 Cap adjustment",
             description=(
                 f"{_CAP_NOTE}\n\n"
-                "A `cap_adjustment` row records that the league granted or "
-                "withdrew relief, for the record. It will **not** let a team "
-                "sign a driver it cannot otherwise afford — to change what a "
-                "team can spend, edit the cap in **Setup → Cap & rules** or "
-                "move budget with **Manual budget adjustment**.\n\n"
+                "Use this for relief or a penalty aimed at one team. To "
+                "change the ceiling for **everyone**, edit the cap in "
+                "**Setup → Cap & rules**; to move a team's own money "
+                "rather than its ceiling, use **Manual budget "
+                "adjustment**.\n\n"
                 f"Teams {page + 1}/{pages}"
             ),
             color=COLOR_INFO,
@@ -1520,17 +1542,29 @@ class _CapAdjustModal(base.PanelModal, title="Cap adjustment (audit note)"):
             await report_error(interaction, f"No team `{self._team_key}` any more.")
             return
 
+        # Adjustments accumulate across a season (G18), so the owner has
+        # to see what is already applied before adding to it — otherwise
+        # a second "+$5M relief" silently becomes +$10M.
+        existing = _ZERO
+        if state.season_id is not None:
+            async with db.connect() as conn:
+                existing = await queries.fetch_cap_adjustment_total(
+                    conn, state.season_id, row.team_id
+                )
+
         embed = discord.Embed(
-            title="📝 Confirm cap audit note",
+            title="📝 Confirm cap adjustment",
             description=truncate_field(
                 "\n".join(
                     [
                         f"**{row.name}** (`{row.key}`) — {_signed(delta)}",
                         f"Note: {self._note.value}",
                         "",
-                        f"Cap stays {_m(row.cap)} and cap space stays "
-                        f"{_signed(row.cap_space)}. **Nothing about what this "
-                        "team can spend changes.**",
+                        f"League cap {_m(row.cap)}",
+                        f"Adjustments already applied {_signed(existing)}",
+                        f"**Effective cap after this change "
+                        f"{_m(row.cap + existing + delta)}**",
+                        "",
                         _CAP_NOTE,
                         "",
                         "The ledger is append-only, so this note cannot be "
@@ -1557,10 +1591,12 @@ class _CapAdjustModal(base.PanelModal, title="Cap adjustment (audit note)"):
             await self._flow.parent.reload(
                 confirm,
                 note=(
-                    f"✅ Audit note recorded for **{row.name}**: "
-                    f"{_signed(recorded)}. The cap, cap space and every "
-                    "signing check are unchanged — this row is read by "
-                    "nothing that enforces anything."
+                    f"✅ Cap adjusted for **{row.name}**: "
+                    f"{_signed(recorded)}. Effective cap is now "
+                    f"{_m(row.cap + existing + recorded)} and every "
+                    "signing check uses it from here. The ledger row is "
+                    "append-only, so this cannot be edited or deleted — "
+                    "correct it with an opposite adjustment."
                 ),
             )
 

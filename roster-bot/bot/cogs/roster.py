@@ -13,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot import db, flow, queries, roster_ops
+from bot import db, flow, queries, roster_ops, workflow
 from bot.events import _rerender, _rerender_fa
 from bot.render import (
     build_avatar_card,
@@ -90,7 +90,13 @@ class RosterCog(commands.Cog):
             )
             return
 
-        view = _ConfirmRemoveView(team_id=team.id, team_name=team.name, bot=self.bot)
+        view = _ConfirmRemoveView(
+            team_id=team.id,
+            team_name=team.name,
+            bot=self.bot,
+            guild_id=interaction.guild_id,
+            team_key=team.key,
+        )
         await interaction.response.send_message(
             f"Remove **{team.name}** (`{team.key}`) and delete its roster message?",
             view=view,
@@ -562,33 +568,42 @@ class _ConfigView(discord.ui.View):
 
 
 class _ConfirmRemoveView(discord.ui.View):
-    def __init__(self, *, team_id: int, team_name: str, bot: commands.Bot) -> None:
+    def __init__(
+        self,
+        *,
+        team_id: int,
+        team_name: str,
+        bot: commands.Bot,
+        guild_id: int,
+        team_key: str,
+    ) -> None:
         super().__init__(timeout=60)
         self._team_id = team_id
         self._team_name = team_name
         self._bot = bot
+        self._guild_id = guild_id
+        self._team_key = team_key
 
     @discord.ui.button(label="Remove", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        async with db.connect() as conn:
-            team = await queries.fetch_team_by_id(conn, self._team_id)
-            if team is None:
-                await interaction.response.edit_message(content="Team no longer exists.", view=None)
-                return
-
-            if team.message_id:
-                try:
-                    channel = self._bot.get_channel(team.channel_id)
-                    if isinstance(channel, discord.TextChannel):
-                        msg = await channel.fetch_message(team.message_id)
-                        await msg.delete()
-                except (discord.NotFound, discord.Forbidden):
-                    pass
-
-            await queries.delete_team(conn, self._team_id)
+        # Routed through `workflow.remove_team` so the typed command and
+        # the Teams panel share one guard. Deleting a team that ever
+        # signed anyone used to raise a raw foreign-key violation here:
+        # contracts, offers, trades, dead money and the budget ledger
+        # all reference teams(id) without ON DELETE CASCADE.
+        try:
+            name = await workflow.remove_team(
+                self._bot, guild_id=self._guild_id, team_key=self._team_key
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.edit_message(
+                content=str(exc), view=None
+            )
+            self.stop()
+            return
 
         await interaction.response.edit_message(
-            content=f"**{self._team_name}** removed.", view=None
+            content=f"**{name}** removed.", view=None
         )
         self.stop()
 

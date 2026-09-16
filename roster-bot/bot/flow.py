@@ -196,6 +196,96 @@ async def start_create(interaction: discord.Interaction, team_key: str) -> None:
     await interaction.response.send_modal(_Step1Modal(state))
 
 
+def normalise_team_key(raw: str) -> str:
+    """
+    The team key as `/roster create` would derive it.
+
+    `/roster create name:"Red Bull"` lowercases its argument and uses it
+    verbatim, so the panel does exactly the same thing rather than
+    inventing a second slug rule that would produce a different key for
+    the same typed name.
+    """
+    return raw.strip().lower()
+
+
+class PanelCreateModal(base.PanelModal, title="New team (1/9)"):
+    """
+    Step 1 of the create wizard, plus the team key.
+
+    `/roster create` takes the key as a command argument and then opens
+    `_Step1Modal`. A panel button has no argument to carry, and Discord
+    will not let one modal open another, so the key becomes a fifth
+    field here and the rest of the wizard (steps 2-9, all views) is
+    reused unchanged.
+    """
+
+    team_key = discord.ui.TextInput(
+        label="Team key (short id)",
+        placeholder="red bull",
+        max_length=32,
+    )
+    team_name = discord.ui.TextInput(
+        label="Display name", placeholder="Red Bull Racing", max_length=64
+    )
+    tagline = discord.ui.TextInput(
+        label="Tagline (optional)",
+        placeholder="6x WCC | 3x WDC | 1x ICC",
+        required=False,
+        max_length=120,
+    )
+    logo_url = discord.ui.TextInput(
+        label="Logo image (optional)",
+        placeholder="https://example.com/logo.png",
+        required=False,
+        max_length=256,
+    )
+    banner_url = discord.ui.TextInput(
+        label="Accent image (optional)",
+        placeholder="https://example.com/banner.png",
+        required=False,
+        max_length=256,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        key = normalise_team_key(str(self.team_key.value))
+        if not key:
+            await interaction.response.send_message(
+                "A team needs a key — try the team's short name, e.g. "
+                "`red bull`.",
+                ephemeral=True,
+            )
+            return
+
+        async with db.connect() as conn:
+            existing = await queries.fetch_team(conn, interaction.guild_id, key)
+        if existing is not None:
+            await interaction.response.send_message(
+                f"A team with key `{key}` already exists (**{existing.name}**). "
+                "Pick a different key, or use **Edit team** on the Teams "
+                "screen to change that one.",
+                ephemeral=True,
+            )
+            return
+
+        state = FlowState(
+            guild_id=interaction.guild_id,
+            user_id=interaction.user.id,
+            team_key=key,
+            display_name=str(self.team_name.value).strip(),
+            tagline=str(self.tagline.value).strip(),
+            logo_url=str(self.logo_url.value).strip(),
+            banner_url=str(self.banner_url.value).strip(),
+        )
+        _save(state)
+        await _show_step2_color(interaction, state)
+
+
+async def start_create_from_panel(interaction: discord.Interaction) -> None:
+    """Open the create wizard with no team key known yet."""
+    await interaction.response.send_modal(PanelCreateModal())
+
+
 async def start_edit(interaction: discord.Interaction, team_key: str) -> None:
     """Kick off the edit flow pre-filled from the DB.  Opens Step 1 modal."""
     assert interaction.guild_id is not None

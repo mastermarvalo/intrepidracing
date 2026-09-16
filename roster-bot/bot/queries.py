@@ -194,6 +194,46 @@ async def replace_slots(
         )
 
 
+#: Tables that reference `teams(id)` WITHOUT `ON DELETE CASCADE`, so a
+#: row in any of them makes `delete_team` raise a foreign-key violation.
+#: Label → table, used to explain the refusal rather than let asyncpg
+#: surface "ForeignKeyViolationError" to an admin.
+TEAM_DELETE_BLOCKERS = (
+    ("contracts", "contracts"),
+    ("contract offers", "contract_offers"),
+    ("trades proposed", "trades"),
+    ("dead money", "dead_money"),
+    ("budget ledger rows", "team_budget_ledger"),
+)
+
+
+async def fetch_team_delete_blockers(
+    conn: asyncpg.Connection, team_id: int
+) -> dict[str, int]:
+    """
+    Label → row count for everything that would block deleting a team.
+
+    Only non-empty counts are returned, so an empty dict means the team
+    is safe to delete.
+    """
+    out: dict[str, int] = {}
+    for label, table in TEAM_DELETE_BLOCKERS:
+        if table == "trades":
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM trades "
+                " WHERE proposing_team_id = $1 OR other_team_id = $1",
+                team_id,
+            )
+        else:
+            count = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {table} WHERE team_id = $1",  # noqa: S608
+                team_id,
+            )
+        if count:
+            out[label] = int(count)
+    return out
+
+
 async def delete_team(conn: asyncpg.Connection, team_id: int) -> None:
     await conn.execute("DELETE FROM teams WHERE id = $1", team_id)
 
@@ -1833,6 +1873,26 @@ async def append_ledger(
         season_id, tier_id, driver_id, team_id, contract_id, offer_id,
         kind, amount, json.dumps(detail), actor_id,
     )
+
+
+async def fetch_cap_adjustment_total(
+    conn: asyncpg.Connection, season_id: int, team_id: int
+) -> Decimal:
+    """
+    Net of the team's `cap_adjustment` ledger rows for the season.
+
+    Positive grants the team extra cap room, negative docks it. Zero when
+    the league has never adjusted this team, which is the common case.
+    """
+    total = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+          FROM contract_ledger
+         WHERE season_id = $1 AND team_id = $2 AND kind = 'cap_adjustment'
+        """,
+        season_id, team_id,
+    )
+    return Decimal(total)
 
 
 async def fetch_ledger_for_driver(
