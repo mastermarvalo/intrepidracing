@@ -51,3 +51,11 @@ DRIVER_TREND_ENTRIES = 5
 
 # How many valuation runs `/market-admin valuation list` returns.
 VALUATION_LIST_LIMIT = 20
+
+# Drivers per page on the career-earnings leaderboard. Each renders on
+# one line rather than two (no delta to show), so a page fits more than
+# `MARKET_PAGE_SIZE` without crowding on mobile.
+EARNINGS_PAGE_SIZE = 15
+
+# Rows shown in a driver's own earnings history panel.
+EARNINGS_HISTORY_ENTRIES = 10

@@ -285,3 +285,49 @@ class BudgetEntry:
     is_correction: bool = False
     actor_id: int | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
+class DriverEarning:
+    """
+    One append-only row of `driver_earnings_ledger`. `amount` is signed.
+
+    A driver-side tally only: no row here moves a team's cash. Identity
+    is `(guild_id, member_id)` rather than `driver_id`, so a total
+    survives a change of tier and carries into the next season by
+    itself. The season/tier/contract/round links are provenance and may
+    be NULL on an old row whose season was deleted.
+    """
+
+    id: int
+    guild_id: int
+    member_id: int
+    kind: str
+    amount: Decimal
+    season_id: int | None = None
+    tier_id: int | None = None
+    driver_id: int | None = None
+    contract_id: int | None = None
+    round_id: int | None = None
+    note: str | None = None
+    actor_id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass
+class CareerEarnings:
+    """
+    One driver's lifetime earnings, as the leaderboard reads them.
+
+    `display_name` is the most recent name the league recorded for this
+    member, and is None for a member with no `drivers` row left at all
+    (every season they raced in has since been deleted). Callers render
+    the member id in that case rather than dropping the row: the money
+    was still earned.
+    """
+
+    member_id: int
+    total: Decimal
+    display_name: str | None = None
+    races_paid: int = 0
+    seasons_paid: int = 0

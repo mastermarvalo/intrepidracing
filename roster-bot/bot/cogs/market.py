@@ -11,6 +11,9 @@ Commands:
     /market team name:<key>             cap sheet + per-driver P/L
     /market surplus tier:<code>         best P/L (market − contract)
     /market underwater tier:<code>      worst P/L
+  Phase 10:
+    /market earnings [season] [page]    driver career-earnings leaderboard
+    /market my-earnings [member]        one driver's earnings + history
 
 Every reply is ephemeral (matching `/roster view`'s convention) —
 public boards are the shared artifact and are posted separately via
@@ -18,6 +21,8 @@ public boards are the shared artifact and are posted separately via
 """
 
 from __future__ import annotations
+
+from typing import Sequence
 
 import discord
 from discord import app_commands
@@ -27,6 +32,37 @@ from bot import db, limits, queries
 from bot.contracts import render as contract_render
 from bot.market import budget_ops
 from bot.market import render as market_render
+from bot.models import CareerEarnings
+
+# Matches the existing market pager's timeout.
+_VIEW_TIMEOUT = 180
+
+# The leaderboard is read whole so the pager can report "page 1/N". A
+# ceiling keeps a pathological guild from building an unbounded embed
+# payload; a league with more drivers than this has bigger problems
+# than a truncated leaderboard.
+_EARNINGS_FETCH_LIMIT = 500
+
+
+def _live_names(
+    interaction: discord.Interaction, rows: Sequence[CareerEarnings]
+) -> dict[int, str]:
+    """
+    Current Discord display names for the members on this page.
+
+    Preferred over the name stored on the `drivers` row, which is a
+    snapshot from whenever they were enrolled. Members who have left the
+    server are absent and fall back to the stored name.
+    """
+    guild = interaction.guild
+    if guild is None:
+        return {}
+    names: dict[int, str] = {}
+    for row in rows:
+        member = guild.get_member(row.member_id)
+        if member is not None:
+            names[row.member_id] = member.display_name
+    return names
 
 
 class MarketCog(commands.Cog):
@@ -267,6 +303,111 @@ class MarketCog(commands.Cog):
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+    # ── /market earnings ─────────────────────────────────────────────────
+
+    @market.command(
+        name="earnings",
+        description="Driver career-earnings leaderboard (carries across seasons)",
+    )
+    @app_commands.describe(
+        scope="All-time career totals, or just the active season",
+        page="Page number",
+    )
+    @app_commands.choices(
+        scope=[
+            app_commands.Choice(name="All time (career)", value="career"),
+            app_commands.Choice(name="Active season only", value="season"),
+        ]
+    )
+    async def market_earnings(
+        self,
+        interaction: discord.Interaction,
+        scope: app_commands.Choice[str] | None = None,
+        page: int = 1,
+    ) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+
+        season_only = scope is not None and scope.value == "season"
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            if season_only and season is None:
+                await interaction.followup.send(
+                    "No active season, so there is no season to scope to. "
+                    "Run this without the `scope` option for career totals.",
+                    ephemeral=True,
+                )
+                return
+            season_id = season.id if season_only and season is not None else None
+            # Fetched whole rather than one page at a time: the
+            # leaderboard is at most a few hundred rows, and the pager
+            # needs the full count to render "page 1/N" anyway.
+            rows = await queries.fetch_earnings_leaderboard(
+                conn,
+                guild_id=interaction.guild_id,
+                season_id=season_id,
+                limit=_EARNINGS_FETCH_LIMIT,
+            )
+
+        label = season.name if (season_only and season is not None) else None
+        embed = market_render.render_earnings_leaderboard(
+            rows=rows,
+            page=page,
+            season_label=label,
+            names=_live_names(interaction, rows),
+        )
+        view = EarningsPager(
+            guild_id=interaction.guild_id,
+            season_id=season_id,
+            season_label=label,
+        )
+        view.sync_with_embed(embed)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    # ── /market my-earnings ──────────────────────────────────────────────
+
+    @market.command(
+        name="my-earnings",
+        description="A driver's career earnings and recent pay",
+    )
+    @app_commands.describe(member="Whose earnings to show (defaults to you)")
+    async def market_my_earnings(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member | None = None,
+    ) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+
+        target = member or interaction.user
+        async with db.connect() as conn:
+            season = await queries.fetch_active_season(conn, interaction.guild_id)
+            career = await queries.fetch_career_earnings(
+                conn, target.id, interaction.guild_id
+            )
+            season_total = None
+            if season is not None:
+                season_total = await queries.fetch_season_earnings(
+                    conn, target.id, season.id
+                )
+            history = await queries.fetch_driver_earnings_history(
+                conn,
+                guild_id=interaction.guild_id,
+                member_id=target.id,
+                limit=limits.EARNINGS_HISTORY_ENTRIES,
+            )
+            kinds = await queries.fetch_earnings_kinds(conn)
+
+        embed = market_render.render_driver_earnings(
+            display_name=target.display_name,
+            career_total=career,
+            season_total=season_total,
+            season_label=season.name if season is not None else None,
+            history=history,
+            kind_labels={code: label for code, label, _auto in kinds},
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
     # ── /market dashboard ────────────────────────────────────────────────
 
     @market.command(name="dashboard", description="Cross-tier top-of-tier summary")
@@ -372,6 +513,67 @@ class _MarketPagerView(discord.ui.View):
             accent_color=self._accent_color,
             drivers=rows,
             page=self._page,
+        )
+        self.sync_with_embed(embed)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        self._page = max(1, self._page - 1)
+        await self._rerender(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_button(
+        self, interaction: discord.Interaction, _button: discord.ui.Button
+    ) -> None:
+        self._page = min(self._total_pages, self._page + 1)
+        await self._rerender(interaction)
+
+
+class EarningsPager(discord.ui.View):
+    """Prev/next for the career-earnings leaderboard."""
+
+    def __init__(
+        self, *, guild_id: int, season_id: int | None, season_label: str | None
+    ) -> None:
+        super().__init__(timeout=_VIEW_TIMEOUT)
+        self._guild_id = guild_id
+        self._season_id = season_id
+        self._season_label = season_label
+        self._page = 1
+        self._total_pages = 1
+
+    def sync_with_embed(self, embed: discord.Embed) -> None:
+        footer = embed.footer.text if embed.footer else ""
+        for chunk in footer.split("·"):
+            chunk = chunk.strip()
+            if not chunk.startswith("Page "):
+                continue
+            _, spec = chunk.split(" ", 1)
+            try:
+                page_str, total_str = spec.split("/", 1)
+                self._page = int(page_str)
+                self._total_pages = int(total_str)
+            except ValueError:
+                pass
+        self.prev_button.disabled = self._page <= 1
+        self.next_button.disabled = self._page >= self._total_pages
+
+    async def _rerender(self, interaction: discord.Interaction) -> None:
+        async with db.connect() as conn:
+            rows = await queries.fetch_earnings_leaderboard(
+                conn,
+                guild_id=self._guild_id,
+                season_id=self._season_id,
+                limit=_EARNINGS_FETCH_LIMIT,
+            )
+        embed = market_render.render_earnings_leaderboard(
+            rows=rows,
+            page=self._page,
+            season_label=self._season_label,
+            names=_live_names(interaction, rows),
         )
         self.sync_with_embed(embed)
         await interaction.response.edit_message(embed=embed, view=self)

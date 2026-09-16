@@ -462,6 +462,8 @@ in Phase 3 + 4: `market`, `movers`, `dashboard`, `surplus`,
 | `/market surplus <tier>` | Drivers with the biggest positive P/L (market − contract) |
 | `/market underwater <tier>` | Drivers with the biggest negative P/L |
 | `/market dashboard` | Cross-tier top-of-tier summary (display only) |
+| `/market earnings [scope] [page]` | Driver career-earnings leaderboard, all time or this season |
+| `/market my-earnings [@member]` | One driver's career total, season total, and recent pay |
 
 ### `/contract` (open to everyone; TP / driver / commissioner scopes)
 
@@ -567,6 +569,11 @@ actor; nothing is overwritten.
 | `incident_penalty` | debit | results import — incident points × `per_incident_pt_m` |
 | `adjustment` | either | `/market-admin budget adjust` |
 
+> `race_earnings` here is **team** prize money for championship points.
+> It is unrelated to a driver's career earnings, which live in their own
+> ledger and never touch a team budget — see
+> [Driver career earnings](#driver-career-earnings-phase-10).
+
 Charges land on the team the driver is **contracted to at import time**.
 A free agent's DNF is reported in the import receipt but charges nobody.
 Re-importing a round is safe: the bot compares what the round *should*
@@ -650,6 +657,65 @@ season, oldest first.
 
 An **extension** starts a new term: `update_contract_terms` resets
 `season_index` to 1 alongside the new `term_seasons`.
+
+### Driver career earnings (Phase 10)
+
+Drivers **keep** what they are paid. Every time you import a race, each
+driver under contract is credited one race's share of their salary —
+the same figure the team side is charged — and that amount is added to a
+lifetime total that never resets.
+
+```text
+/league  →  Market  →  "Career earnings leaderboard"
+```
+
+or `/market earnings`. `/market my-earnings` shows one driver their
+career total, their total this season, and their recent pay lines. A
+driver's career total also appears on their driver card.
+
+**This takes nothing extra from any team.** Career earnings are a
+record of what a driver has been paid, not a second transfer of money.
+Team budgets, the spending cap, escrow and every P/L figure behave
+exactly as they did before this feature existed. Nothing in the bot
+lets a driver spend the total — it is a leaderboard number for now, and
+it is stored as real money so it can become spendable later without a
+migration.
+
+**It works with escrow on or off.** A driver earned their race salary
+whether or not your league models team cash, so earnings are credited on
+a separate pass and do not follow the `escrow_enabled` switch. A league
+that has never turned escrow on still builds a full leaderboard.
+
+**It carries forward by itself.** A driver's identity for earnings is
+their Discord account, not their driver row, so a new season, a new
+tier, or a new team changes nothing. There is no carry-over step to run
+and nothing to remember at the season boundary. Deleting an old season
+does not erase career history either — the season link is provenance
+only, and it is cleared rather than cascaded.
+
+**Pay is per round, not per finish.** Every active contract in the tier
+is credited once per imported round, including a driver who did not show
+up, because that mirrors what the team is charged. If you would rather
+dock a no-show, use `/market-admin earnings adjust` with a negative
+amount — it is audit-logged with your reason.
+
+#### Seeding the seasons you raced before this existed
+
+| Command | What it does |
+|---|---|
+| `/market-admin earnings carry-in <@member> <amount_m> <note>` | Sets a driver's opening career total from your old records |
+| `/market-admin earnings adjust <@member> <delta_m> <note>` | Corrects a total, either direction |
+
+Both require a reason, both are written to the ledger with your user id
+against them, and both are additive — a carry-in does not overwrite
+anything, so a driver who has already been paid this season keeps
+accruing on top of the figure you seed.
+
+> **Verify before you seed.** The bot has no way to know what your
+> league paid in earlier seasons, so a carry-in figure is only as good
+> as the spreadsheet you take it from. Check it against your own records
+> before entering it; correcting it later is possible but the ledger
+> keeps both rows.
 
 ### The weekly race-night loop
 
