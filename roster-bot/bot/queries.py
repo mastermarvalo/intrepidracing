@@ -17,10 +17,12 @@ from bot.market import budget as budget_engine
 from bot.market import results as results_engine
 from bot.models import (
     BudgetEntry,
+    CareerEarnings,
     Contract,
     ContractOffer,
     DeadMoneyEntry,
     Driver,
+    DriverEarning,
     GuildConfig,
     LeagueConfig,
     LedgerEntry,
@@ -3292,3 +3294,217 @@ async def fetch_team_escrow_held(
         team_id, season_id,
     )
     return Decimal(total)
+
+
+# ── driver career earnings (Phase 10) ────────────────────────────────────────
+
+
+def _row_to_driver_earning(row: asyncpg.Record) -> DriverEarning:
+    return DriverEarning(
+        id=row["id"],
+        guild_id=row["guild_id"],
+        member_id=row["member_id"],
+        kind=row["kind"],
+        amount=Decimal(row["amount"]),
+        season_id=row["season_id"],
+        tier_id=row["tier_id"],
+        driver_id=row["driver_id"],
+        contract_id=row["contract_id"],
+        round_id=row["round_id"],
+        note=row["note"],
+        actor_id=row["actor_id"],
+        created_at=row["created_at"],
+    )
+
+
+async def insert_driver_earning(
+    conn: asyncpg.Connection,
+    *,
+    guild_id: int,
+    member_id: int,
+    kind: str,
+    amount: Decimal,
+    season_id: int | None = None,
+    tier_id: int | None = None,
+    driver_id: int | None = None,
+    contract_id: int | None = None,
+    round_id: int | None = None,
+    note: str | None = None,
+    actor_id: int | None = None,
+) -> int | None:
+    """
+    Credit (or debit) a driver's career total. Returns the new row's id.
+
+    Returns None when this is a `race_salary` row whose (contract, round)
+    has already been paid. That is not an error: a round re-imported
+    after a stewards' decision must not pay the same race twice, and the
+    caller treats None as "already paid, change nothing" exactly as the
+    escrow path treats `record_race_service` returning None.
+
+    The conflict target is the partial unique index, so it only bites on
+    `race_salary`; adjustments carry no round and can repeat freely.
+    """
+    return await conn.fetchval(
+        """
+        INSERT INTO driver_earnings_ledger
+            (guild_id, member_id, kind, amount, season_id, tier_id,
+             driver_id, contract_id, round_id, note, actor_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (contract_id, round_id)
+            WHERE kind = 'race_salary'
+            DO NOTHING
+        RETURNING id
+        """,
+        guild_id, member_id, kind, amount, season_id, tier_id,
+        driver_id, contract_id, round_id, note, actor_id,
+    )
+
+
+async def fetch_career_earnings(
+    conn: asyncpg.Connection, member_id: int, guild_id: int
+) -> Decimal:
+    """
+    One driver's lifetime total across every season, including seasons
+    that have since been deleted. Zero for a driver never paid.
+    """
+    total = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+          FROM driver_earnings_ledger
+         WHERE guild_id = $1 AND member_id = $2
+        """,
+        guild_id, member_id,
+    )
+    return Decimal(total)
+
+
+async def fetch_season_earnings(
+    conn: asyncpg.Connection, member_id: int, season_id: int
+) -> Decimal:
+    """What one driver earned in one season. Zero if they earned nothing."""
+    total = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(amount), 0)
+          FROM driver_earnings_ledger
+         WHERE member_id = $1 AND season_id = $2
+        """,
+        member_id, season_id,
+    )
+    return Decimal(total)
+
+
+async def fetch_earnings_leaderboard(
+    conn: asyncpg.Connection,
+    *,
+    guild_id: int,
+    season_id: int | None = None,
+    limit: int,
+    offset: int = 0,
+) -> list[CareerEarnings]:
+    """
+    Career earnings, highest first. `season_id` narrows it to one season.
+
+    The display name is the most recent one the league recorded for that
+    member, via a lateral join on `drivers` rather than a GROUP BY, so a
+    driver who changed name or tier appears once under their latest name
+    instead of splitting into a row per spelling.
+
+    Members whose every season has been deleted still rank, with a NULL
+    name — the money was earned and the caller renders the id.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT led.member_id,
+               SUM(led.amount)                          AS total,
+               COUNT(*) FILTER (WHERE led.round_id IS NOT NULL) AS races_paid,
+               COUNT(DISTINCT led.season_id)            AS seasons_paid,
+               name.display_name
+          FROM driver_earnings_ledger led
+          LEFT JOIN LATERAL (
+               SELECT d.display_name
+                 FROM drivers d
+                WHERE d.member_id = led.member_id
+                ORDER BY d.created_at DESC
+                LIMIT 1
+          ) name ON TRUE
+         WHERE led.guild_id = $1
+           AND ($2::BIGINT IS NULL OR led.season_id = $2)
+         GROUP BY led.member_id, name.display_name
+         ORDER BY total DESC, led.member_id
+         LIMIT $3 OFFSET $4
+        """,
+        guild_id, season_id, limit, offset,
+    )
+    return [
+        CareerEarnings(
+            member_id=r["member_id"],
+            total=Decimal(r["total"]),
+            display_name=r["display_name"],
+            races_paid=r["races_paid"],
+            seasons_paid=r["seasons_paid"],
+        )
+        for r in rows
+    ]
+
+
+async def count_earnings_leaderboard(
+    conn: asyncpg.Connection, *, guild_id: int, season_id: int | None = None
+) -> int:
+    """How many drivers appear on the leaderboard, for pagination."""
+    return await conn.fetchval(
+        """
+        SELECT COUNT(DISTINCT member_id)
+          FROM driver_earnings_ledger
+         WHERE guild_id = $1
+           AND ($2::BIGINT IS NULL OR season_id = $2)
+        """,
+        guild_id, season_id,
+    )
+
+
+async def fetch_driver_earnings_history(
+    conn: asyncpg.Connection,
+    *,
+    guild_id: int,
+    member_id: int,
+    limit: int,
+) -> list[DriverEarning]:
+    """One driver's most recent earning rows, newest first."""
+    rows = await conn.fetch(
+        """
+        SELECT * FROM driver_earnings_ledger
+         WHERE guild_id = $1 AND member_id = $2
+         ORDER BY created_at DESC, id DESC
+         LIMIT $3
+        """,
+        guild_id, member_id, limit,
+    )
+    return [_row_to_driver_earning(r) for r in rows]
+
+
+async def fetch_earnings_kinds(conn: asyncpg.Connection) -> list[tuple[str, str, bool]]:
+    """The `driver_earning_kinds` data table, for labels and validation."""
+    rows = await conn.fetch(
+        "SELECT code, label, is_auto FROM driver_earning_kinds ORDER BY code"
+    )
+    return [(r["code"], r["label"], r["is_auto"]) for r in rows]
+
+
+async def fetch_member_ids_for_drivers(
+    conn: asyncpg.Connection, driver_ids: Sequence[int]
+) -> dict[int, int]:
+    """
+    Map `drivers.id` → `member_id` in one query.
+
+    Race night credits every active contract in a tier, and each credit
+    needs the Discord member behind the contract's driver row. Looking
+    that up per contract would be one round trip per driver on the
+    hottest path in the bot, inside the import transaction.
+    """
+    if not driver_ids:
+        return {}
+    rows = await conn.fetch(
+        "SELECT id, member_id FROM drivers WHERE id = ANY($1::BIGINT[])",
+        list(driver_ids),
+    )
+    return {r["id"]: r["member_id"] for r in rows}

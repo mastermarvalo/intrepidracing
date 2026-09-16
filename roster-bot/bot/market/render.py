@@ -30,6 +30,7 @@ import discord
 
 from bot import limits
 from bot.market.money import format_money, format_pl
+from bot.models import CareerEarnings, DriverEarning
 
 # The (0, 1, -1) allowlist covers the few unavoidable numeric literals
 # below: the initial page number, page arithmetic, and colour fallback.
@@ -38,16 +39,22 @@ from bot.market.money import format_money, format_pl
 # ── public entry points ──────────────────────────────────────────────
 
 
-def paginate(items: Sequence, page: int) -> tuple[list, int, int]:
+def paginate(
+    items: Sequence, page: int, size: int | None = None
+) -> tuple[list, int, int]:
     """
     Slice `items` for the requested 1-indexed page. Returns
     (page_items, page_clamped, total_pages). If items is empty,
     total_pages is 1 and page_items is empty — the empty state still
     renders as "page 1 of 1".
+
+    `size` defaults to `MARKET_PAGE_SIZE`; surfaces that fit more per
+    page (the earnings leaderboard renders one line per driver, not two)
+    pass their own.
     """
     if not items:
         return ([], 1, 1)
-    size = limits.MARKET_PAGE_SIZE
+    size = limits.MARKET_PAGE_SIZE if size is None else size
     total = (len(items) + size - 1) // size
     page_clamped = max(1, min(page, total))
     start = (page_clamped - 1) * size
@@ -385,3 +392,135 @@ def _embed_char_count(embed: discord.Embed) -> int:
     for field in embed.fields:
         total += len(field.name or "") + len(field.value or "")
     return total
+
+
+# ── Driver career earnings (Phase 10) ────────────────────────────────
+
+
+def render_earnings_leaderboard(
+    *,
+    rows: Sequence[CareerEarnings],
+    page: int,
+    season_label: str | None,
+    names: Mapping[int, str] | None = None,
+) -> discord.Embed:
+    """
+    Career-earnings leaderboard, highest first.
+
+    `season_label` None means all-time; a label narrows the title to one
+    season. `names` optionally supplies live Discord display names by
+    member id, which beat the stored ones for a driver who has since
+    renamed; the stored name is the fallback and the bare member id is
+    the last resort for someone whose seasons were all deleted.
+
+    Ranks are computed from the page offset rather than the row order,
+    so page 2 starts at 16 rather than restarting at 1.
+    """
+    page_rows, page_clamped, total_pages = paginate(
+        rows, page, limits.EARNINGS_PAGE_SIZE
+    )
+    scope = "All time" if season_label is None else season_label
+    embed = discord.Embed(
+        title=f"Driver career earnings — {scope}",
+        colour=discord.Colour.gold(),
+    )
+    if not rows:
+        embed.description = _empty_earnings_body()
+        embed.set_footer(text=f"Page {page_clamped}/{total_pages}  ·  0 driver(s)")
+        _enforce_total(embed)
+        return embed
+
+    first_rank = (page_clamped - 1) * limits.EARNINGS_PAGE_SIZE + 1
+    lines: list[str] = []
+    for offset, row in enumerate(page_rows):
+        lines.append(_bound(_earnings_line(
+            rank=first_rank + offset,
+            row=row,
+            names=names or {},
+        )))
+    embed.description = _clip("\n".join(lines), limits.EMBED_DESCRIPTION_MAX)
+    embed.set_footer(
+        text=f"Page {page_clamped}/{total_pages}  ·  {len(rows)} driver(s)"
+    )
+    _enforce_total(embed)
+    return embed
+
+
+def render_driver_earnings(
+    *,
+    display_name: str,
+    career_total: Decimal,
+    season_total: Decimal | None,
+    season_label: str | None,
+    history: Sequence[DriverEarning],
+    kind_labels: Mapping[str, str] | None = None,
+) -> discord.Embed:
+    """
+    One driver's earnings: career total, this season, recent rows.
+
+    Shows the career total first because that is the number the league
+    competes over, and it is the one that carries between seasons.
+    """
+    embed = discord.Embed(
+        title=f"Earnings — {display_name}",
+        colour=discord.Colour.gold(),
+    )
+    embed.add_field(
+        name="Career", value=format_money(career_total), inline=True
+    )
+    if season_total is not None:
+        embed.add_field(
+            name=season_label or "This season",
+            value=format_money(season_total),
+            inline=True,
+        )
+    if not history:
+        embed.add_field(
+            name="History",
+            value=(
+                "Nothing recorded yet. Salary is credited when a race is "
+                "imported, so this fills in on the next race night."
+            ),
+            inline=False,
+        )
+    else:
+        labels = kind_labels or {}
+        lines = [
+            _bound(
+                f"{format_pl(row.amount)}  ·  "
+                f"{labels.get(row.kind, row.kind)}"
+                + (f"  ·  {row.note}" if row.note else "")
+            )
+            for row in history
+        ]
+        embed.add_field(
+            name="Recent",
+            value=_clip("\n".join(lines), limits.EMBED_FIELD_VALUE_MAX),
+            inline=False,
+        )
+    embed.set_footer(
+        text="Career earnings carry between seasons. They are a record, "
+             "not a balance — nothing is spendable."
+    )
+    _enforce_total(embed)
+    return embed
+
+
+def _earnings_line(
+    *, rank: int, row: CareerEarnings, names: Mapping[int, str]
+) -> str:
+    name = names.get(row.member_id) or row.display_name or f"<@{row.member_id}>"
+    detail = f"{row.races_paid} race(s)"
+    if row.seasons_paid > 1:
+        detail += f" · {row.seasons_paid} seasons"
+    return f"{rank}. {name} — {format_money(row.total)}  ({detail})"
+
+
+def _empty_earnings_body() -> str:
+    return (
+        "No driver earnings recorded yet.\n"
+        "Salary is credited to a driver's career total when a race is "
+        "imported, so this populates on the next race night.\n"
+        "Seeding totals from earlier seasons: "
+        "`/market-admin earnings carry-in`."
+    )

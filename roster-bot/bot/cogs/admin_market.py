@@ -153,6 +153,11 @@ class AdminMarketCog(commands.Cog):
         description="Team budgets: prize money, penalties, rollover, config",
         parent=admin,
     )
+    earnings = app_commands.Group(
+        name="earnings",
+        description="Driver career earnings: seed past seasons, correct totals",
+        parent=admin,
+    )
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -1752,6 +1757,91 @@ class AdminMarketCog(commands.Cog):
     ) -> None:
         await self._budget_write(
             interaction, team=team, amount_m=delta_m, note=note, kind="adjustment",
+        )
+
+    # ── /market-admin earnings ───────────────────────────────────────
+
+    @earnings.command(
+        name="carry-in",
+        description="Seed a driver's opening career earnings from past seasons",
+    )
+    @app_commands.describe(
+        member="The driver",
+        amount_m="Career earnings to date, in $M (positive)",
+        note="Where the figure came from (required — audit trail)",
+    )
+    async def earnings_carry_in(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        amount_m: str,
+        note: str,
+    ) -> None:
+        await self._earnings_write(
+            interaction, member=member, amount_m=amount_m, note=note,
+            kind="carry_in",
+        )
+
+    @earnings.command(
+        name="adjust",
+        description="Correct a driver's career earnings, either sign (audit-logged)",
+    )
+    @app_commands.describe(
+        member="The driver",
+        delta_m="Adjustment in $M (positive = credit, negative = debit)",
+        note="Reason (required — audit trail)",
+    )
+    async def earnings_adjust(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        delta_m: str,
+        note: str,
+    ) -> None:
+        await self._earnings_write(
+            interaction, member=member, amount_m=delta_m, note=note,
+            kind="adjustment",
+        )
+
+    async def _earnings_write(
+        self,
+        interaction: discord.Interaction,
+        *,
+        member: discord.Member,
+        amount_m: str,
+        note: str,
+        kind: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+        try:
+            amount = Decimal(amount_m.strip().lstrip("$").rstrip("Mm"))
+        except InvalidOperation as exc:
+            await interaction.response.send_message(
+                f"Could not parse amount: {exc}", ephemeral=True
+            )
+            return
+        try:
+            total = await workflow.adjust_driver_earnings(
+                guild_id=interaction.guild_id,
+                actor_id=interaction.user.id,
+                member_id=member.id,
+                kind=kind,
+                amount=amount,
+                note=note,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        verb = "Seeded" if kind == "carry_in" else "Adjusted"
+        await interaction.response.send_message(
+            f"{verb} **{member.display_name}**'s career earnings by "
+            f"{_fmt_money(amount)}.\n"
+            f"New career total: **{_fmt_money(total)}**\n"
+            f"\u2014 {note}",
+            ephemeral=True,
         )
 
     async def _budget_write(

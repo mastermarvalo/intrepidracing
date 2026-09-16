@@ -109,6 +109,42 @@ def render_escrow_outcome(outcome: workflow.ImportOutcome) -> list[str]:
     return lines
 
 
+def render_earnings_outcome(outcome: workflow.ImportOutcome) -> list[str]:
+    """
+    Driver career-earnings line for the receipt.
+
+    Reported separately from the escrow line, and present even when
+    escrow is off, because the two are independent: a driver earned
+    their race salary whether or not the league models team cash. This
+    line adds to a driver's lifetime total and takes nothing from any
+    team budget.
+    """
+    e = outcome.earnings
+    if e is None or not e.credits:
+        return []
+
+    lines = [
+        f"\U0001f3c6 Driver earnings: +{format_money(e.total_paid)} credited "
+        f"to {e.paid_count} driver(s) for this race \u2014 career totals "
+        "only, no team budget is touched."
+    ]
+    if e.already_paid:
+        lines.append(
+            f"\u21ba {e.already_paid} contract(s) were already paid for this "
+            "round, so they were not paid twice."
+        )
+    if e.too_small_to_pay:
+        lines.append(
+            f"\u26a0 {e.too_small_to_pay} contract(s) worked out to under a "
+            "cent per race, so nothing was credited for them."
+        )
+    return lines
+
+
 def render_money_outcome(outcome: workflow.ImportOutcome) -> list[str]:
     """Every money line this import produced, in reading order."""
-    return render_budget_outcome(outcome) + render_escrow_outcome(outcome)
+    return (
+        render_budget_outcome(outcome)
+        + render_escrow_outcome(outcome)
+        + render_earnings_outcome(outcome)
+    )
