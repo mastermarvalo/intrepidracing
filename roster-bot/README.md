@@ -89,6 +89,30 @@ uv run ruff check bot/
    - Manage Messages (to delete roster messages on `/roster remove`)
 4. Make sure the bot's role sits **above all team roles** in Server Settings → Roles, otherwise it won't be able to assign them
 
+## What a fresh install starts with
+
+If this is the bot's first run on your server, it is worth knowing what
+you are and are not inheriting. The bot has **no knowledge of seasons
+your league raced before you installed it** — however many that is.
+
+| On a fresh install | State |
+|---|---|
+| Driver market values | Empty until you publish a baseline valuation per tier |
+| Career earnings | Every driver at $0.00M; fills in from your first imported race |
+| Contracts | None; every driver is a free agent until signed in the bot |
+| Team budgets | No ledger rows until the first thing that touches a budget |
+| Salary escrow | **On.** New seasons default to escrow enabled |
+| Carry-over | Nothing to carry; your first season has no prior season |
+
+Nothing needs backfilling and no catch-up commands need running. Call
+your first season in the bot whatever you like — if your league is
+really on its eighth, name it "Season 8" and the bot will happily treat
+it as season one of its own records.
+
+The only optional catch-up step is seeding historical driver earnings,
+covered under
+[Driver career earnings](#driver-career-earnings-phase-10).
+
 ## The control panel — start here
 
 Two commands cover everything an admin actually needs day to day:
@@ -647,13 +671,17 @@ lands over the spending cap is called out in the receipt for the
 commissioner to resolve through a release, buyout, or trade before that
 team signs anyone new.
 
-**Payroll now has a season boundary.** Before Phase 8 nothing ever moved
-a contract out of `active`, so Season 7 deals kept counting against
-Season 8 payroll forever. After the first carry-over, live payroll
+**Payroll has a season boundary.** Live payroll
 (`fetch_team_payroll`, the signing rule's input) reflects only current
-obligations. If you have already been running the bot across a season
-boundary without this feature, run `carry-over` once for each past
-season, oldest first.
+obligations, because carry-over is what moves a finished contract out of
+`active`.
+
+On a **fresh install there is nothing to carry over** — your first
+season in the bot has no prior season to inherit from, so you will not
+touch `carry-over` until the end of it. The only case that needs a
+catch-up run is a bot that was already importing races across a season
+boundary before this feature existed; then run `carry-over` once per
+past season, oldest first.
 
 An **extension** starts a new term: `update_contract_terms` resets
 `season_index` to 1 alongside the new `term_seasons`.
@@ -699,7 +727,16 @@ up, because that mirrors what the team is charged. If you would rather
 dock a no-show, use `/market-admin earnings adjust` with a negative
 amount — it is audit-logged with your reason.
 
-#### Seeding the seasons you raced before this existed
+#### Optional: seeding seasons you raced before the bot
+
+On a fresh install every driver starts at **$0.00M** and the leaderboard
+fills in from your first imported race. That is the clean default and it
+needs no setup at all.
+
+If your league raced seasons before the bot existed and you want that
+history on the leaderboard, you can seed each driver an opening total by
+hand. This is entirely optional and skipping it costs you nothing but
+historical flavour.
 
 | Command | What it does |
 |---|---|

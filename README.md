@@ -34,6 +34,10 @@ league, not for a developer.
   loses money to DNFs, no-shows and incident points.
 - **Contracts are real.** Offers, counteroffers, approvals, releases,
   buyouts, trades and season-to-season carry-over, all logged.
+- **Drivers keep their salary.** Every race a driver is under contract
+  adds to a lifetime earnings total that never resets, ranked on a
+  leaderboard that carries across seasons. It costs the teams nothing
+  extra.
 - **Every money movement is auditable.** Nothing adjusts a balance
   silently; each change appends a ledger row you can read back.
 - **The three tiers stay separate.** A Tier 2 driver is priced against
@@ -405,6 +409,54 @@ repointed at the new season, not re-signed, so nobody pays twice.
 
 ---
 
+## Driver career earnings
+
+Separate from everything above, and the one number that belongs to the
+**driver** rather than the team.
+
+Every time you import a race, each driver under contract is credited one
+race's share of their salary — the same figure the team side is charged
+— and it is added to a lifetime total that never resets.
+
+```text
+/league → Market → "Career earnings leaderboard"
+```
+
+or `/market earnings`. A driver can check their own with
+`/market my-earnings`, which shows their career total, their total this
+season, and their recent pay. It also appears on their driver card.
+
+**This costs the teams nothing extra.** Career earnings are a record of
+what a driver has been paid, not a second movement of money. Budgets,
+the cap, escrow and every P/L figure behave exactly as they would
+without this feature. Nothing lets a driver spend the total — it is a
+leaderboard number, stored as real money so it can mean something later
+if you decide it should.
+
+**It does not depend on escrow.** A driver earned their race salary
+whether or not your league models team cash, so earnings accrue with
+escrow on or off.
+
+**It carries forward by itself.** A driver's earnings are tied to their
+Discord account, not their seat, so a new season, tier or team changes
+nothing. There is no offseason step for this and nothing to remember.
+
+**Pay is per race imported, not per finish.** Everyone under contract is
+paid for the round, including a driver who did not show up, because that
+is what the team is charged for. If you would rather dock a no-show:
+
+```text
+/market-admin earnings adjust <@driver> -0.50 "DNS, R4"
+```
+
+On a fresh install every driver starts at $0.00M and the board fills in
+from your first imported race. If you want your pre-bot seasons on the
+leaderboard you can seed opening totals by hand with
+`/market-admin earnings carry-in` — optional, and covered in
+[section 20 of the runbook](docs/RUNNING_YOUR_LEAGUE.md).
+
+---
+
 ## Already running a league?
 
 If you have seasons of history and are adopting the bot now, or are
@@ -414,12 +466,19 @@ following Part 4 above. It covers importing standings, backfilling
 existing contracts, and setting driver values to something sensible
 instead of a cold baseline.
 
-**Decide about escrow before your next season.** Escrow — salary being
-charged from a team's cash race by race — is **off** on any season that
-existed before the update that introduced it, and **on** by default for
-any season whose money rules you set up afterwards. So a league that has
-been running without it will get it on the new season unless you say
-otherwise.
+**Decide about escrow before you start.** Escrow — salary being charged
+from a team's cash race by race — is **on by default** for any season
+you create from now on.
+
+That means a **brand new install gets escrow on**, including the case
+where your league has years of history but the bot does not: the bot has
+no prior season to inherit a setting from, so the default applies. If
+your league has always run commitment-only, where a contract counts
+against the cap and nothing leaves the balance, you have to switch
+escrow off deliberately. It will not stay off on its own.
+
+The only seasons that start with escrow **off** are ones that already
+existed inside the bot before the update that introduced it.
 
 Check where you stand and set it deliberately:
 
@@ -482,6 +541,13 @@ status per item, is in [`docs/audit/`](docs/audit/README.md).
 - **Moving a driver who races in two tiers fails with a database
   error** rather than a plain explanation. The move genuinely is not
   allowed; the message just does not say so.
+- **With escrow off, race-based contract terms never complete.** The
+  counter that advances a contract towards the end of its term is only
+  written by the escrow charge, which does nothing when escrow is
+  disabled — so a 30-race deal stays active forever and you have to end
+  it by hand with a release. This does not affect a default install,
+  where escrow is on. It bites only if you deliberately switch escrow
+  off, and it is worth fixing before you do.
 - **Cap adjustments are an audit note only.** They record in the ledger
   and do not change what a team may spend, though two of the older
   typed commands still claim enforcement is coming.
