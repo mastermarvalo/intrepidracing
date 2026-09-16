@@ -1224,6 +1224,17 @@ class AdminMarketCog(commands.Cog):
         if not await _admin_or_deny(interaction):
             return
         async with db.connect() as conn:
+            # Read the contract first: after the void it no longer
+            # points anywhere useful for stripping the role.
+            contract = await queries.fetch_contract_by_id(conn, contract_id)
+            team = (
+                await queries.fetch_team_by_id(conn, contract.team_id)
+                if contract is not None else None
+            )
+            driver = (
+                await queries.fetch_driver_by_id(conn, contract.driver_id)
+                if contract is not None else None
+            )
             try:
                 await contracts_service.void_contract(
                     conn, contract_id, actor_id=interaction.user.id, note=note
@@ -1231,8 +1242,24 @@ class AdminMarketCog(commands.Cog):
             except contracts_service.TransitionError as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
+        # Same role drop release and buyout perform. The money is
+        # already committed; a role failure is reported, not rolled back.
+        failure: str | None = None
+        if driver is not None:
+            from bot import roster_ops
+            failure = await roster_ops.drop_from_team_best_effort(
+                guild=interaction.guild,
+                member_id=driver.member_id,
+                team=team,
+                actor=interaction.user,
+                reason=f"Contract {contract_id} voided",
+            )
+        where = f" and removed the {team.name} role" if (
+            failure is None and team is not None
+        ) else ""
+        tail = f"\n⚠ Team role not removed: {failure}" if failure else ""
         await interaction.response.send_message(
-            f"✅ Voided contract `{contract_id}`.", ephemeral=True
+            f"✅ Voided contract `{contract_id}`{where}.{tail}", ephemeral=True
         )
 
     @admin.command(name="set-status", description="Set a driver's status")

@@ -585,6 +585,15 @@ async def void_contract(
         raise TransitionError(
             f"Contract {contract_id} is `{contract.state}`, not `active`."
         )
+    # Same guard as `release_contract`. Voiding a contract a pending
+    # trade depends on leaves that trade unresolvable: approval fails
+    # with "no longer active" and no button in the queue can clear it.
+    in_trade = await queries.fetch_trade_involves_contract(conn, contract_id)
+    if in_trade is not None:
+        raise TransitionError(
+            f"Contract {contract_id} is part of open trade {in_trade.id}. "
+            "Withdraw or resolve the trade first."
+        )
     await queries.void_contract(conn, contract_id, actor_id)
     await queries.append_ledger(
         conn,
@@ -1049,16 +1058,34 @@ async def move_driver_between_tiers(
     the driver's active contract (if any) to the same tier. Writes a
     ledger entry with old→new tier ids.
     """
-    driver_row = await conn.fetchrow(
-        "SELECT id, season_id, tier_id, display_name FROM drivers WHERE id = $1",
-        driver_id,
-    )
-    if driver_row is None:
+    driver = await queries.fetch_driver_by_id(conn, driver_id)
+    if driver is None:
         raise TransitionError(f"No driver with id {driver_id}")
-    old_tier_id = driver_row["tier_id"]
+    old_tier_id = driver.tier_id
     if old_tier_id == new_tier_id:
         raise TransitionError(
             f"Driver {driver_id} is already in tier {new_tier_id}."
+        )
+
+    # One member can hold a driver row in more than one tier at once —
+    # a T3 regular who also keeps a T2 reserve seat. `drivers` is
+    # UNIQUE (season_id, tier_id, member_id), so moving one of those
+    # rows onto a tier the member already occupies is a collision, not
+    # a move. Catch it here: `set_driver_tier` below is a bare UPDATE,
+    # and the UniqueViolationError it raises reaches the commissioner
+    # as a generic database notice with no way to act on it.
+    clash = await queries.fetch_driver(
+        conn, driver.season_id, new_tier_id, driver.member_id,
+    )
+    if clash is not None:
+        tier = await queries.fetch_tier_by_id(conn, new_tier_id)
+        where = f"`{tier.label}`" if tier is not None else f"tier {new_tier_id}"
+        raise TransitionError(
+            f"{driver.display_name} already has an entry in {where} "
+            f"(driver id {clash.id}), so there is nothing to move them "
+            "into. A driver may hold a seat in several tiers, but not "
+            f"two in the same one. Either move driver {clash.id} "
+            "instead, or remove it first."
         )
 
     await queries.set_driver_tier(conn, driver_id, new_tier_id)
@@ -1071,7 +1098,7 @@ async def move_driver_between_tiers(
 
     await queries.append_ledger(
         conn,
-        season_id=driver_row["season_id"],
+        season_id=driver.season_id,
         tier_id=new_tier_id,
         driver_id=driver_id,
         team_id=active.team_id if active is not None else None,

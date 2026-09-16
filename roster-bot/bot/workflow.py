@@ -1252,16 +1252,37 @@ async def fetch_driver_detail(guild_id: int, driver_id: int) -> DriverForPanel:
         return await _driver_for_panel(conn, driver, tier)
 
 
+@dataclass
+class VoidOutcome:
+    """
+    What a void did, and what the caller still has to do about it.
+
+    `team` is the team the driver was signed to, carried out so the
+    Discord-facing caller can strip the role. This module cannot do it
+    itself — it has no `discord` import by design — so a void that left
+    the role in place was invisible to every caller until they were
+    handed the team to act on.
+    """
+    contract_id: int
+    member_id: int
+    display_name: str
+    team: object | None
+    team_name: str | None
+
+
 async def void_active_contract(
     *,
     guild_id: int,
     actor_id: int,
     driver_id: int,
     note: str | None,
-) -> None:
+) -> VoidOutcome:
     """
     Void a driver's active contract. Raises WorkflowError if the driver
     has no active contract in the current season.
+
+    Returns the detail the caller needs to drop the team role, which is
+    the caller's job rather than this module's.
     """
     async with db.connect() as conn:
         driver = await queries.fetch_driver_by_id(conn, driver_id)
@@ -1277,12 +1298,22 @@ async def void_active_contract(
             raise WorkflowError(
                 f"{driver.display_name} has no active contract to void."
             )
+        # Read the team before the void, while the contract still
+        # points at it.
+        team = await queries.fetch_team_by_id(conn, contract.team_id)
         try:
             await contracts_service.void_contract(
                 conn, contract.id, actor_id=actor_id, note=note
             )
         except contracts_service.TransitionError as exc:
             raise WorkflowError(str(exc)) from exc
+    return VoidOutcome(
+        contract_id=contract.id,
+        member_id=driver.member_id,
+        display_name=driver.display_name,
+        team=team,
+        team_name=team.name if team is not None else None,
+    )
 
 
 async def set_driver_status(

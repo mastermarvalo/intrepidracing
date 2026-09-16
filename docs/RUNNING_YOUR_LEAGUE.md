@@ -665,7 +665,7 @@ Four ways a deal ends, and what each does to the escrow:
 | **Term completed** | The final race is imported. Escrow returns in full plus P/L at the driver's current value. Team role removed; driver becomes a free agent |
 | **Release** (`/contract release`) | Settles immediately at the driver's current value — escrow back, plus or minus P/L as it stands today |
 | **Buyout** (`/contract buyout`) | Same settlement, and the buyout amount stays as dead money against the cap for the season |
-| **Void** (`/market-admin void`) | Same settlement, recorded with the commissioner's note |
+| **Void** (`/market-admin void`) | Same settlement, recorded with the commissioner's note. Refused while a trade is pending on the contract — resolve the trade first |
 | **Trade** | The old team's holding settles at current value; the new team opens a fresh holding and escrows from that race on |
 
 You chose "settle at current value" for early exits, so a team **can**

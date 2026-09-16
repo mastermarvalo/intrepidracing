@@ -530,17 +530,6 @@ covers harder cases.
 Honest list, verified against the current code. Full detail, with
 status per item, is in [`docs/audit/`](docs/audit/README.md).
 
-- **Void leaves the Discord team role attached.** The driver stays in
-  the team's role list with no contract and no warning. Release and
-  buyout both attempt to drop the role. Remove it by hand after a void,
-  or prefer release. Money is unaffected — the escrow still settles.
-- **Void can jam a pending trade.** Release checks for open trades
-  involving the contract first; void does not. If a trade is pending on
-  a contract you void, it may be left unresolvable from the buttons and
-  need a commissioner to clear it.
-- **Moving a driver who races in two tiers fails with a database
-  error** rather than a plain explanation. The move genuinely is not
-  allowed; the message just does not say so.
 - **Cap adjustments are an audit note only.** They record in the ledger
   and do not change what a team may spend, though two of the older
   typed commands still claim enforcement is coming.
@@ -561,4 +550,5 @@ allowed to contain literal numbers.
 [`docs/ADR-001-f1-with-generic-future.md`](docs/ADR-001-f1-with-generic-future.md)
 explains why. [`docs/audit/`](docs/audit/README.md) records 26 defects
 traced from click to database write, with current status — useful
-context for why several screens are shaped the way they are.
+context for why several screens are shaped the way they are. Every
+high-severity one is now fixed; what remains is listed above.
