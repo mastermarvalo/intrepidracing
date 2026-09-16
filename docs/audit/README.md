@@ -6,7 +6,7 @@ A three-document record of the audit that preceded the Phase 9 update
 | Document | What it is | Trust it for |
 |---|---|---|
 | [`FINDINGS-2026-09.md`](FINDINGS-2026-09.md) | The audit as written 2026-09-14, 26 findings `G1`–`G26`, each traced click → DB write → message | **Why** something was wrong and why it mattered |
-| [`STATUS-2026-09.md`](STATUS-2026-09.md) | Per-finding FIXED / PARTIAL / OPEN verified against `main` at `528fe0e` on 2026-09-15 | **Where things stand**, with file + symbol evidence |
+| [`STATUS-2026-09.md`](STATUS-2026-09.md) | Per-finding FIXED / PARTIAL / OPEN verified against `main` at `528fe0e` on 2026-09-15; G2, G4, G6, G7 fixed 2026-09-16 | **Where things stand**, with file + symbol evidence |
 | [`GUI-CONSOLIDATION-2026-09.md`](GUI-CONSOLIDATION-2026-09.md) | The pre-implementation design spec for the twelve screens, plus a list of what shipped differently | The **intent** behind a screen's shape |
 
 As of the last verification: **19 fixed, 4 partial, 3 open.**

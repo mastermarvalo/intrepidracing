@@ -240,13 +240,25 @@ class AdminMarketCog(commands.Cog):
             await interaction.followup.send(f"\u274c {exc}", ephemeral=True)
             return
 
-        await interaction.followup.send(
-            f"\u2705 Seeded the F1 preset into **{result.name}**: "
-            f"{result.tiers_created} tier(s), lookups, valuation factors "
-            f"and a default league config.\nNext: assign tier roles from "
-            f"`/league` \u2192 Setup, then sync drivers.",
-            ephemeral=True,
-        )
+        if result.settings_only:
+            # G2: the season already had tiers, so only the missing half
+            # was seeded. Say which half, or an admin cannot tell whether
+            # their hand-built tiers survived.
+            body = (
+                f"\u2705 Seeded league settings into **{result.name}**: "
+                f"lookups, valuation factors, the scoring table and a "
+                f"default league config. Your {result.tiers_kept} existing "
+                f"tier(s) were left untouched.\nNext: assign tier roles "
+                f"from `/league` \u2192 Setup, then sync drivers."
+            )
+        else:
+            body = (
+                f"\u2705 Seeded the F1 preset into **{result.name}**: "
+                f"{result.tiers_created} tier(s), lookups, valuation factors "
+                f"and a default league config.\nNext: assign tier roles from "
+                f"`/league` \u2192 Setup, then sync drivers."
+            )
+        await interaction.followup.send(body, ephemeral=True)
 
     @season.command(name="activate", description="Make a season the active one for this server")
     @app_commands.describe(name="Season name")
