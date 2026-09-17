@@ -52,6 +52,9 @@ from bot.ui import base
 log = logging.getLogger(__name__)
 
 _DEFAULT_CONTRACT_TYPE = "standard"
+# Same fallback `queries.derive_term_races` uses when no league_config
+# row carries a calendar, so validation and storage cannot disagree.
+_FALLBACK_RACES = 24
 _OFFER_KIND_CHOICES = [
     app_commands.Choice(name="New signing", value="new"),
     app_commands.Choice(name="Extension", value="extension"),
@@ -612,6 +615,24 @@ class ContractsCog(commands.Cog):
 # ── modals + views ─────────────────────────────────────────────────────
 
 
+def _offer_term_races(cfg, term_seasons: int) -> int:
+    """
+    The race term this season-denominated offer will become.
+
+    `contract_offers` stores only `term_seasons`; `queries.insert_contract`
+    derives `term_races = term_seasons x races_per_season` at signing. The
+    two race-bounds rules were therefore validating `OfferInputs.term_races`
+    default of 1 instead of the real term, so on any league whose
+    `min_term_races` is above 1 -- the F1 preset ships 5 -- every offer was
+    blocked with "Term of 1 race(s) is below the league minimum".
+
+    Mirrors `queries.derive_term_races`, including its 24-race fallback, so
+    what is validated equals what is stored.
+    """
+    per_season = getattr(cfg, "races_per_season", None) or _FALLBACK_RACES
+    return max(1, term_seasons * per_season)
+
+
 class _OfferModal(base.PanelModal):
     def __init__(
         self,
@@ -734,6 +755,9 @@ class _OfferModal(base.PanelModal):
             term_seasons=term_seasons,
             min_term_seasons=cfg.min_term_seasons,
             max_term_seasons=cfg.max_term_seasons,
+            term_races=_offer_term_races(cfg, term_seasons),
+            min_term_races=cfg.min_term_races,
+            max_term_races=cfg.max_term_races,
             offer_kind=self._offer_kind,
             free_agency_open=cfg.free_agency_open,
         )
@@ -975,6 +999,9 @@ class _CounterModal(base.PanelModal):
                 term_seasons=term,
                 min_term_seasons=cfg.min_term_seasons,
                 max_term_seasons=cfg.max_term_seasons,
+                term_races=_offer_term_races(cfg, term),
+                min_term_races=cfg.min_term_races,
+                max_term_races=cfg.max_term_races,
                 offer_kind=self._owner.offer_kind,
                 free_agency_open=cfg.free_agency_open,
             )
