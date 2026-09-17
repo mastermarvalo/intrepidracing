@@ -518,37 +518,50 @@ shorter or longer than what was agreed.
 
 ### What a Team Principal actually types
 
-One honest caveat, because the unit changes between the form and the
-contract. **The offer form still asks for a term in whole seasons.** A TP
-types `2`, and the bot converts it to `2 × races per season` = 48 races
-when the deal is signed. Everything after signing is race-denominated —
-service, escrow, settlement, `/contract status` — but the *offer* is
-still made in seasons.
+**The offer form asks for a term in races.** A Team Principal types `10`
+and gets a ten-race deal. Races are the unit the contract actually runs
+in — service, escrow, settlement and `/contract status` have always been
+race-denominated — so the form now matches what is signed.
 
-So in a 24-race season, a TP can offer 24, 48 or 72 races, and nothing
-in between. The minimum contract length can be set to 5 races, but no TP
-can actually offer a 5-race deal through the form; the shortest
-offerable term is one full season. Only two things can produce an
-off-calendar term today:
+Seasons are still accepted as a shorthand, because most deals are whole
+seasons and nobody wants to do arithmetic. Add an `s`:
+
+| A TP types | The offer becomes | Notes |
+|---|---|---|
+| `10` | 10 races | The plain number is races |
+| `10 races` or `10r` | 10 races | Same thing, spelled out |
+| `2s` or `2 seasons` | 48 races | In a 24-race season |
+| `1s` | 24 races | In a 24-race season |
+
+Anything the bot cannot read — a blank, `two`, `0`, a negative — is
+refused with a message, and the offer is not created.
+
+This is what makes your **minimum contract length** meaningful. Set it
+to 5 races and a TP can offer exactly that. Previously the shortest
+offerable term was one full season, so a 5-race minimum was a number
+that nothing could reach.
+
+Two other things still produce off-calendar terms, and always did:
 
 - **Carry-over**, which moves the true remainder (a 36-race deal in a
   24-race season carries 12 races into the next one).
 - **Re-signing a driver mid-term**, where the guidance in §14 is to
   match the races actually remaining.
 
-If you want TPs to offer arbitrary race counts — a 10-race deal, a
-6-race audition — that is a change to the offer form and to the
-`contract_offers` table, which stores only seasons today. Worth doing,
-but it has not been done.
+> **Set both maximums, and keep them consistent.** The race ceiling and
+> the season ceiling are enforced together, and an offer must satisfy
+> both. The F1 preset shipped with a 3-season maximum and a 48-race
+> ceiling, which meant the 3-season term the league had always allowed
+> was refused as "72 races exceeds the league maximum of 48". The preset
+> now derives the race ceiling from the season maximum so the two cannot
+> disagree. If you edit one, edit the other.
 
-> **Set the maximum in whole seasons.** Because offers arrive in
-> seasons, a race ceiling that isn't a multiple of your calendar is
-> unreachable: a TP hits the next season boundary first. The F1 preset
-> shipped with a 3-season maximum and a 48-race ceiling, which meant the
-> 3-season term the league had always allowed was refused as "72 races
-> exceeds the league maximum of 48" — a limit in a unit the form never
-> showed. The preset now derives the ceiling from the season maximum so
-> the two cannot disagree. If you edit one, edit the other.
+> **What the term looks like once offered.** Offer cards and the signed
+> post show the term in races — "10 race(s)". When a term is an exact
+> number of whole seasons, the season count is shown alongside it: "48
+> race(s) (2 seasons)". A term that is neither, like 30 races, is shown
+> only in races, because calling it "2 seasons" would describe a deal 18
+> races longer than the one signed.
 
 ---
 

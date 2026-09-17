@@ -615,22 +615,92 @@ class ContractsCog(commands.Cog):
 # ── modals + views ─────────────────────────────────────────────────────
 
 
+def _races_per_season(cfg) -> int:
+    """
+    The league's calendar, with the same 24-race fallback
+    `queries.derive_term_races` applies, so a term that is validated
+    here and stored there cannot come out different.
+    """
+    return getattr(cfg, "races_per_season", None) or _FALLBACK_RACES
+
+
 def _offer_term_races(cfg, term_seasons: int) -> int:
     """
-    The race term this season-denominated offer will become.
+    The race term a season-denominated offer means.
 
-    `contract_offers` stores only `term_seasons`; `queries.insert_contract`
-    derives `term_races = term_seasons x races_per_season` at signing. The
-    two race-bounds rules were therefore validating `OfferInputs.term_races`
-    default of 1 instead of the real term, so on any league whose
-    `min_term_races` is above 1 -- the F1 preset ships 5 -- every offer was
-    blocked with "Term of 1 race(s) is below the league minimum".
-
-    Mirrors `queries.derive_term_races`, including its 24-race fallback, so
-    what is validated equals what is stored.
+    Still used for anything that only knows a season count.
     """
-    per_season = getattr(cfg, "races_per_season", None) or _FALLBACK_RACES
-    return max(1, term_seasons * per_season)
+    return max(1, term_seasons * _races_per_season(cfg))
+
+
+def _seasons_for_races(cfg, term_races: int) -> int:
+    """
+    The season span a race term touches, rounded UP.
+
+    `term_seasons` remains on the offer because the salary is a
+    per-season rate and the season-denominated bounds are still checked
+    against it. A 10-race deal in a 24-race season touches one season; a
+    30-race deal touches two.
+
+    Rounding up rather than down matters: a 30-race deal that reported
+    one season would be quoted against a single season's salary while
+    actually running into a second.
+    """
+    per_season = _races_per_season(cfg)
+    return max(1, -(-term_races // per_season))
+
+
+def parse_term(cfg, raw: str) -> tuple[int, int]:
+    """
+    Read a Team Principal's term entry as `(term_races, term_seasons)`.
+
+    Offers are made in RACES since migration 018, because a whole-season
+    term could not express a 10-race stand-in deal or match the races
+    remaining when re-signing mid-term. Seasons stay available as a
+    convenience because most deals are still full seasons and nobody
+    wants to type 48:
+
+        "10"   -> 10 races
+        "2s"   -> 2 seasons  -> 48 races on a 24-race calendar
+        "2 seasons"
+
+    Raises ValueError with a message meant to be shown to the TP.
+    """
+    text = raw.strip().lower()
+    if not text:
+        raise ValueError("Enter a contract length.")
+    seasons_asked = False
+    # Race suffixes are stripped FIRST. "races" ends in "s", so checking
+    # the season suffixes first read "5 races" as five SEASONS -- a
+    # 120-race deal from a TP who asked for five races.
+    for suffix in ("races", "race", "r"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            break
+    else:
+        for suffix in ("seasons", "season", "s"):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)].strip()
+                seasons_asked = True
+                break
+    if not text:
+        raise ValueError(
+            "Enter a number — for example `10` for ten races, or `2s` "
+            "for two seasons."
+        )
+    try:
+        count = int(text)
+    except ValueError:
+        raise ValueError(
+            f"Could not read {raw.strip()!r} as a contract length. Use a "
+            "number of races (`10`) or seasons (`2s`)."
+        ) from None
+    if count < 1:
+        raise ValueError("A contract must run for at least one race.")
+    if seasons_asked:
+        races = _offer_term_races(cfg, count)
+        return races, count
+    return count, _seasons_for_races(cfg, count)
 
 
 class _OfferModal(base.PanelModal):
@@ -658,7 +728,9 @@ class _OfferModal(base.PanelModal):
             label="Salary ($M)", placeholder="e.g. 12.50", required=True
         )
         self._term = discord.ui.TextInput(
-            label="Term (seasons)", placeholder="e.g. 2", required=True
+            label="Term (races, or '2s' for seasons)",
+            placeholder="e.g. 10 for ten races, or 2s for two seasons",
+            required=True,
         )
         self._bonus = discord.ui.TextInput(
             label="Signing bonus ($M)", placeholder="0.00", required=False,
@@ -679,9 +751,8 @@ class _OfferModal(base.PanelModal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
             salary = Decimal(self._salary.value.strip())
-            term_seasons = int(self._term.value.strip())
             signing_bonus = Decimal(self._bonus.value.strip() or "0")
-        except (InvalidOperation, ValueError) as exc:
+        except InvalidOperation as exc:
             await interaction.response.send_message(
                 f"Could not parse a number: {exc}", ephemeral=True
             )
@@ -701,6 +772,17 @@ class _OfferModal(base.PanelModal):
                     "No league_config for this scope. Ask a commissioner "
                     "to seed the F1 preset first.",
                     ephemeral=True,
+                )
+                return
+            # Parsed here, not above, because reading "2s" needs the
+            # league's calendar and the calendar lives on cfg.
+            try:
+                term_races, term_seasons = parse_term(
+                    cfg, self._term.value
+                )
+            except ValueError as exc:
+                await interaction.response.send_message(
+                    str(exc), ephemeral=True
                 )
                 return
             payroll_before = await queries.fetch_team_effective_payroll(
@@ -755,7 +837,7 @@ class _OfferModal(base.PanelModal):
             term_seasons=term_seasons,
             min_term_seasons=cfg.min_term_seasons,
             max_term_seasons=cfg.max_term_seasons,
-            term_races=_offer_term_races(cfg, term_seasons),
+            term_races=term_races,
             min_term_races=cfg.min_term_races,
             max_term_races=cfg.max_term_races,
             offer_kind=self._offer_kind,
@@ -779,6 +861,8 @@ class _OfferModal(base.PanelModal):
             current_market_value=market_value,
             validation=validation,
             team_budget=budget_snap.balance if budget_snap else None,
+            term_races=term_races,
+            races_per_season=_races_per_season(cfg),
         )
         view = _ReviewSubmitView(
             team=self._team,
@@ -794,6 +878,7 @@ class _OfferModal(base.PanelModal):
             incentives=self._incentives.value or None,
             message=self._message.value or None,
             validation=validation,
+            term_races=term_races,
         )
         await interaction.response.send_message(
             embed=review, view=view, ephemeral=True
@@ -809,6 +894,7 @@ class _ReviewSubmitView(discord.ui.View):
         salary: Decimal, term_seasons: int, signing_bonus: Decimal,
         incentives: str | None, message: str | None,
         validation: rules.OfferValidation,
+        term_races: int,
     ) -> None:
         super().__init__(timeout=300)
         self._team = team
@@ -820,6 +906,7 @@ class _ReviewSubmitView(discord.ui.View):
         self._ttl_hours = ttl_hours
         self._salary = salary
         self._term = term_seasons
+        self._term_races = term_races
         self._bonus = signing_bonus
         self._incentives = incentives
         self._message = message
@@ -860,6 +947,7 @@ class _ReviewSubmitView(discord.ui.View):
                 ttl_hours=self._ttl_hours,
                 validation=self._validation.to_json(),
                 initial_state="pending_driver",
+                term_races=self._term_races,
             )
             approvals_channel_id = (cfg.approvals_channel_id if cfg else None)
 
@@ -877,6 +965,10 @@ class _ReviewSubmitView(discord.ui.View):
             message=self._message,
             ttl_hours=self._ttl_hours,
             approvals_channel_id=approvals_channel_id,
+            term_races=self._term_races,
+            races_per_season=(
+                _races_per_season(cfg) if cfg is not None else None
+            ),
         )
         if thread_id is not None:
             async with db.connect() as conn:
@@ -911,8 +1003,8 @@ class _CounterModal(base.PanelModal):
             default=str(parent_offer.salary), required=True,
         )
         self._term = discord.ui.TextInput(
-            label="Term (seasons)",
-            default=str(parent_offer.term_seasons), required=True,
+            label="Term (races, or '2s' for seasons)",
+            default=str(parent_offer.term_races), required=True,
         )
         self._bonus = discord.ui.TextInput(
             label="Signing bonus ($M)",
@@ -934,9 +1026,8 @@ class _CounterModal(base.PanelModal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
             salary = Decimal(self._salary.value.strip())
-            term = int(self._term.value.strip())
             bonus = Decimal(self._bonus.value.strip() or "0")
-        except (InvalidOperation, ValueError) as exc:
+        except InvalidOperation as exc:
             await interaction.response.send_message(
                 f"Could not parse a number: {exc}", ephemeral=True
             )
@@ -951,6 +1042,14 @@ class _CounterModal(base.PanelModal):
             if cfg is None:
                 await interaction.response.send_message(
                     "No league_config for this scope.", ephemeral=True
+                )
+                return
+            # Needs the calendar, so parsed after cfg loads.
+            try:
+                term_races, term = parse_term(cfg, self._term.value)
+            except ValueError as exc:
+                await interaction.response.send_message(
+                    str(exc), ephemeral=True
                 )
                 return
             payroll_before = await queries.fetch_team_effective_payroll(
@@ -999,7 +1098,7 @@ class _CounterModal(base.PanelModal):
                 term_seasons=term,
                 min_term_seasons=cfg.min_term_seasons,
                 max_term_seasons=cfg.max_term_seasons,
-                term_races=_offer_term_races(cfg, term),
+                term_races=term_races,
                 min_term_races=cfg.min_term_races,
                 max_term_races=cfg.max_term_races,
                 offer_kind=self._owner.offer_kind,
@@ -1021,6 +1120,7 @@ class _CounterModal(base.PanelModal):
                     message=self._message.value or None,
                     ttl_hours=cfg.offer_ttl_hours,
                     validation=validation.to_json(),
+                    term_races=term_races,
                 )
             except service.TransitionError as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
@@ -1050,11 +1150,16 @@ async def _deliver_offer(
     message: str | None,
     ttl_hours: int,
     approvals_channel_id: int | None,
+    term_races: int | None = None,
+    races_per_season: int | None = None,
 ) -> int | None:
     """
     Create a private negotiation thread in the approvals channel with
     the driver + TP, post the offer card, return the thread id. Fall
     back to a DM if the thread cannot be created.
+
+    The driver must see the term in the unit it was agreed in: a
+    10-race deal shown as "1 season(s)" is a different deal.
     """
     from datetime import UTC, datetime, timedelta
 
@@ -1086,6 +1191,8 @@ async def _deliver_offer(
         expires_at=expires_at,
         current_market_value=market_value,
         current_contract_value=current_contract,
+        term_races=term_races,
+        races_per_season=races_per_season,
     )
     footer_line = (
         f"Offer id `{offer_id}`. `/contract accept id: {offer_id}` · "

@@ -23,6 +23,38 @@ from bot.market.money import format_money, format_pl
 _ZERO = Decimal(0)
 
 
+def format_term(
+    term_seasons: int,
+    term_races: int | None = None,
+    races_per_season: int | None = None,
+) -> str:
+    """
+    A term as the league now agrees it: in races.
+
+    Races became the authoritative term in migration 015 and offerable
+    in 018, so "1 season(s)" is the wrong label for a 10-race deal — it
+    reads as a full year. `term_races` is optional because the season
+    count is all a pre-018 caller has.
+
+    The season span is appended only when the calendar is known AND the
+    term divides into it exactly. An earlier version tested
+    `term_races % term_seasons`, which called a 30-race deal
+    "(2 seasons)" because 30 is even — a deal 18 races shorter than the
+    two seasons it claimed. When in doubt, say races and nothing else.
+    """
+    if term_races is None:
+        return f"{term_seasons} season(s)"
+    races = f"{term_races} race(s)"
+    if (
+        races_per_season
+        and races_per_season > 0
+        and term_races % races_per_season == 0
+        and term_races // races_per_season > 1
+    ):
+        return f"{races} ({term_races // races_per_season} seasons)"
+    return races
+
+
 def render_review_panel(
     *,
     team_name: str,
@@ -36,6 +68,8 @@ def render_review_panel(
     incentives: str | None,
     message: str | None,
     payroll_before: Decimal,
+    term_races: int | None = None,
+    races_per_season: int | None = None,
     salary_cap: Decimal,
     current_market_value: Decimal | None,
     validation: OfferValidation,
@@ -63,7 +97,11 @@ def render_review_panel(
     embed.add_field(name="Kind", value=offer_kind, inline=True)
     embed.add_field(name="Type", value=contract_type, inline=True)
     embed.add_field(name="Salary", value=format_money(salary), inline=True)
-    embed.add_field(name="Term", value=f"{term_seasons} season(s)", inline=True)
+    embed.add_field(
+        name="Term",
+        value=format_term(term_seasons, term_races, races_per_season),
+        inline=True,
+    )
     embed.add_field(
         name="Signing bonus", value=format_money(signing_bonus), inline=True
     )
@@ -132,6 +170,8 @@ def render_driver_offer_card(
     expires_at,
     current_market_value: Decimal | None,
     current_contract_value: Decimal | None,
+    term_races: int | None = None,
+    races_per_season: int | None = None,
 ) -> discord.Embed:
     """The offer as the driver sees it in the negotiation thread."""
     embed = discord.Embed(
@@ -140,7 +180,11 @@ def render_driver_offer_card(
     )
     embed.add_field(name="Tier", value=tier_label, inline=True)
     embed.add_field(name="Type", value=contract_type, inline=True)
-    embed.add_field(name="Term", value=f"{term_seasons} season(s)", inline=True)
+    embed.add_field(
+        name="Term",
+        value=format_term(term_seasons, term_races, races_per_season),
+        inline=True,
+    )
     embed.add_field(name="Salary", value=format_money(salary), inline=True)
     embed.add_field(
         name="Signing bonus", value=format_money(signing_bonus), inline=True
@@ -194,6 +238,8 @@ def render_signed_contract_post(
     value_at_signing: Decimal | None,
     external_ref: str,
     approved_by_mention: str,
+    term_races: int | None = None,
+    races_per_season: int | None = None,
 ) -> discord.Embed:
     """
     Public post that lands in transactions_channel on approval. This
@@ -205,7 +251,11 @@ def render_signed_contract_post(
     )
     embed.add_field(name="Tier", value=tier_label, inline=True)
     embed.add_field(name="Type", value=contract_type, inline=True)
-    embed.add_field(name="Term", value=f"{term_seasons} season(s)", inline=True)
+    embed.add_field(
+        name="Term",
+        value=format_term(term_seasons, term_races, races_per_season),
+        inline=True,
+    )
     embed.add_field(name="Value", value=format_money(contract_value), inline=True)
     embed.add_field(
         name="Signing bonus", value=format_money(signing_bonus), inline=True

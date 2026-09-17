@@ -161,6 +161,13 @@ class ContractOffer:
     resolved_at: datetime | None = None
     resolved_by: int | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    #: The term the deal actually runs for, in races (migration 018).
+    #: `term_seasons` above is the derived season span the deal can
+    #: touch, kept because the salary rate and the season-denominated
+    #: bounds are still quoted in seasons. Defaults to one full F1
+    #: calendar so an offer built in a test without an explicit term is
+    #: legal in every league rather than a one-race deal.
+    term_races: int = 24
 
 
 @dataclass

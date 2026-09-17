@@ -90,10 +90,15 @@ async def submit_offer(
     validation: dict,
     parent_offer_id: int | None = None,
     initial_state: str = "pending_driver",
+    term_races: int | None = None,
 ) -> int:
     """
     Insert a new offer row in `initial_state` and log an
     `offer_created` ledger entry. Returns the new offer id.
+
+    `term_races` is the term the deal actually runs for (migration 018).
+    Omitting it derives the term from `term_seasons` in `insert_offer`,
+    which is what every pre-018 caller effectively did.
     """
     expires_at = _now() + timedelta(hours=ttl_hours)
     offer_id = await queries.insert_offer(
@@ -114,6 +119,7 @@ async def submit_offer(
         parent_offer_id=parent_offer_id,
         expires_at=expires_at,
         validation=validation,
+        term_races=term_races,
     )
     await queries.append_ledger(
         conn,
@@ -127,6 +133,7 @@ async def submit_offer(
         detail={
             "offer_kind": offer_kind,
             "term_seasons": term_seasons,
+            "term_races": term_races,
             "contract_type": contract_type,
             "parent_offer_id": parent_offer_id,
             "initial_state": initial_state,
@@ -202,11 +209,16 @@ async def driver_counter(
     message: str | None,
     ttl_hours: int,
     validation: dict,
+    term_races: int | None = None,
 ) -> int:
     """
     Driver counters the team's offer: the parent goes to `countered`
     (terminal from the parent's perspective) and a new child in
     `pending_team` carries the driver's terms back.
+
+    A counter that does not name its own `term_races` inherits the
+    parent's, so countering on salary alone cannot silently reset the
+    length of the deal to a whole number of seasons.
     """
     parent = await _load_open_offer(conn, parent_offer_id)
     _require_state(parent, {"pending_driver"})
@@ -233,6 +245,9 @@ async def driver_counter(
         validation=validation,
         parent_offer_id=parent_offer_id,
         initial_state="pending_team",
+        term_races=(
+            term_races if term_races is not None else parent.term_races
+        ),
     )
     await queries.append_ledger(
         conn,
@@ -262,8 +277,14 @@ async def team_counter(
     message: str | None,
     ttl_hours: int,
     validation: dict,
+    term_races: int | None = None,
 ) -> int:
-    """Team counters the driver's counter (state = pending_team)."""
+    """
+    Team counters the driver's counter (state = pending_team).
+
+    As with `driver_counter`, an unspecified `term_races` inherits the
+    parent's rather than being re-derived from seasons.
+    """
     parent = await _load_open_offer(conn, parent_offer_id)
     _require_state(parent, {"pending_team"})
     await queries.update_offer_state(
@@ -289,6 +310,9 @@ async def team_counter(
         validation=validation,
         parent_offer_id=parent_offer_id,
         initial_state="pending_driver",
+        term_races=(
+            term_races if term_races is not None else parent.term_races
+        ),
     )
     await queries.append_ledger(
         conn,
@@ -421,6 +445,9 @@ async def _approve_new_signing(
         signing_bonus=offer.signing_bonus,
         max_incentives=_parse_incentives_amount(offer.incentives),
         term_seasons=offer.term_seasons,
+        # The offer's own race term, not `term_seasons x races_per_season`.
+        # Re-deriving here would round a 10-race deal up to a full season.
+        term_races=offer.term_races,
         contract_type=offer.contract_type,
         state="active",
         value_at_signing=value_at_signing,
@@ -452,6 +479,7 @@ async def _approve_new_signing(
         detail={
             "contract_type": offer.contract_type,
             "term_seasons": offer.term_seasons,
+            "term_races": offer.term_races,
             "signing_bonus": str(offer.signing_bonus),
             "value_at_signing": (
                 str(value_at_signing) if value_at_signing is not None else None
@@ -488,11 +516,16 @@ async def _approve_extension(
         )
     old_value = existing.contract_value
     old_term = existing.term_seasons
+    old_races = existing.term_races
     await queries.update_contract_terms(
         conn, existing.id,
         contract_value=offer.salary,
         term_seasons=offer.term_seasons,
         signing_bonus=offer.signing_bonus,
+        # Without this the extension's agreed length was recorded in the
+        # ledger but never applied: the contract kept running to its
+        # original race term.
+        term_races=offer.term_races,
     )
     await queries.update_offer_state(
         conn, offer.id,
@@ -519,8 +552,10 @@ async def _approve_extension(
         detail={
             "old_contract_value": str(old_value),
             "old_term_seasons": old_term,
+            "old_term_races": old_races,
             "new_contract_value": str(offer.salary),
             "new_term_seasons": offer.term_seasons,
+            "new_term_races": offer.term_races,
             "value_at_signing": (
                 str(value_at_signing) if value_at_signing is not None else None
             ),

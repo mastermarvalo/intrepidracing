@@ -23,7 +23,12 @@ from decimal import Decimal
 
 import pytest
 
-from bot.cogs.contracts import _FALLBACK_RACES, _offer_term_races
+from bot.cogs.contracts import (
+    _FALLBACK_RACES,
+    _offer_term_races,
+    _seasons_for_races,
+    parse_term,
+)
 from bot.contracts import rules
 from bot.presets.f1 import _DEFAULT_LEAGUE_CONFIG as F1
 
@@ -179,20 +184,122 @@ async def test_a_term_past_the_season_ceiling_is_still_refused():
     assert "term_races_too_long" in codes
 
 
-async def test_both_term_rules_agree_on_every_offer():
-    # The season rule and the race rule must never disagree, or a TP is
-    # told a term is fine in one unit and illegal in the other.
+async def test_the_race_rule_is_never_looser_than_the_season_rule():
+    """
+    Races are the authoritative term; seasons are derived as the span a
+    term touches. So anything the race rule ACCEPTS the season rule must
+    also accept, or a TP would be told a term is legal in the unit they
+    typed and illegal in a unit they never saw.
+
+    The converse is allowed and intended: a 1-race term satisfies the
+    season bounds (it touches one season) while the race minimum
+    rightly refuses it.
+    """
     cfg = _Cfg(F1["races_per_season"])
-    for seasons in range(1, F1["max_term_seasons"] + 3):
+    for races in range(1, F1["max_term_races"] + F1["races_per_season"]):
         results = {
             r.code: r.ok
             for r in rules.validate_offer(
-                _inputs(term_seasons=seasons, cfg=cfg)
+                _inputs(
+                    term_seasons=_seasons_for_races(cfg, races),
+                    cfg=cfg,
+                    term_races=races,
+                )
             ).results
         }
-        season_ok = results.get("term_within_bounds", False)
-        race_ok = results.get("term_races_within_bounds", False)
-        assert season_ok == race_ok, (
-            f"{seasons} seasons: season rule {season_ok}, "
-            f"race rule {race_ok}"
+        if results.get("term_races_within_bounds"):
+            assert results.get("term_within_bounds"), (
+                f"{races} races passes the race rule but fails the "
+                "season rule"
+            )
+
+
+# ── offering a term in races (migration 018) ─────────────────────────
+
+
+def test_a_race_term_is_read_as_races():
+    cfg = _Cfg(24)
+    assert parse_term(cfg, "10") == (10, 1)
+    assert parse_term(cfg, "10 races") == (10, 1)
+    assert parse_term(cfg, "10r") == (10, 1)
+
+
+def test_a_season_term_is_still_accepted_as_a_convenience():
+    cfg = _Cfg(24)
+    assert parse_term(cfg, "2s") == (48, 2)
+    assert parse_term(cfg, "2 seasons") == (48, 2)
+    assert parse_term(cfg, "2 season") == (48, 2)
+
+
+def test_races_is_not_mistaken_for_a_season_suffix():
+    # "races" ends in "s". Stripping season suffixes first turned
+    # "5 races" into five SEASONS -- a 120-race deal from a TP who
+    # asked for five races.
+    cfg = _Cfg(24)
+    assert parse_term(cfg, "5 races") == (5, 1)
+    assert parse_term(cfg, "1 race") == (1, 1)
+
+
+def test_the_term_entry_is_case_and_space_insensitive():
+    cfg = _Cfg(24)
+    assert parse_term(cfg, "  3S  ") == (72, 3)
+    assert parse_term(cfg, "2 Seasons") == (48, 2)
+    assert parse_term(cfg, " 12 ") == (12, 1)
+
+
+@pytest.mark.parametrize(
+    "raw", ["", "   ", "abc", "0", "-3", "two", "s", "races"]
+)
+def test_an_unreadable_term_is_refused_with_a_message_for_the_tp(raw):
+    with pytest.raises(ValueError) as caught:
+        parse_term(_Cfg(24), raw)
+    assert str(caught.value)
+
+
+def test_the_derived_season_span_rounds_up():
+    # A 30-race deal runs into a second season. Reporting one season
+    # would quote it against a single season's salary.
+    cfg = _Cfg(24)
+    assert _seasons_for_races(cfg, 24) == 1
+    assert _seasons_for_races(cfg, 25) == 2
+    assert _seasons_for_races(cfg, 30) == 2
+    assert _seasons_for_races(cfg, 48) == 2
+    assert _seasons_for_races(cfg, 49) == 3
+
+
+def test_a_short_race_deal_is_offerable_and_legal():
+    # The whole point: the F1 preset allows a 5-race minimum, and before
+    # migration 018 the shortest offerable term was a full season.
+    cfg = _Cfg(F1["races_per_season"])
+    races, seasons = parse_term(cfg, str(F1["min_term_races"]))
+    assert races == F1["min_term_races"]
+    validation = rules.validate_offer(
+        _inputs(term_seasons=seasons, cfg=cfg, term_races=races)
+    )
+    assert validation.ok, _blockers(validation)
+
+
+def test_a_term_below_the_race_minimum_is_still_refused():
+    cfg = _Cfg(F1["races_per_season"])
+    races = F1["min_term_races"] - 1
+    validation = rules.validate_offer(
+        _inputs(
+            term_seasons=_seasons_for_races(cfg, races),
+            cfg=cfg,
+            term_races=races,
         )
+    )
+    assert "term_races_below_minimum" in _blockers(validation)
+
+
+def test_a_term_past_the_race_ceiling_is_refused():
+    cfg = _Cfg(F1["races_per_season"])
+    races = F1["max_term_races"] + 1
+    validation = rules.validate_offer(
+        _inputs(
+            term_seasons=_seasons_for_races(cfg, races),
+            cfg=cfg,
+            term_races=races,
+        )
+    )
+    assert "term_races_too_long" in _blockers(validation)
