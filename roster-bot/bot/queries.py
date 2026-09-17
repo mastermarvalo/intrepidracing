@@ -1666,6 +1666,7 @@ def _row_to_offer(row: asyncpg.Record) -> ContractOffer:
         offer_kind=row["offer_kind"],
         salary=row["salary"],
         term_seasons=row["term_seasons"],
+        term_races=row["term_races"],
         contract_type=row["contract_type"],
         signing_bonus=row["signing_bonus"],
         incentives=row["incentives"],
@@ -1710,22 +1711,37 @@ async def insert_offer(
     message: str | None = None,
     parent_offer_id: int | None = None,
     validation: dict | None = None,
+    term_races: int | None = None,
 ) -> int:
+    """
+    `term_races` is NOT NULL in the schema. A caller that still thinks
+    in seasons may omit it, and it is then derived as
+    `term_seasons x races_per_season` — the same conversion migration
+    018 used to backfill existing offers — so an offer written through
+    an older code path and one backfilled by the migration describe the
+    same deal.
+    """
+    if term_races is None:
+        term_races = await derive_term_races(
+            conn, season_id=season_id, tier_id=tier_id,
+            term_seasons=term_seasons,
+        )
     return await conn.fetchval(
         """
         INSERT INTO contract_offers
             (season_id, tier_id, driver_id, team_id, offered_by,
              offer_kind, salary, term_seasons, contract_type,
              signing_bonus, incentives, message, state,
-             parent_offer_id, expires_at, validation)
+             parent_offer_id, expires_at, validation, term_races)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16::jsonb)
+                $13, $14, $15, $16::jsonb, $17)
         RETURNING id
         """,
         season_id, tier_id, driver_id, team_id, offered_by,
         offer_kind, salary, term_seasons, contract_type,
         signing_bonus, incentives, message, state,
         parent_offer_id, expires_at, json.dumps(validation or {}),
+        term_races,
     )
 
 
@@ -1944,6 +1960,7 @@ async def update_contract_terms(
     contract_value: Decimal,
     term_seasons: int,
     signing_bonus: Decimal,
+    term_races: int | None = None,
 ) -> None:
     """
     Extension path: overwrite the money terms on an ACTIVE contract in
@@ -1951,15 +1968,33 @@ async def update_contract_terms(
     column, but every change is captured in the ledger (kind =
     'contract_extended'), so the audit trail is intact even without
     versioning the row.
+
+    `term_races` is the authoritative term since migration 015. Omitting
+    it leaves the existing race term untouched, which is what this did
+    before offers carried a race term — and which meant an extension's
+    agreed length was recorded in seasons but never actually applied to
+    how long the deal ran. Pass it to extend the deal for real.
     """
+    if term_races is None:
+        await conn.execute(
+            """
+            UPDATE contracts
+            SET contract_value = $1, term_seasons = $2,
+                signing_bonus = $3, season_index = 1
+            WHERE id = $4 AND state = 'active'
+            """,
+            contract_value, term_seasons, signing_bonus, contract_id,
+        )
+        return
     await conn.execute(
         """
         UPDATE contracts
         SET contract_value = $1, term_seasons = $2, signing_bonus = $3,
-            season_index = 1
+            season_index = 1, term_races = $5
         WHERE id = $4 AND state = 'active'
         """,
         contract_value, term_seasons, signing_bonus, contract_id,
+        term_races,
     )
 
 

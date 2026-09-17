@@ -221,12 +221,18 @@ _DEFAULT_LEAGUE_CONFIG: dict[str, object] = {
     # runs a 12-race split season needs its own number and every
     # per-race salary charge divides by this.
     "races_per_season": 24,
-    # Five races is the shortest deal the league recognises and two full
-    # seasons the longest. Deliberately NOT 1 and 72: a one-race contract
-    # is a free look at a driver with no commitment, which is what the
-    # premiums exist to discourage. Both are commissioner-editable.
+    # Five races is the shortest deal the league recognises. Deliberately
+    # NOT 1: a one-race contract is a free look at a driver with no
+    # commitment, which is what the premiums exist to discourage.
     "min_term_races": 5,
-    "max_term_races": 48,
+    # The ceiling MUST equal max_term_seasons x races_per_season. It was
+    # 48 ("two full seasons") while max_term_seasons said 3, so a TP could
+    # type the 3-season term the league has always allowed and be refused
+    # with "Term of 72 races exceeds the league maximum of 48" -- a limit
+    # in a unit nobody had been shown. Derived here so the two bounds
+    # cannot drift apart again; `test_presets.py` asserts the identity.
+    # Both are commissioner-editable.
+    "max_term_races": 3 * 24,
     # ── contract premiums (Phase 9) — UNTUNED PLACEHOLDERS
     # Zero means no price floor above the driver's market value, which is
     # exactly how the first seven seasons of this league priced contracts.

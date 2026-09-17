@@ -197,12 +197,25 @@ def test_the_offer_deadline_column_is_not_nullable():
     ever relaxes it. Kept as a test so that if someone does relax it,
     this fails loudly and the renderer gets the guard it would then
     need.
+
+    This used to assert that no migration contained ANY
+    `ALTER TABLE contract_offers` at all. That was a proxy for the real
+    rule and it was too wide: 018 adds a `term_races` column, which is
+    both legal and necessary, and the proxy refused it while saying
+    nothing about nullability. The assertion below is the actual rule —
+    nothing may drop `expires_at` or relax it to NULL.
     """
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parent.parent / "migrations"
     init = (root / "008_contracts_and_offers.sql").read_text()
     assert "expires_at      TIMESTAMPTZ NOT NULL" in init
+    forbidden = (
+        "alter column expires_at drop not null",
+        "drop column expires_at",
+        "drop column if exists expires_at",
+    )
     for sql in root.glob("*.sql"):
-        text = sql.read_text().lower()
-        assert "alter table contract_offers" not in text, sql.name
+        text = " ".join(sql.read_text().lower().split())
+        for phrase in forbidden:
+            assert phrase not in text, f"{sql.name}: {phrase}"

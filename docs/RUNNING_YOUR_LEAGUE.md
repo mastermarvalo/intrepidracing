@@ -1,8 +1,9 @@
 # Running your league — the owner's runbook
 
-**Version 3.** Covers the race-term and escrow economics, the full
+**Version 4.** Covers the race-term and escrow economics, the full
 team lifecycle in the panel, enforced cap adjustments, honest board
-reporting, and the carry-over ordering guard.
+reporting, the carry-over ordering guard, and what unit a Team
+Principal actually offers a contract in (§8).
 
 This is the operator guide. It takes you from an empty server to a
 running driver market, then through a race night, then through the end
@@ -514,6 +515,53 @@ What this changes in practice:
 Migrating from the old model, every existing contract is converted at
 `term_races = term_seasons × races per season`, so nobody's deal gets
 shorter or longer than what was agreed.
+
+### What a Team Principal actually types
+
+**The offer form asks for a term in races.** A Team Principal types `10`
+and gets a ten-race deal. Races are the unit the contract actually runs
+in — service, escrow, settlement and `/contract status` have always been
+race-denominated — so the form now matches what is signed.
+
+Seasons are still accepted as a shorthand, because most deals are whole
+seasons and nobody wants to do arithmetic. Add an `s`:
+
+| A TP types | The offer becomes | Notes |
+|---|---|---|
+| `10` | 10 races | The plain number is races |
+| `10 races` or `10r` | 10 races | Same thing, spelled out |
+| `2s` or `2 seasons` | 48 races | In a 24-race season |
+| `1s` | 24 races | In a 24-race season |
+
+Anything the bot cannot read — a blank, `two`, `0`, a negative — is
+refused with a message, and the offer is not created.
+
+This is what makes your **minimum contract length** meaningful. Set it
+to 5 races and a TP can offer exactly that. Previously the shortest
+offerable term was one full season, so a 5-race minimum was a number
+that nothing could reach.
+
+Two other things still produce off-calendar terms, and always did:
+
+- **Carry-over**, which moves the true remainder (a 36-race deal in a
+  24-race season carries 12 races into the next one).
+- **Re-signing a driver mid-term**, where the guidance in §14 is to
+  match the races actually remaining.
+
+> **Set both maximums, and keep them consistent.** The race ceiling and
+> the season ceiling are enforced together, and an offer must satisfy
+> both. The F1 preset shipped with a 3-season maximum and a 48-race
+> ceiling, which meant the 3-season term the league had always allowed
+> was refused as "72 races exceeds the league maximum of 48". The preset
+> now derives the race ceiling from the season maximum so the two cannot
+> disagree. If you edit one, edit the other.
+
+> **What the term looks like once offered.** Offer cards and the signed
+> post show the term in races — "10 race(s)". When a term is an exact
+> number of whole seasons, the season count is shown alongside it: "48
+> race(s) (2 seasons)". A term that is neither, like 30 races, is shown
+> only in races, because calling it "2 seasons" would describe a deal 18
+> races longer than the one signed.
 
 ---
 
@@ -1059,6 +1107,21 @@ Nothing in this system deletes money history. Every movement is an
 append-only ledger row with a kind, an amount, and an actor. If a number
 looks wrong it can be traced, and corrections are additional rows rather
 than edits.
+
+---
+
+### "Every contract offer is refused"
+
+If a TP reports that *nothing* they offer is accepted, and the refusal
+names a race count they never typed — "Term of 1 race(s) is below the
+league minimum of 5" — you are on a build from before this was fixed.
+The offer form collected a term in seasons and handed the rules engine
+a term of one race, so every offer failed the minimum. Pull the latest
+and restart.
+
+If the refusal instead says a race term "exceeds the league maximum",
+check that your maximum contract length in races is a whole multiple of
+your races per season. See the boxed note in §8.
 
 ---
 
