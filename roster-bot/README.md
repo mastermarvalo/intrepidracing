@@ -435,6 +435,7 @@ driver mathematically cannot influence a Tier-1 value.
 | `/market-admin tier add <code> <label> <rank> [role] [color]` | Add a tier to the active season |
 | `/market-admin tier edit <code> ...` | Edit an existing tier (labels, roles, colors) |
 | `/market-admin tier list` | List tiers for the active season |
+| `/market-admin tier remove <code> [override]` | Remove a tier. Refuses if it has contract history; shows what would be destroyed and asks to confirm. `override: true` deletes the history too and requires typing the tier code |
 | `/market-admin config show [tier]` | Show league config (season default or tier override) |
 | `/market-admin config edit [tier]` | Edit money limits or contract rules (incl. min/max contract length) |
 | `/market-admin config channel <kind> <#channel> [tier]` | Set market / transactions / approvals channel |

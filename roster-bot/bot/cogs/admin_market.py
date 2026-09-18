@@ -6,7 +6,7 @@ Phase 1 surface:
   /market-admin season create <name> [preset]
   /market-admin season activate <name>
   /market-admin season list
-  /market-admin tier add|edit|list
+  /market-admin tier add|edit|list|remove
   /market-admin config show|edit|channel|role|free-agency
 
 Phase 2 surface:
@@ -67,6 +67,7 @@ from bot.market import driver_ops
 from bot.market import results as results_engine
 from bot.market.money import format_money, format_pl
 from bot.ui import offseason_screen, receipts
+from bot.ui.base import COLOR_WARN
 from bot.ui.config_modal import ConfigSectionView, build_config_embed
 
 log = logging.getLogger(__name__)
@@ -646,6 +647,52 @@ class AdminMarketCog(commands.Cog):
             lines.append(f"`{t.code}` · **{t.label}** · rank {t.rank_order} · {role}{color}")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @tier.command(
+        name="remove",
+        description="Remove a tier from the active season (asks first)",
+    )
+    @app_commands.describe(
+        code="Tier code to remove",
+        override=(
+            "Also delete contract history that would otherwise block it. "
+            "Cannot be undone."
+        ),
+    )
+    async def tier_remove(
+        self,
+        interaction: discord.Interaction,
+        code: str,
+        override: bool = False,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        try:
+            preview = await workflow.preview_tier_removal(
+                guild_id=interaction.guild_id, code=code
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        if preview.needs_override and not override:
+            await interaction.response.send_message(
+                embed=_tier_removal_embed(preview, override=False),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            embed=_tier_removal_embed(preview, override=override),
+            view=_ConfirmRemoveTierView(
+                preview=preview,
+                override=override,
+                opener_id=interaction.user.id,
+            ),
+            ephemeral=True,
+        )
 
     # ── /market-admin config ─────────────────────────────────────────────
 
@@ -2583,3 +2630,201 @@ def _render_carry_over(result: approvals.CarryOverResult) -> discord.Embed:
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(AdminMarketCog(bot))
+
+
+# ── tier removal ─────────────────────────────────────────────────────
+
+
+def _tier_removal_embed(preview, *, override: bool) -> discord.Embed:
+    """
+    The inventory an admin sees before anything is deleted.
+
+    Cascade losses get equal billing with blockers on purpose. Blockers
+    announce themselves by refusing; cascades are the quiet ones, and
+    they are what actually surprises people — a tier delete takes its
+    drivers and valuations with it and nothing else would say so.
+    """
+    if preview.needs_override and not override:
+        embed = discord.Embed(
+            title=f"Cannot remove {preview.label}",
+            description=(
+                f"`{preview.code}` in **{preview.season_name}** still has "
+                f"contract history. Removing it would delete that history "
+                f"too, so it is refused by default."
+            ),
+            color=COLOR_WARN,
+        )
+    else:
+        if preview.is_empty:
+            detail = "This tier is empty — nothing else is affected."
+        elif override:
+            detail = (
+                "**This cannot be undone.** Everything below is deleted "
+                "permanently, including contract history."
+            )
+        else:
+            detail = "Check what goes with it before confirming."
+        embed = discord.Embed(
+            title=(
+                f"Permanently delete {preview.label}?"
+                if override and not preview.is_empty
+                else f"Remove {preview.label}?"
+            ),
+            description=f"`{preview.code}` in **{preview.season_name}**. {detail}",
+            color=discord.Color.dark_red() if override else COLOR_WARN,
+        )
+
+    if preview.blockers:
+        embed.add_field(
+            name=(
+                "🛑 Contract history"
+                + (" — WILL BE DELETED" if override else " — blocks removal")
+            ),
+            value="\n".join(
+                f"• {n} {label}" for label, n in preview.blockers.items()
+            ),
+            inline=False,
+        )
+    if preview.cascade_losses:
+        embed.add_field(
+            name="⚠️ Deleted along with the tier",
+            value="\n".join(
+                f"• {n} {label}" for label, n in preview.cascade_losses.items()
+            ),
+            inline=False,
+        )
+    if preview.teams_unlinked:
+        embed.add_field(
+            name="Teams",
+            value=(
+                f"{preview.teams_unlinked} team(s) are linked to this tier. "
+                f"They will be **unlinked, not deleted**."
+            ),
+            inline=False,
+        )
+
+    if preview.needs_override and not override:
+        embed.add_field(
+            name="If you still want to",
+            value=(
+                f"Move or release the drivers first, or re-run with "
+                f"`override: true`:\n"
+                f"`/market-admin tier remove code: {preview.code} "
+                f"override: True`"
+            ),
+            inline=False,
+        )
+    elif override:
+        embed.set_footer(
+            text="Override — contract history is deleted permanently. "
+                 "You will be asked to type the tier code."
+        )
+    return embed
+
+
+class _ConfirmRemoveTierView(discord.ui.View):
+    """
+    Confirmation gate. A plain removal takes one button press; an
+    override additionally requires typing the tier code, because the
+    two cases differ by "some rows vanish" versus "the league's money
+    history vanishes" and should not cost the same single click.
+    """
+
+    def __init__(self, *, preview, override: bool, opener_id: int) -> None:
+        super().__init__(timeout=120)
+        self._preview = preview
+        self._override = override
+        self._opener_id = opener_id
+        self._button.label = (
+            "Delete tier and history" if override else "Remove tier"
+        )
+
+    async def interaction_check(
+        self, interaction: discord.Interaction
+    ) -> bool:
+        if interaction.user.id != self._opener_id:
+            await interaction.response.send_message(
+                "This confirmation is not yours.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Remove tier", style=discord.ButtonStyle.danger)
+    async def _button(
+        self, interaction: discord.Interaction, _b: discord.ui.Button
+    ) -> None:
+        if self._override:
+            await interaction.response.send_modal(
+                _TypeTheCodeModal(
+                    preview=self._preview, parent=self
+                )
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _finish_tier_removal(
+            interaction, preview=self._preview, override=False
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def _cancel(
+        self, interaction: discord.Interaction, _b: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Cancelled — nothing was removed.", embed=None, view=None
+        )
+        self.stop()
+
+
+class _TypeTheCodeModal(discord.ui.Modal, title="Confirm tier deletion"):
+    def __init__(self, *, preview, parent) -> None:
+        super().__init__()
+        self._preview = preview
+        # Not `self._parent`: discord.py uses that name internally on UI
+        # components, and shadowing it breaks the component. `_owner` is
+        # the convention used elsewhere in this codebase.
+        self._owner = parent
+        self._entry = discord.ui.TextInput(
+            label=f"Type {preview.code} to confirm",
+            placeholder=preview.code,
+            required=True,
+            max_length=64,
+        )
+        self.add_item(self._entry)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        typed = self._entry.value.strip().lower()
+        if typed != self._preview.code.lower():
+            await interaction.response.send_message(
+                f"That does not match `{self._preview.code}`. "
+                f"Nothing was removed.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _finish_tier_removal(
+            interaction, preview=self._preview, override=True
+        )
+        self._owner.stop()
+
+
+async def _finish_tier_removal(
+    interaction: discord.Interaction, *, preview, override: bool
+) -> None:
+    try:
+        label = await workflow.remove_tier(
+            guild_id=interaction.guild_id,
+            code=preview.code,
+            override=override,
+        )
+    except workflow.WorkflowError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+    note = (
+        " Contract history was deleted."
+        if override
+        else ""
+    )
+    await interaction.followup.send(
+        f"✅ Removed **{label}** (`{preview.code}`).{note}", ephemeral=True
+    )

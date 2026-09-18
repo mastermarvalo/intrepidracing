@@ -996,6 +996,8 @@ one model, enter the whole grid fresh at a season boundary.
 | Repost or fix the market boards | `/league` → Boards, or `/market-admin board refresh` |
 | Add or fix a Google Sheets board | `/league` → Setup → Boards → Google Sheets boards |
 | Create, edit or delete a team | `/league` → Setup → Teams |
+| Add or edit a tier | `/market-admin tier add` / `tier edit` |
+| Remove a tier | `/market-admin tier remove <code>` — see §17.1 |
 | Stop mid-season poaching | `/market-admin config free-agency state: closed` |
 
 `budget adjust` changes how much cash a team **has**. `adjust-cap`
@@ -1019,6 +1021,64 @@ Payroll if signed     $151.25M
 Adjustments are cumulative per season and every one writes an audit
 row, so a grant made three months ago still shows up in the arithmetic
 with its note attached.
+
+### 17.1 Removing a tier
+
+`/market-admin tier remove code: t3`
+
+Removing a tier is the most destructive thing the bot will do, so it
+never happens on one click. The command shows you an inventory first
+and waits for you to confirm.
+
+**Two different dangers, and the bot treats them differently.**
+
+Some records *refuse* the removal: contracts, contract offers, ledger
+rows and dead money. The database itself will not let a tier go while
+they exist, which is the correct instinct — that is your league's money
+history.
+
+Others are deleted *silently*: drivers, valuation runs, league config,
+market boards, results config, race rounds and budget config. Nothing
+stops these, which is exactly why the confirmation lists them. Removing
+a tier with twelve drivers in it deletes twelve drivers, and this screen
+is the only thing that will tell you so.
+
+**Teams are never deleted.** A team attached to the tier is unlinked and
+survives with all its history. Losing your grid because you tidied up a
+tier would be absurd.
+
+So there are three outcomes:
+
+| The tier has | What happens |
+|---|---|
+| Nothing | Confirm once, it is gone |
+| Drivers, boards, config, results | Inventory shown, confirm once, they go with it |
+| Any contract history | **Refused.** You are told what blocks it |
+
+**The override.** If you genuinely want a tier gone along with its
+contract history:
+
+```text
+/market-admin tier remove code: t3 override: True
+```
+
+This deletes the contracts, offers, ledger rows and dead money for that
+tier. It cannot be undone and there is no backup unless you made one.
+Because of that it asks twice: the confirmation button is relabelled
+**Delete tier and history**, and pressing it opens a box where you must
+type the tier code exactly. Typing anything else cancels.
+
+The override only ever touches the one tier. Other tiers keep their
+contracts, drivers and history untouched.
+
+> **Before you reach for the override**, consider whether you need it.
+> A tier you have stopped using costs nothing to leave in place, and it
+> keeps the records readable. If the problem is that the tier is wrong
+> rather than unwanted, `/market-admin tier edit` changes the label,
+> rank and role without touching anything else. And if you are
+> restructuring for next year, simply build the new season with the
+> tiers you want — seasons are the natural boundary for this, and
+> nothing is destroyed.
 
 ---
 

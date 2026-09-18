@@ -1824,6 +1824,118 @@ async def list_teams(guild_id: int) -> list[TeamForPanel]:
     return out
 
 
+@dataclass(frozen=True)
+class TierRemovalPreview:
+    """
+    What removing a tier would cost, gathered before anything changes.
+
+    `blockers` refuse the delete outright. `cascade_losses` do not —
+    Postgres removes them silently — which is exactly why they are
+    surfaced. `teams_unlinked` are detached, never deleted.
+    """
+
+    tier_id: int
+    code: str
+    label: str
+    season_name: str
+    blockers: dict[str, int]
+    cascade_losses: dict[str, int]
+    teams_unlinked: int
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.blockers and not self.cascade_losses
+
+    @property
+    def needs_override(self) -> bool:
+        return bool(self.blockers)
+
+
+def _describe_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{n} {label}" for label, n in counts.items())
+
+
+async def preview_tier_removal(
+    *, guild_id: int, code: str
+) -> TierRemovalPreview:
+    """Inventory a tier removal without touching anything."""
+    code = code.strip().lower()
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError(
+                "No active season. Create and activate one first."
+            )
+        tier = await queries.fetch_tier(conn, season.id, code)
+        if tier is None:
+            raise WorkflowError(
+                f"No tier `{code}` in **{season.name}**. "
+                f"`/market-admin tier list` shows what exists."
+            )
+        return TierRemovalPreview(
+            tier_id=tier.id,
+            code=tier.code,
+            label=tier.label,
+            season_name=season.name,
+            blockers=await queries.fetch_tier_delete_blockers(conn, tier.id),
+            cascade_losses=await queries.fetch_tier_cascade_losses(
+                conn, tier.id
+            ),
+            teams_unlinked=await queries.fetch_teams_linked_to_tier(
+                conn, tier.id
+            ),
+        )
+
+
+async def remove_tier(
+    *, guild_id: int, code: str, override: bool = False
+) -> str:
+    """
+    Remove a tier from the active season. Returns its display label.
+
+    Without `override` this refuses any tier that still has contract
+    history, because deleting it would take the league's money records
+    with it — the same reasoning as `remove_team`.
+
+    With `override` the contract history is deleted too. That is not
+    recoverable, so the caller is expected to have shown the admin the
+    full inventory and collected a typed confirmation first. This
+    function does not itself prompt; it is the Discord-free half.
+
+    The preview is re-read inside the write connection rather than
+    trusted from the caller: an offer can be submitted between the
+    confirmation prompt and the button press, and a stale "0 contracts"
+    must not be what authorises a purge.
+    """
+    code = code.strip().lower()
+    async with db.connect() as conn:
+        season = await queries.fetch_active_season(conn, guild_id)
+        if season is None:
+            raise WorkflowError(
+                "No active season. Create and activate one first."
+            )
+        tier = await queries.fetch_tier(conn, season.id, code)
+        if tier is None:
+            raise WorkflowError(f"No tier `{code}` in **{season.name}**.")
+
+        blockers = await queries.fetch_tier_delete_blockers(conn, tier.id)
+        async with conn.transaction():
+            if blockers and not override:
+                raise WorkflowError(
+                    f"**{tier.label}** (`{tier.code}`) cannot be removed — "
+                    f"it still has {_describe_counts(blockers)}. Removing "
+                    f"it would take that history with it.\n\n"
+                    f"Move or release its drivers first, or re-run with "
+                    f"`override: true` to delete the tier and its history "
+                    f"anyway. The override cannot be undone."
+                )
+            if override:
+                await queries.purge_tier(conn, tier.id)
+            else:
+                await queries.delete_tier(conn, tier.id)
+    return tier.label
+
+
 async def remove_team(client, *, guild_id: int, team_key: str) -> str:
     """
     Delete a team and best-effort delete its roster message.
