@@ -549,6 +549,136 @@ async def fetch_all_tiers(conn: asyncpg.Connection, season_id: int) -> list[Tier
     return [_row_to_tier(r) for r in rows]
 
 
+#: Tables referencing `tiers(id)` WITHOUT `ON DELETE CASCADE`. A row in
+#: any of them makes a plain `DELETE FROM tiers` raise a foreign-key
+#: violation, so they are counted and explained rather than letting
+#: asyncpg surface "ForeignKeyViolationError" to an admin.
+#:
+#: `teams` is deliberately absent: `teams.tier_id` is a nullable, optional
+#: attachment, so a team is UNLINKED from the tier rather than deleted.
+#: Deleting a league's teams because a tier was removed would be
+#: catastrophic and is never what an admin means.
+TIER_DELETE_BLOCKERS = (
+    ("contracts", "contracts"),
+    ("contract offers", "contract_offers"),
+    ("ledger rows", "contract_ledger"),
+    ("dead money rows", "dead_money"),
+)
+
+#: Tables referencing `tiers(id)` WITH `ON DELETE CASCADE`. These do NOT
+#: block the delete — Postgres removes them silently. That is precisely
+#: why they are counted: an admin deserves to see that removing a tier
+#: also destroys its drivers and valuations, which nothing would
+#: otherwise tell them.
+TIER_CASCADE_LOSSES = (
+    ("drivers", "drivers"),
+    ("valuation runs", "valuation_runs"),
+    ("league config rows", "league_config"),
+    ("market boards", "market_boards"),
+    ("results config rows", "results_config"),
+    ("race rounds", "race_rounds"),
+    ("budget config rows", "budget_config"),
+)
+
+
+async def _count_by_tier(
+    conn: asyncpg.Connection, spec, tier_id: int
+) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for label, table in spec:
+        count = await conn.fetchval(
+            f"SELECT COUNT(*) FROM {table} WHERE tier_id = $1",  # noqa: S608
+            tier_id,
+        )
+        if count:
+            out[label] = int(count)
+    return out
+
+
+async def fetch_tier_delete_blockers(
+    conn: asyncpg.Connection, tier_id: int
+) -> dict[str, int]:
+    """
+    Label → row count for everything that would refuse a tier delete.
+
+    Only non-empty counts are returned, so an empty dict means no
+    foreign key stands in the way.
+    """
+    return await _count_by_tier(conn, TIER_DELETE_BLOCKERS, tier_id)
+
+
+async def fetch_tier_cascade_losses(
+    conn: asyncpg.Connection, tier_id: int
+) -> dict[str, int]:
+    """
+    Label → row count for everything a tier delete would silently take
+    with it. Nothing here blocks the delete; that is the danger.
+    """
+    return await _count_by_tier(conn, TIER_CASCADE_LOSSES, tier_id)
+
+
+async def fetch_teams_linked_to_tier(
+    conn: asyncpg.Connection, tier_id: int
+) -> int:
+    return int(
+        await conn.fetchval(
+            "SELECT COUNT(*) FROM teams WHERE tier_id = $1", tier_id
+        )
+    )
+
+
+async def delete_tier(conn: asyncpg.Connection, tier_id: int) -> None:
+    """
+    Delete a tier that nothing blocks. Cascades still apply, so the
+    caller is responsible for having shown the admin what they lose.
+    """
+    await conn.execute(
+        "UPDATE teams SET tier_id = NULL WHERE tier_id = $1", tier_id
+    )
+    await conn.execute("DELETE FROM tiers WHERE id = $1", tier_id)
+
+
+async def purge_tier(conn: asyncpg.Connection, tier_id: int) -> None:
+    """
+    Delete a tier AND the contract history that would otherwise refuse
+    it. This destroys an audit trail and is only reachable behind an
+    explicit override plus a typed confirmation.
+
+    Order matters, and not only for the tier's own rows:
+
+    * `trade_items.contract_id` has no cascade, so trade line items
+      referencing this tier's contracts must go before the contracts do
+      — even though `trade_items` has no `tier_id` of its own and never
+      appears in the blocker count.
+    * `contract_offers.parent_offer_id` is a self-reference with no
+      cascade. Counter-offers form parent→child chains, so the link is
+      broken before the rows are removed rather than relying on
+      statement-level constraint timing.
+    * `teams` is unlinked, never deleted.
+    """
+    await conn.execute(
+        "UPDATE teams SET tier_id = NULL WHERE tier_id = $1", tier_id
+    )
+    await conn.execute(
+        "DELETE FROM trade_items WHERE contract_id IN "
+        "(SELECT id FROM contracts WHERE tier_id = $1)",
+        tier_id,
+    )
+    await conn.execute(
+        "DELETE FROM contract_ledger WHERE tier_id = $1", tier_id
+    )
+    await conn.execute("DELETE FROM dead_money WHERE tier_id = $1", tier_id)
+    await conn.execute(
+        "UPDATE contract_offers SET parent_offer_id = NULL WHERE tier_id = $1",
+        tier_id,
+    )
+    await conn.execute(
+        "DELETE FROM contract_offers WHERE tier_id = $1", tier_id
+    )
+    await conn.execute("DELETE FROM contracts WHERE tier_id = $1", tier_id)
+    await conn.execute("DELETE FROM tiers WHERE id = $1", tier_id)
+
+
 async def update_tier(
     conn: asyncpg.Connection,
     tier_id: int,
