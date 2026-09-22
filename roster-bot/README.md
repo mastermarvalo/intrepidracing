@@ -450,6 +450,7 @@ driver mathematically cannot influence a Tier-1 value.
 | `/market-admin valuation preview <run_id>` | Re-show a run's preview |
 | `/market-admin valuation publish <run_id>` | Flip a dry-run to published — makes it the live market value |
 | `/market-admin valuation list [tier]` | 20 most recent runs |
+| `/market-admin driver set-value <member> <tier> <value_m> <reason>` | Manually override one driver's market value, bypassing the movement caps. Shows a confirm screen with warnings first; publishes a new run for the tier that carries every other driver's value forward unchanged. Reason is mandatory and is kept permanently. Also at `/league` → Drivers → **Set value** |
 
 A run now prices the round whose `round_label` you pass, if results for
 that label have been imported (see **Race results** below). With no

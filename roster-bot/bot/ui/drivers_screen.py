@@ -2,8 +2,8 @@
 Driver enrolment + per-driver admin actions.
 
 `/market-admin driver add|sync|sync-all` back the enrolment surface;
-`/market-admin void|set-status|promote|relegate` back the per-driver
-actions. This screen is the guided front for both.
+`/market-admin void|set-status|promote|relegate|driver set-value` back
+the per-driver actions. This screen is the guided front for both.
 
 The list surface offers:
   * **Enrol member** — a three-step wizard (tier → member → status) so a
@@ -29,6 +29,8 @@ must stay Discord-free — but it never touches queries directly.
 """
 
 from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
 
 import discord
 
@@ -60,7 +62,7 @@ _ALL_TIERS = "__all__"
 # everything must still say where the rest lives.
 _DRIVER_TYPED_FALLBACK = (
     "Typed fallback: `/market-admin admin set-status` · `admin void` · "
-    "`admin promote` · `admin relegate`."
+    "`admin promote` · `admin relegate` · `driver set-value`."
 )
 
 _PROMOTE = "promote"
@@ -803,6 +805,7 @@ class _DriverDetailView(AdminOwnedView):
         self.add_item(_SetStatusButton())
         self.add_item(_MoveTierButton(label="Promote", direction=_PROMOTE))
         self.add_item(_MoveTierButton(label="Relegate", direction=_RELEGATE))
+        self.add_item(_SetValueButton())
         self.add_item(BackButton(self._back, row=1))
 
     async def _back(self, interaction: discord.Interaction) -> None:
@@ -892,6 +895,185 @@ class _VoidNoteModal(base.PanelModal, title="Void contract"):
                 f"✅ Voided **{outcome.display_name}**'s contract"
                 f"{where}.{tail}"
             ),
+        )
+
+
+class _SetValueButton(discord.ui.Button):
+    """
+    Manual price for one driver.
+
+    The engine is normally the only thing that sets a value, so this is
+    the escape hatch for the case it gets wrong — a bad results import,
+    a driver the engine has no history for, a number the commissioners
+    simply disagree with.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Set value", style=discord.ButtonStyle.secondary, row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        assert isinstance(view, _DriverDetailView)
+        await interaction.response.send_modal(_SetValueModal(view))
+
+
+class _SetValueModal(base.PanelModal, title="Set market value"):
+    def __init__(self, parent: _DriverDetailView) -> None:
+        super().__init__()
+        self.parent = parent
+        current = parent.detail.market_value
+        self.value_m = discord.ui.TextInput(
+            label="New market value ($M)",
+            placeholder=(
+                f"currently {format_money(current)}"
+                if current is not None
+                else "e.g. 20.75"
+            ),
+            required=True,
+            max_length=20,
+        )
+        self.reason = discord.ui.TextInput(
+            label="Reason (kept permanently)",
+            placeholder="e.g. corrected a bad results import",
+            required=True,
+            max_length=200,
+        )
+        self.add_item(self.value_m)
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        raw = str(self.value_m.value).strip().lstrip("$").rstrip("Mm")
+        try:
+            new_value = Decimal(raw)
+        except InvalidOperation:
+            await report_error(
+                interaction,
+                f"Could not read `{self.value_m.value}` as an amount. "
+                f"Enter millions, e.g. `20.75`.",
+            )
+            return
+
+        try:
+            preview = await workflow.preview_value_override(
+                guild_id=interaction.guild_id,
+                tier=self.parent.detail.tier_code,
+                member_id=self.parent.detail.member_id,
+                new_value=new_value,
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+
+        # A modal cannot open another modal, but it can post a view —
+        # so the confirm step lands as a followup rather than being
+        # skipped. Overrides bypass the movement caps, so the admin sees
+        # what they are about to publish before it is published.
+        reason = str(self.reason.value).strip()
+        await interaction.followup.send(
+            embed=_build_set_value_embed(preview, reason=reason),
+            view=_SetValueConfirmView(parent=self.parent, preview=preview,
+                                      reason=reason),
+            ephemeral=True,
+        )
+
+
+def _build_set_value_embed(
+    preview: workflow.ValueOverridePreview, *, reason: str
+) -> discord.Embed:
+    """The proposed change, its consequences, and anything unusual."""
+    if preview.is_first_value:
+        headline = (
+            f"**{preview.display_name}** has no published value yet — "
+            f"this sets their first, at {format_money(preview.new_value)}."
+        )
+    else:
+        headline = (
+            f"**{preview.display_name}**: "
+            f"{format_money(preview.current_value)} → "
+            f"**{format_money(preview.new_value)}** "
+            f"({format_pl(preview.delta)})"
+        )
+    embed = discord.Embed(
+        title="Set market value?",
+        description=truncate_field(
+            f"{preview.tier_label} (`{preview.tier_code}`)\n\n{headline}"
+        ),
+        color=COLOR_WARN if preview.warnings else COLOR_INFO,
+    )
+    embed.add_field(name="Reason", value=truncate_field(reason), inline=False)
+    if preview.warnings:
+        embed.add_field(
+            name="⚠ Worth knowing",
+            value=truncate_field("\n".join(f"• {w}" for w in preview.warnings)),
+            inline=False,
+        )
+    if preview.carried_count:
+        embed.add_field(
+            name="How this is applied",
+            value=truncate_field(
+                f"Publishes a new valuation run for `{preview.tier_code}`. "
+                f"The other {preview.carried_count - 1} driver(s) keep "
+                f"their current values, with no movement recorded."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="Recorded permanently and attributed to you.")
+    return embed
+
+
+class _SetValueConfirmView(AdminOwnedView):
+    """Confirm the override. Reversible, so no type-the-name gate."""
+
+    def __init__(
+        self,
+        *,
+        parent: _DriverDetailView,
+        preview: workflow.ValueOverridePreview,
+        reason: str,
+    ) -> None:
+        super().__init__(opener_id=parent.opener_id)
+        self.parent = parent
+        self.preview = preview
+        self.reason = reason
+
+    @discord.ui.button(label="Set value", style=discord.ButtonStyle.primary)
+    async def _confirm(
+        self, interaction: discord.Interaction, _b: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await workflow.apply_value_override(
+                interaction.client,
+                guild_id=interaction.guild_id,
+                tier=self.preview.tier_code,
+                member_id=self.parent.detail.member_id,
+                new_value=self.preview.new_value,
+                reason=self.reason,
+                actor_id=interaction.user.id,
+            )
+        except workflow.WorkflowError as exc:
+            await report_error(interaction, str(exc))
+            return
+        self.stop()
+        await interaction.edit_original_response(
+            content=(
+                f"✅ **{result.display_name}** is now valued at "
+                f"{format_money(result.new_value)}. Boards updated."
+            ),
+            embed=None,
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def _cancel(
+        self, interaction: discord.Interaction, _b: discord.ui.Button
+    ) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content="Cancelled — the value is unchanged.", embed=None, view=None
         )
 
 

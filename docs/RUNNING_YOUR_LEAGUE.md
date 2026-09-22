@@ -653,6 +653,52 @@ That is deliberate. Don't try to merge them.
 
 ---
 
+### 9.1 Overriding a value by hand
+
+Everything above is the engine's opinion. Sometimes the engine is
+wrong: a results import had the wrong finishing order, a driver
+transferred in with no history for the engine to work from, or the
+commissioners simply disagree with a number. You can set a value
+directly.
+
+```text
+/market-admin driver set-value member: @Zeezin tier: t1 value_m: 20.75 reason: corrected a bad R4 import
+```
+
+Or from the panel: `/league` → **Drivers** → pick the driver →
+**Set value**.
+
+Either route shows you the change before it is applied — the old value,
+the new one, the movement, and anything unusual about it — and nothing
+is written until you confirm.
+
+**An override is not capped.** The weekly and exceptional movement
+limits from §9 exist to stop the engine lurching; an override is you
+deliberately overruling the engine, so the number you type is the
+number you get. If it is a very large jump, or lands outside the
+minimum or maximum salary, the confirm screen says so and lets you
+continue anyway. Negative values are refused, and the reason field is
+mandatory — it is the whole audit trail.
+
+**What it actually writes.** An override publishes a new valuation run
+for that tier. Everyone else in the tier carries their current value
+forward unchanged, with no movement recorded, so the market board
+stays complete and the movers board shows only the driver you
+repriced. This is worth knowing for one reason: if a scheduled
+valuation run publishes after your override, it prices off the new
+value — it does not undo it, but it can move away from it.
+
+**If the driver is under contract**, repricing them changes the P/L
+their team settles at when that contract completes. The confirm screen
+warns you. Overrides are logged permanently against the driver with
+your name and your reason, so an override late in a season is visible
+rather than mysterious.
+
+Overriding back is the fix for a mistaken override — set the value
+again. Nothing is destroyed; each override is a new run on top.
+
+---
+
 ## 11. The first valuation
 
 Every driver needs a value before anyone can be offered a contract.
@@ -991,6 +1037,7 @@ one model, enter the whole grid fresh at a season boundary.
 | Release a driver | `/contract release <contract_id> <note>` |
 | Buy a driver out | `/contract buyout <contract_id> <buyout_m> <note>` |
 | Move a driver up or down a tier, contract included | `/market-admin promote` / `relegate` |
+| Override one driver's market value | `/market-admin driver set-value @driver <tier> <value_m> <reason>`, or `/league` → Drivers → pick driver → **Set value** — see §9.1 |
 | Correct a team's cash | `/market-admin budget adjust <team> <delta_m> <note>` |
 | Change one team's spending ceiling | `/market-admin adjust-cap <team> <delta_m> <note>`, or `/league` → Setup → Teams |
 | Repost or fix the market boards | `/league` → Boards, or `/market-admin board refresh` |

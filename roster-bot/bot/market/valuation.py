@@ -234,3 +234,155 @@ def _rank_key(v: DriverValuation) -> tuple[Decimal, int]:
     # Higher market value first; stable tiebreak on driver_id so the
     # ranking is deterministic across runs.
     return (-v.market_value, v.driver_id)
+
+
+# ── Manual overrides ────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CarriedValue:
+    """A driver's standing value, as the previous published run left it."""
+
+    driver_id: int
+    display_name: str
+    market_value: Decimal
+
+
+@dataclass(frozen=True)
+class OverrideRow:
+    """One row of an override run, ready to persist."""
+
+    driver_id: int
+    market_value: Decimal
+    previous_value: Decimal | None
+    delta: Decimal
+    rank_in_tier: int
+    capped: bool
+    breakdown: list[dict[str, object]]
+
+
+def build_override_rows(
+    *,
+    carried: Sequence[CarriedValue],
+    target_driver_id: int,
+    new_value: Decimal,
+    reason: str,
+    actor_id: int,
+) -> list[OverrideRow]:
+    """
+    Build the full row set for a manual override run.
+
+    Every driver in `carried` gets a row. That is not incidental: the
+    market board renders *all* rows of the tier's latest published run,
+    so a run containing only the overridden driver would erase everyone
+    else from the board. Carried drivers keep their value, and their
+    delta is zero so the movers board does not invent movement that
+    never happened.
+
+    Movement caps are deliberately not applied. An override exists
+    precisely for the cases the engine's guardrails get wrong, and a
+    cap that silently clipped the number the admin typed would be worse
+    than refusing outright. The caller is responsible for warning about
+    a large jump; the engine records it faithfully.
+
+    Ranks are recomputed across the new values, so an override moves
+    the driver up or down the table immediately rather than leaving a
+    stale ordering behind.
+    """
+    zero = Decimal("0")
+    target_seen = False
+    priced: list[tuple[Decimal, int, OverrideRow]] = []
+
+    for row in carried:
+        if row.driver_id == target_driver_id:
+            target_seen = True
+            previous = row.market_value
+            priced.append((
+                new_value,
+                row.driver_id,
+                OverrideRow(
+                    driver_id=row.driver_id,
+                    market_value=new_value,
+                    previous_value=previous,
+                    delta=round_money(new_value - previous),
+                    rank_in_tier=0,
+                    capped=False,
+                    breakdown=_override_breakdown(
+                        reason=reason, actor_id=actor_id, previous=previous
+                    ),
+                ),
+            ))
+        else:
+            priced.append((
+                row.market_value,
+                row.driver_id,
+                OverrideRow(
+                    driver_id=row.driver_id,
+                    market_value=row.market_value,
+                    previous_value=row.market_value,
+                    delta=zero,
+                    rank_in_tier=0,
+                    capped=False,
+                    breakdown=_carried_breakdown(),
+                ),
+            ))
+
+    if not target_seen:
+        # First value this driver has ever had: no previous, and the
+        # delta is zero rather than the full amount, so the movers
+        # board does not report a brand-new driver as the biggest
+        # riser of the cycle.
+        priced.append((
+            new_value,
+            target_driver_id,
+            OverrideRow(
+                driver_id=target_driver_id,
+                market_value=new_value,
+                previous_value=None,
+                delta=zero,
+                rank_in_tier=0,
+                capped=False,
+                breakdown=_override_breakdown(
+                    reason=reason, actor_id=actor_id, previous=None
+                ),
+            ),
+        ))
+
+    # Highest value is rank 1, with driver_id breaking ties — the same
+    # ordering `_rank_key` uses for computed runs, so an override does
+    # not quietly reshuffle equal-valued drivers.
+    priced.sort(key=lambda p: (-p[0], p[1]))
+    ranked: list[OverrideRow] = []
+    for index, (_value, _tiebreak, row) in enumerate(priced):
+        ranked.append(
+            OverrideRow(
+                driver_id=row.driver_id,
+                market_value=row.market_value,
+                previous_value=row.previous_value,
+                delta=row.delta,
+                rank_in_tier=index + 1,
+                capped=row.capped,
+                breakdown=row.breakdown,
+            )
+        )
+    return ranked
+
+
+def _override_breakdown(
+    *, reason: str, actor_id: int, previous: Decimal | None
+) -> list[dict[str, object]]:
+    return [{
+        "factor": "manual_override",
+        "label": "Manual override",
+        "reason": reason,
+        "actor_id": actor_id,
+        "previous_value": str(previous) if previous is not None else None,
+    }]
+
+
+def _carried_breakdown() -> list[dict[str, object]]:
+    return [{
+        "factor": "carried_forward",
+        "label": "Carried forward unchanged",
+        "reason": "Value unchanged by another driver's manual override",
+    }]
