@@ -40,10 +40,68 @@ class RosterBot(commands.Bot):
         # walks the tree.
         await self.load_extension("bot.cogs.panel")
         await self.load_extension("bot.events")
-        # Global sync — commands appear in all servers but propagation takes up to 1h.
-        # For faster dev iteration, call tree.sync(guild=discord.Object(id=YOUR_GUILD_ID)).
-        await self.tree.sync()
-        log.info("Command tree synced")
+        await self._sync_commands()
+
+    async def _sync_commands(self) -> None:
+        """
+        Publish the command tree to Discord.
+
+        A bare `tree.sync()` is a *global* sync, and Discord propagates
+        those lazily — up to an hour. For a single-server league that is
+        the wrong trade: every new command looks broken for an hour
+        after deploy, which is indistinguishable from a bug and sends
+        you hunting through logs for a problem that does not exist.
+
+        Setting `DISCORD_GUILD_ID` syncs to that one guild instead,
+        where Discord applies the change immediately. Left unset, the
+        behaviour is the old global sync, so an existing deployment
+        keeps working untouched.
+        """
+        guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
+        if not guild_id:
+            await self.tree.sync()
+            log.info(
+                "Command tree synced globally (%d commands). Discord may "
+                "take up to an hour to show new or changed commands. Set "
+                "DISCORD_GUILD_ID to your server ID for instant syncs.",
+                len(self.tree.get_commands()),
+            )
+            return
+
+        try:
+            target = discord.Object(id=int(guild_id))
+        except ValueError:
+            log.error(
+                "DISCORD_GUILD_ID=%r is not a number — falling back to a "
+                "global sync. Copy the ID from Discord with Developer Mode "
+                "on: right-click the server, Copy Server ID.",
+                guild_id,
+            )
+            await self.tree.sync()
+            return
+
+        # Mirror the globally-declared commands onto the guild, then sync
+        # the guild. Without the copy, the guild sync would publish an
+        # empty tree and every command would vanish from that server.
+        self.tree.copy_global_to(guild=target)
+        try:
+            synced = await self.tree.sync(guild=target)
+        except discord.Forbidden:
+            log.error(
+                "Not allowed to sync commands to guild %s — the bot is "
+                "probably not in that server, or was invited without the "
+                "applications.commands scope. Re-invite it with that "
+                "scope. Falling back to a global sync.",
+                guild_id,
+            )
+            await self.tree.sync()
+            return
+        log.info(
+            "Command tree synced to guild %s (%d commands) — available "
+            "immediately.",
+            guild_id,
+            len(synced),
+        )
 
     async def _on_app_command_error(
         self,

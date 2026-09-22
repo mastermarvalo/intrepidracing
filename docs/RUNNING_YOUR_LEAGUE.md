@@ -201,6 +201,16 @@ Create the Discord application:
 5. **Server Settings → Roles**: drag the bot's role **above every team
    role and tier role.** Discord will not let it assign a role above its
    own. This is the single most common setup failure.
+6. Put your **server ID** in `DISCORD_GUILD_ID` in `.env`. Turn on
+   Discord Settings → Advanced → Developer Mode, then right-click the
+   server → **Copy Server ID**.
+
+Step 6 is optional but you want it. Without it the bot registers its
+commands *globally*, and Discord can take up to an hour to show a new
+or changed one — so after an upgrade a command that works perfectly
+well simply isn't there yet, which is impossible to tell apart from a
+bug. With the server ID set, commands appear the moment the bot
+restarts.
 
 Start it:
 
@@ -221,8 +231,10 @@ make down      # stop
 make logs      # follow
 ```
 
-In Discord, type `/league`. If it doesn't appear, give Discord a minute
-and reload the client.
+In Discord, type `/league`. If it doesn't appear, reload the client
+(Ctrl+R). If it still doesn't, check `make logs` for the sync line —
+it names how many commands went out and whether they went to your
+server or globally.
 
 ---
 
@@ -1083,6 +1095,41 @@ contracts, drivers and history untouched.
 ---
 
 ## 18. When something looks wrong
+
+**A command isn't there after an upgrade.** Three things to check, in
+this order.
+
+First, did the bot actually restart on the new code? Merging a change
+to GitHub does nothing to your host. You need:
+
+```sh
+cd <repo>/roster-bot && git pull && make restart && make logs
+```
+
+Second, check the subcommand name. Commands nest, and the group is not
+usable on its own — there is no `/market-admin remove`, only
+`/market-admin tier remove` and `/market-admin board remove`. If you
+type the group and see nothing useful, you may be one word short.
+
+Third, if `DISCORD_GUILD_ID` is unset, the bot syncs globally and
+Discord takes **up to an hour** to publish a new command. `make logs`
+tells you which happened:
+
+```text
+Command tree synced to guild 1234... (89 commands) — available immediately.
+```
+
+versus
+
+```text
+Command tree synced globally (89 commands). Discord may take up to an
+hour to show new or changed commands. Set DISCORD_GUILD_ID to your
+server ID for instant syncs.
+```
+
+If you see the second line, set `DISCORD_GUILD_ID` (§3, step 6) and
+restart. Reload your Discord client with Ctrl+R afterwards — the client
+caches the command list and will keep showing you a stale one.
 
 **The bot didn't assign a team role.** Its role is below the team role.
 Server Settings → Roles, drag the bot up. The contract still committed —
