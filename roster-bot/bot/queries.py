@@ -982,15 +982,77 @@ async def insert_valuation_run(
     round_label: str,
     created_by: int | None,
     published: bool = False,
+    kind: str = "computed",
+    override_driver_id: int | None = None,
+    override_reason: str | None = None,
 ) -> int:
+    """
+    Create a valuation run.
+
+    `kind` defaults to `computed`, so every existing caller keeps its
+    behaviour. A `manual` run must supply both `override_driver_id` and
+    a non-blank `override_reason`; the CHECK constraint added in
+    migration 019 enforces that pairing at the database level rather
+    than trusting callers.
+    """
     return await conn.fetchval(
         """
         INSERT INTO valuation_runs
-            (season_id, tier_id, round_label, created_by, published, published_at)
-        VALUES ($1, $2, $3, $4, $5, CASE WHEN $5 THEN NOW() ELSE NULL END)
+            (season_id, tier_id, round_label, created_by, published,
+             published_at, kind, override_driver_id, override_reason)
+        VALUES ($1, $2, $3, $4, $5,
+                CASE WHEN $5 THEN NOW() ELSE NULL END, $6, $7, $8)
         RETURNING id
         """,
         season_id, tier_id, round_label, created_by, published,
+        kind, override_driver_id, override_reason,
+    )
+
+
+async def fetch_tier_current_values(
+    conn: asyncpg.Connection, tier_id: int
+) -> list[asyncpg.Record]:
+    """
+    Every driver row from the tier's most recent published run.
+
+    This is the carry-forward set for a manual override. The market
+    board renders all rows of the latest published run, so an override
+    run that omitted these drivers would wipe them off the board — the
+    override has to re-state the whole tier, not just the one driver
+    it changes.
+    """
+    run_id = await fetch_latest_published_run_id(conn, tier_id)
+    if run_id is None:
+        return []
+    return await conn.fetch(
+        """
+        SELECT dv.driver_id, d.display_name, dv.market_value
+        FROM driver_valuations dv
+        JOIN drivers d ON d.id = dv.driver_id
+        WHERE dv.run_id = $1
+        ORDER BY dv.rank_in_tier
+        """,
+        run_id,
+    )
+
+
+async def fetch_override_history(
+    conn: asyncpg.Connection, driver_id: int, limit: int
+) -> list[asyncpg.Record]:
+    """Manual overrides applied to one driver, newest first."""
+    return await conn.fetch(
+        """
+        SELECT vr.id AS run_id, vr.round_label, vr.override_reason,
+               vr.created_by, vr.created_at, dv.market_value,
+               dv.previous_value, dv.delta
+        FROM valuation_runs vr
+        JOIN driver_valuations dv
+          ON dv.run_id = vr.id AND dv.driver_id = vr.override_driver_id
+        WHERE vr.override_driver_id = $1 AND vr.kind = 'manual'
+        ORDER BY vr.created_at DESC
+        LIMIT $2
+        """,
+        driver_id, limit,
     )
 
 

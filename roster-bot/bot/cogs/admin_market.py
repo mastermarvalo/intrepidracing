@@ -67,7 +67,7 @@ from bot.market import driver_ops
 from bot.market import results as results_engine
 from bot.market.money import format_money, format_pl
 from bot.ui import offseason_screen, receipts
-from bot.ui.base import COLOR_WARN
+from bot.ui.base import COLOR_INFO, COLOR_WARN, EMBED_FIELD_LIMIT
 from bot.ui.config_modal import ConfigSectionView, build_config_embed
 
 log = logging.getLogger(__name__)
@@ -1347,6 +1347,68 @@ class AdminMarketCog(commands.Cog):
         await interaction.followup.send(
             f"✅ Tier `{tier_row.code}` sync: enrolled **{created}**, "
             f"already-registered **{skipped}**.",
+            ephemeral=True,
+        )
+
+    @driver.command(
+        name="set-value",
+        description="Manually override a driver's market value",
+    )
+    @app_commands.describe(
+        member="Driver to reprice",
+        tier="Tier code (e.g. t1)",
+        value_m="New market value in $M, e.g. 20.75",
+        reason="Why — recorded permanently and shown on the driver card",
+    )
+    async def driver_set_value(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        tier: str,
+        value_m: str,
+        reason: str,
+    ) -> None:
+        if not await _admin_or_deny(interaction):
+            return
+        assert interaction.guild_id is not None
+
+        try:
+            new_value = Decimal(value_m.strip().lstrip("$").rstrip("Mm"))
+        except InvalidOperation:
+            await interaction.response.send_message(
+                f"Could not read `{value_m}` as an amount. Enter millions, "
+                f"e.g. `20.75`.",
+                ephemeral=True,
+            )
+            return
+
+        if not reason.strip():
+            await interaction.response.send_message(
+                "An override needs a reason — it is the audit trail.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            preview = await workflow.preview_value_override(
+                guild_id=interaction.guild_id,
+                tier=tier,
+                member_id=member.id,
+                new_value=new_value,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            embed=_value_override_embed(preview, reason=reason.strip()),
+            view=_ConfirmValueOverrideView(
+                tier=tier,
+                member_id=member.id,
+                new_value=new_value,
+                reason=reason.strip(),
+                opener_id=interaction.user.id,
+            ),
             ephemeral=True,
         )
 
@@ -2828,3 +2890,123 @@ async def _finish_tier_removal(
     await interaction.followup.send(
         f"✅ Removed **{label}** (`{preview.code}`).{note}", ephemeral=True
     )
+
+
+# ── manual value override ────────────────────────────────────────────
+
+
+def _value_override_embed(preview, *, reason: str) -> discord.Embed:
+    """Show the change, what it drags with it, and anything odd about it."""
+    if preview.is_first_value:
+        headline = (
+            f"**{preview.display_name}** has no published value yet. "
+            f"This sets their first one."
+        )
+    else:
+        direction = "▲" if preview.delta > 0 else "▼" if preview.delta < 0 else "="
+        headline = (
+            f"**{preview.display_name}**: {_fmt_money(preview.current_value)} → "
+            f"**{_fmt_money(preview.new_value)}**  {direction} "
+            f"{_fmt_money(abs(preview.delta))}"
+        )
+
+    embed = discord.Embed(
+        title="Override market value?",
+        description=(
+            f"{preview.tier_label} (`{preview.tier_code}`) · "
+            f"{preview.season_name}\n\n{headline}"
+        ),
+        color=COLOR_WARN if preview.warnings else COLOR_INFO,
+    )
+    embed.add_field(name="Reason", value=reason[:EMBED_FIELD_LIMIT], inline=False)
+
+    if preview.warnings:
+        body = "\n".join(f"• {w}" for w in preview.warnings)
+        embed.add_field(
+            name="⚠️ Worth knowing",
+            value=body[:EMBED_FIELD_LIMIT],
+            inline=False,
+        )
+
+    # The carry-forward is the non-obvious part: an override publishes a
+    # whole new run, so say so rather than letting it look like a
+    # single-row edit.
+    if preview.carried_count:
+        embed.add_field(
+            name="How this is applied",
+            value=(
+                f"Publishes a new valuation run for `{preview.tier_code}`. "
+                f"The other {preview.carried_count - 1} driver(s) keep their "
+                f"current values, unchanged and with no movement recorded."
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="Recorded permanently and attributed to you.")
+    return embed
+
+
+class _ConfirmValueOverrideView(discord.ui.View):
+    """
+    One button. The override is reversible — set the value back, or
+    publish a fresh valuation run — so this does not need the
+    type-the-name gate that tier removal has.
+    """
+
+    def __init__(
+        self,
+        *,
+        tier: str,
+        member_id: int,
+        new_value: Decimal,
+        reason: str,
+        opener_id: int,
+    ) -> None:
+        super().__init__(timeout=120)
+        self._tier = tier
+        self._member_id = member_id
+        self._new_value = new_value
+        self._reason = reason
+        self._opener_id = opener_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self._opener_id:
+            await interaction.response.send_message(
+                "This confirmation is not yours.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Set value", style=discord.ButtonStyle.primary)
+    async def _confirm(
+        self, interaction: discord.Interaction, _b: discord.ui.Button
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await workflow.apply_value_override(
+                interaction.client,
+                guild_id=interaction.guild_id,
+                tier=self._tier,
+                member_id=self._member_id,
+                new_value=self._new_value,
+                reason=self._reason,
+                actor_id=interaction.user.id,
+            )
+        except workflow.WorkflowError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        self.stop()
+        await interaction.followup.send(
+            f"✅ **{result.display_name}** is now valued at "
+            f"{_fmt_money(result.new_value)} in `{result.tier_code}`. "
+            f"Boards updated.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def _cancel(
+        self, interaction: discord.Interaction, _b: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Cancelled — the value is unchanged.", embed=None, view=None
+        )
+        self.stop()

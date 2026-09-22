@@ -469,6 +469,226 @@ class PublishOutcome:
     boards_refreshed: bool
 
 
+def _money(amount: Decimal) -> str:
+    """Money for a warning string. Discord-free, like the rest of this module."""
+    return f"${amount:,.2f}M"
+
+
+# ── manual value override ───────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ValueOverridePreview:
+    """
+    What a proposed override would do, before anything is written.
+
+    `warnings` are advisory, never blocking. An override exists for the
+    cases the engine's rules get wrong, so the rules it would normally
+    breach are reported rather than enforced — but they are reported,
+    because "this is $40M above the cap" is exactly the kind of thing
+    an admin means to know before confirming.
+    """
+
+    driver_id: int
+    display_name: str
+    tier_code: str
+    tier_label: str
+    season_name: str
+    current_value: Decimal | None
+    new_value: Decimal
+    carried_count: int
+    warnings: tuple[str, ...]
+
+    @property
+    def is_first_value(self) -> bool:
+        return self.current_value is None
+
+    @property
+    def delta(self) -> Decimal:
+        if self.current_value is None:
+            return Decimal("0")
+        return self.new_value - self.current_value
+
+
+async def _resolve_override_target(conn, *, guild_id: int, tier: str, member_id: int):
+    """Shared lookup for the preview and the write. Raises WorkflowError."""
+    season = await queries.fetch_active_season(conn, guild_id)
+    if season is None:
+        raise WorkflowError("No active season.")
+    tier_row = await queries.fetch_tier(conn, season.id, tier)
+    if tier_row is None:
+        raise WorkflowError(f"No tier `{tier}` in **{season.name}**.")
+    driver = await queries.fetch_driver(conn, season.id, tier_row.id, member_id)
+    if driver is None:
+        raise WorkflowError(
+            f"That member is not a driver in `{tier}`. Enrol them with "
+            f"`/market-admin driver add` first."
+        )
+    return season, tier_row, driver
+
+
+async def preview_value_override(
+    *, guild_id: int, tier: str, member_id: int, new_value: Decimal
+) -> ValueOverridePreview:
+    """Price the change and collect warnings without writing anything."""
+    if new_value < Decimal("0"):
+        raise WorkflowError("A market value cannot be negative.")
+
+    async with db.connect() as conn:
+        season, tier_row, driver = await _resolve_override_target(
+            conn, guild_id=guild_id, tier=tier, member_id=member_id
+        )
+        current = await queries.fetch_latest_published_valuation(conn, driver.id)
+        carried = await queries.fetch_tier_current_values(conn, tier_row.id)
+        cfg = await queries.fetch_league_config_row(conn, season.id, tier_row.id)
+        if cfg is None:
+            cfg = await queries.fetch_league_config_row(conn, season.id, None)
+        contract = await queries.fetch_active_contract_for_driver(conn, driver.id)
+
+    warnings: list[str] = []
+    if cfg is not None:
+        if new_value < cfg.min_salary:
+            warnings.append(
+                f"Below the minimum salary of {_money(cfg.min_salary)} — "
+                f"offers priced off this value may be refused."
+            )
+        if cfg.max_salary is not None and new_value > cfg.max_salary:
+            warnings.append(
+                f"Above the maximum salary of {_money(cfg.max_salary)}."
+            )
+        if current is not None:
+            move = abs(new_value - current)
+            if move > cfg.weekly_move_cap:
+                warnings.append(
+                    f"Moves {_money(move)} in one step, beyond the weekly "
+                    f"cap of {_money(cfg.weekly_move_cap)}. Overrides are "
+                    f"not capped; this is applied in full."
+                )
+    if contract is not None:
+        warnings.append(
+            "This driver is under contract — changing their value "
+            "changes the P/L their team settles at."
+        )
+    if not carried:
+        warnings.append(
+            "No valuation has been published for this tier yet, so this "
+            "override becomes the tier's first published run."
+        )
+
+    return ValueOverridePreview(
+        driver_id=driver.id,
+        display_name=driver.display_name,
+        tier_code=tier_row.code,
+        tier_label=tier_row.label,
+        season_name=season.name,
+        current_value=current,
+        new_value=new_value,
+        carried_count=len(carried),
+        warnings=tuple(warnings),
+    )
+
+
+async def apply_value_override(
+    client,
+    *,
+    guild_id: int,
+    tier: str,
+    member_id: int,
+    new_value: Decimal,
+    reason: str,
+    actor_id: int,
+) -> ValueOverridePreview:
+    """
+    Write the override as a published valuation run, then refresh boards.
+
+    The run re-states every driver in the tier, not just the one being
+    changed: readers resolve a value from the latest published run, so
+    a partial run would drop everyone else off the market board.
+    """
+    if new_value < Decimal("0"):
+        raise WorkflowError("A market value cannot be negative.")
+    reason = reason.strip()
+    if not reason:
+        raise WorkflowError("An override needs a reason — it is the audit trail.")
+
+    async with db.connect() as conn:
+        async with conn.transaction():
+            season, tier_row, driver = await _resolve_override_target(
+                conn, guild_id=guild_id, tier=tier, member_id=member_id
+            )
+            # Re-read inside the transaction: a valuation publish may
+            # have landed between the preview and the confirmation, and
+            # carrying forward a stale set would silently roll it back.
+            current = await queries.fetch_latest_published_valuation(conn, driver.id)
+            carried_rows = await queries.fetch_tier_current_values(conn, tier_row.id)
+            carried = [
+                valuation_engine.CarriedValue(
+                    driver_id=r["driver_id"],
+                    display_name=r["display_name"],
+                    market_value=r["market_value"],
+                )
+                for r in carried_rows
+            ]
+            rows = valuation_engine.build_override_rows(
+                carried=carried,
+                target_driver_id=driver.id,
+                new_value=new_value,
+                reason=reason,
+                actor_id=actor_id,
+            )
+            run_id = await queries.insert_valuation_run(
+                conn,
+                season_id=season.id,
+                tier_id=tier_row.id,
+                round_label=f"Manual override — {driver.display_name}",
+                created_by=actor_id,
+                published=True,
+                kind="manual",
+                override_driver_id=driver.id,
+                override_reason=reason,
+            )
+            await queries.insert_driver_valuations(
+                conn,
+                run_id,
+                [
+                    {
+                        "driver_id": r.driver_id,
+                        "market_value": r.market_value,
+                        "previous_value": r.previous_value,
+                        "delta": r.delta,
+                        "rank_in_tier": r.rank_in_tier,
+                        "capped": r.capped,
+                        "breakdown": r.breakdown,
+                    }
+                    for r in rows
+                ],
+            )
+            season_id, tier_id = season.id, tier_row.id
+            result = ValueOverridePreview(
+                driver_id=driver.id,
+                display_name=driver.display_name,
+                tier_code=tier_row.code,
+                tier_label=tier_row.label,
+                season_name=season.name,
+                current_value=current,
+                new_value=new_value,
+                carried_count=len(carried),
+                warnings=(),
+            )
+
+    try:
+        await market_boards.refresh_boards_for_tier(
+            client, guild_id=guild_id, season_id=season_id, tier_id=tier_id
+        )
+    except Exception:
+        log.exception(
+            "Board refresh after manual override of driver %s failed "
+            "(the value is published; boards heal on the next poll)",
+            result.driver_id,
+        )
+    return result
+
+
 async def publish_valuation(client, *, guild_id: int, run_id: int) -> PublishOutcome:
     """
     Publish a dry-run and refresh the boards that show it.
