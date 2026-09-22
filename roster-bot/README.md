@@ -934,6 +934,7 @@ sheet just was not shared with it.
 | Variable | Default | Description |
 |---|---|---|
 | `DISCORD_TOKEN` | *(required)* | Bot token |
+| `DISCORD_GUILD_ID` | *(unset)* | Your server's ID. Set it: commands then sync to that server and appear as soon as the bot restarts. Unset, the bot syncs globally and Discord takes **up to an hour** to publish new or changed commands. Falls back to a global sync if the value isn't a number or the guild sync is refused. |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `DATABASE_URL` | `postgresql://roster:roster@postgres:5432/roster` (set by compose) | Postgres connection string |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `roster` | Postgres credentials (compose only) |
